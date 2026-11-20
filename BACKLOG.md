@@ -276,6 +276,83 @@ re-uploading images per room. The earlier bake-first decision is reversed.
        region goes dark/wet, the rest of the map untouched; re-roll the
        maze seed ("different maze") and it rebuilds.
     5. `bun run maze --cells 12x8 --seed <n>` eyeballed vs the table.
+- [~] Chat-driven building loop (FR-1) + undo / tweak (FR-8)
+  - **BUILT offline Nov 20 — [~], live test pending.**
+    `src/session/build-loop.ts` (pure, never imports the vendored
+    client): `parseBuildRequest` — chat line -> one `BuildOp`
+    (create-room, widen, add-door, move-door, add-dressing, add-torches,
+    add-fog, overlay, add-corridor, undo, redo) or `clarify` (a
+    question, never a guess) or `unsupported` ("can't do that yet") or
+    `null` (not a build request). Size words (tiny/small/medium/large/
+    huge), names (`called`/`named`, entry-hall, crypt/tavern/lair…),
+    unit conversion (10 m -> 7 squares via `toSquares`), left/right
+    relative to the wall being faced, "that door" resolved only when
+    the room has exactly one door (or one on the named wall). Corridor
+    keeps the focus on the source room — the next edit lands in the
+    room, not in a 1-wide corridor. `applyOp` — pure, non-mutating
+    (input spec untouched, so history = list of specs and undo = the
+    previous one); `BuildSession` — states + entries + index,
+    `peek`/`commit`/`apply`/`undo`/`redo`, history entries carry the
+    GM's exact words + the summary ("undid: widen room west by 10").
+    `planSync` — diff before/after against built rooms -> {build,
+    rebuild, remove}. `formatBuildLine` — one confirmation line per
+    build with an icon. `src/session/build-exec.ts` (live, lazily
+    imported by the monitor only when a build runs): peek -> validate
+    -> commit -> sync via `buildTileRoom`/`rebuildTileRoom`/Scene
+    delete; a no-op build posts its summary and makes no Foundry
+    calls; an error posts "I couldn't build that — …" and commits
+    nothing. `src/worldbuilding/tiles-layout.ts`: `DoorSpec.secret`
+    — a secret door renders as a wall-straight tile and gets a
+    `door: 2` collision wall (the composer already validated it like
+    any door). `src/session/monitor.ts`: new routing kinds `build` /
+    `clarify` / `unsupported` — build parse runs after roll/question,
+    and only when a build context is passed (without one, build lines
+    stay `chat`, unchanged behaviour); the monitor keeps a
+    `BuildSession` + built-rooms map and lazily loads the executor.
+    `src/cli/monitor.ts`: `--pack <manifest.json>` and
+    `--server-base <path>`. CLI: `bun run build-loop --demo` (the
+    canned Nov 19 script: build the Entry Hall, secret door, widen,
+    100 m corridor, bones, undo, redo — all 7 steps succeed, prints
+    one JSON object with the spec diff + the chat line per step) and
+    `bun run build-loop --say "<line>" [--spec <dungeon.json>]`.
+    Tests: `tests/build-loop.test.ts`, 57 checks — parser (create/
+    widen/doors/dressing/fog/overlay/corridor, "build a wider room" is
+    a create not a widen, "build a 3-room dungeon" is unsupported,
+    non-build lines return null), session (apply/undo/redo, undo at
+    the start, redo tail dropped by a new edit, frozen-input
+    immutability, focus follows create/corridor), secret-door layout,
+    planSync, monitor routing, formatting. Full suite 414 pass /
+    0 fail, `bun run typecheck` clean.
+  - **Known limitations (follow-ups, not live-test blockers):**
+    the build session lives in memory only — a monitor restart loses
+    it (a state file is the follow-up); a failure mid-sync (after
+    commit) leaves the session ahead of the table — recover with
+    "undo that" + re-issue; rooms aren't targeted by name yet, so
+    "the corridor" can't be the active room; "here" doesn't resolve
+    from the GM's ping/cursor yet; one op per message — compound
+    requests ("add a door here and put a chest in the corner") do
+    the first op only.
+  - **LIVE-TEST CHECKLIST (next session):**
+    1. Chat build, end to end: "build an 8x6 entry hall with a south
+       door and a chest" -> the room appears on the table in under
+       2 minutes, one confirmation line in chat, nothing else.
+    2. Widen live: "make this room 10 units wider" -> rebuildTileRoom
+       widens the room with no new images, content shifts with it.
+    3. Secret door: "put a secret door in the north wall" -> the tile
+       reads as wall on the table, the collision wall is `door: 2`,
+       a token can be walked through it.
+    4. Undo/redo in chat: "undo that" reverts the last build and
+       posts what was undone; "redo" brings it back; "undo" at the
+       start of history says "Nothing to undo yet."
+    5. Corridor live: "add a corridor going north for 100 meters" ->
+       the corridor room appears linked to the hall; walk the party
+       through it.
+    6. Clarification: "add a door here" posts a question ("Which
+       wall?") and builds nothing.
+    7. Unsupported: "make it darker" posts "I can't do that yet"
+       and builds nothing.
+    8. `bun run monitor --once` / `--dry-run` with a build line in
+       the log routes it to `build` and (dry-run) posts nothing.
 - [ ] Green eerie fog is the dungeon's fog (STYLE.md) — pieces and bakes
   both use it
 

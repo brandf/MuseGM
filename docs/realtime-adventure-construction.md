@@ -73,9 +73,7 @@ or the named wall — never from coordinates in chat.
 **Acceptance:** a 3-room dungeon built in under 2 minutes of chat, no
 coordinate talk, each step visible within seconds of the message.
 
-**Status:** composer + dungeon graph built and unit-tested (18-tile
-pack, 0 gaps); live test pending. The chat-driven iterative loop
-(monitor → composer) is not yet wired.
+**Status:** [~] built + unit-tested offline Nov 20 — `src/session/build-loop.ts` (pure parser: chat line -> one `BuildOp` — create-room, widen, door add/move, dressing, torches, fog, overlay, corridor — or a clarifying question, or "can't do that yet"; `BuildSession` history of specs; `planSync`) + `src/session/build-exec.ts` (live executor: peek -> validate -> commit -> sync via `buildTileRoom`/`rebuildTileRoom`) + the monitor hook (new routing kinds `build` / `clarify` / `unsupported`, after roll/question) + `src/cli/build-loop.ts` (`--demo`, `--say`, no connection) + `tests/build-loop.test.ts` (57 checks). One confirmation line per build in chat. Live test pending: the full BACKLOG checklist (3-room dungeon in under 2 minutes of chat, widen/secret-door/corridor live, clarification + unsupported lines). "Here" asks which wall for now — resolving it from the GM's ping/cursor is a follow-up. Composer + dungeon graph built and unit-tested (18-tile pack, 0 gaps); the chat-driven iterative loop (monitor → composer) is now wired.
 
 ### FR-2 — Theme re-skin
 
@@ -223,9 +221,17 @@ build). Needs timed light transitions + named lights in the room spec.
 **Acceptance:** any build action reversible in one message; a tweak
 lands in seconds.
 
-**Status:** not built. Needs an edit history (spec versions) + a
-rebuild-from-spec path (the composer already rebuilds; the history and
-the chat → diff parsing are missing).
+**Status:** [~] built + unit-tested offline Nov 20, with FR-1 — the
+layout ops were already pure and non-mutating, so edit history is a
+list of specs and undo is the previous one: `BuildSession` (`peek` /
+`commit` / `apply` / `undo` / `redo`, history entries carry the GM's
+exact words + the summary) in `src/session/build-loop.ts`, "undo
+that" / "redo" parse as ops and post what was undone/redone in chat,
+`tests/build-loop.test.ts` (57 checks, incl. undo-to-start, redo-tail
+dropped by a new edit, frozen-input immutability). Live test pending:
+undo/redo in chat against a live room (see the BACKLOG checklist).
+Known limitation: the session lives in memory only — a monitor
+restart loses the history (a state file is the follow-up).
 
 ### FR-9 — Pacing / director mode (v2)
 
@@ -658,7 +664,7 @@ image landing in chat at the moment of the emergence.
 | Tile composer + dungeon graph (rooms + door links) | Built, unit-tested |
 | 19-tile pack (0 gaps, incl. spear prop) | Built |
 | Trap & zone triggers | Built |
-| Chat-driven iterative building loop | Not wired |
+| Chat-driven iterative building loop | Built, unit-tested (Nov 20); live test pending |
 | Theme packs + re-skin | Not built |
 | Multi-floor + gated reveal | Not built |
 | Zone → cutscene link | Not built |
@@ -666,7 +672,7 @@ image landing in chat at the moment of the emergence.
 | Formation helpers (ring, line, wedge) | Built, unit-tested (Nov 20) |
 | Timed light transitions + named lights | Transitions built (light step); named lights still use id/proximity |
 | Scripted tile swaps (FR-13 swapTile) | Built, unit-tested (Nov 20) |
-| Edit history / undo | Not built |
+| Edit history / undo | Built, unit-tested (Nov 20); live test pending |
 | Props in the room spec | Not built |
 | High-level floor generation (FR-15) | Planner + preview + manifest built, unit-tested; live wiring pending |
 | Interactive dressing: clickable torches/candles (FR-16) | Generator built, unit-tested (Nov 20); click wiring + composer hook pending |

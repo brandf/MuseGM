@@ -18,6 +18,7 @@ export {};
  * Usage:
  *   bun run src/cli/monitor.ts [--alias Meroki] [--debounce 3]
  *                              [--timeout 30] [--once] [--dry-run]
+ *                              [--pack <manifest.json>] [--server-base <path>]
  *
  * Logs are JSON lines on stderr ({event, ...}); --once prints a summary
  * JSON object on stdout and exits. Ctrl-C stops the loop cleanly
@@ -39,16 +40,21 @@ function has(name: string): boolean {
 
 if (has("--help") || has("-h")) {
   process.stdout.write(
-    `usage: bun run src/cli/monitor.ts [--alias Meroki] [--debounce 3] [--timeout 30] [--once] [--dry-run]\n` +
+    `usage: bun run src/cli/monitor.ts [--alias Meroki] [--debounce 3] [--timeout 30] [--once] [--dry-run] [--pack <manifest.json>] [--server-base <path>]\n` +
       `\n` +
       `  --alias <name>   display name in chat (default Meroki)\n` +
       `  --debounce <s>   burst-merge window per wait cycle (default 3)\n` +
       `  --timeout <s>    seconds per wait cycle; also bounds Ctrl-C latency (default 30)\n` +
       `  --once           run one wait cycle + pin drain + combat check, print a summary, exit\n` +
       `  --dry-run        classify + log, but post nothing and change nothing\n` +
+      `  --pack <path>    tile-pack manifest for the build loop (default tiles/manifest.json)\n` +
+      `  --server-base <path>  server folder the pack was uploaded to (default worlds/<world>)\n` +
       `\n` +
       `The monitor starts from the newest chat message (it never re-answers\n` +
-      `history) and picks up open Meroki Pins dropped while it was offline.\n`,
+      `history) and picks up open Meroki Pins dropped while it was offline.\n` +
+      `Build requests in chat ("build an 8x6 room", "add a door", "undo\n` +
+      `that") route to the build loop; ambiguous ones get a clarifying\n` +
+      `question in chat, out-of-scope ones get "I can't do that yet".\n`,
   );
   process.exit(0);
 }
@@ -63,6 +69,8 @@ async function main(): Promise<void> {
   const timeout = Number(arg("--timeout") ?? "30");
   const once = has("--once");
   const dryRun = has("--dry-run");
+  const packPath = arg("--pack");
+  const serverBase = arg("--server-base");
 
   const live = await FoundryLive.connect();
   let stopping = false;
@@ -78,6 +86,8 @@ async function main(): Promise<void> {
       timeout,
       dryRun,
       once,
+      packPath,
+      serverBase,
       shouldStop: () => stopping,
     });
     if (once) {

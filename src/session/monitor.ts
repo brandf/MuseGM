@@ -20,6 +20,13 @@
  *   tracker). HP / down / end-of-combat belong to the CombatAutopilot —
  *   the code path that changes HP owns the callout — so the monitor never
  *   double-posts a down message the autopilot already sent.
+ * - Builds (FR-1 + FR-8): a build request in chat routes to the build
+ *   loop (`src/session/build-loop.ts` — pure parser + history) and the
+ *   executor (`src/session/build-exec.ts`, loaded lazily — it imports
+ *   the live composer, which is not test-safe). One confirmation line
+ *   per build; ambiguous requests get a clarifying question in chat;
+ *   out-of-scope requests get "I can't do that yet". The loop never
+ *   guesses a position and never hallucinates a build.
  * - Everything else (open chat, requests, roleplay): logged as
  *   "needs-agent" and skipped. A human Muse can answer those from the
  *   log; the CLI does not improvise.
@@ -33,6 +40,13 @@ import { rollForChat, parseRollRequest } from "./dice.js";
 import { CombatAutopilot } from "./autopilot.js";
 import type { CombatStatus } from "./autopilot.js";
 import { extractPin, handlePin, findOpenPins, PinProcessor } from "./pins.js";
+import {
+  BuildSession,
+  parseBuildRequest,
+  type BuildParseContext,
+} from "./build-loop.js";
+import { loadPack, type Pack } from "../worldbuilding/tiles-layout.js";
+import type { BuiltTileRoom } from "../worldbuilding/tiles.js";
 
 /** What the monitor does with one chat message. */
 export type MessageClass =
@@ -40,6 +54,9 @@ export type MessageClass =
   | "noise" // empty after stripping markup — nothing to answer
   | "roll" // parseRollRequest matched — roll it
   | "question" // parseQuestion matched — answer from live data
+  | "build" // a build request parsed cleanly — build it
+  | "clarify" // a build request too ambiguous to build — ask in chat
+  | "unsupported" // a build request the kit can't do yet — say so
   | "chat"; // everything else — needs a Muse's judgment; log + skip
 
 /** Strip HTML tags + common entities down to plain text. */
@@ -58,12 +75,17 @@ export function stripHtml(html: string): string {
 
 /**
  * Route one chat message. Order matters: own first (never self-trigger),
- * then noise, then the deterministic handlers, then "chat".
+ * then noise, then the deterministic handlers, then "chat". The build
+ * parse runs after roll/question so a roll or a data question never
+ * gets mistaken for a build request; it needs the build context (the
+ * room being built) to resolve "that door" — without it, build
+ * requests that need the room fall through to "chat".
  */
 export function classifyMessage(
   msg: ChatMessage,
   ownUserId: string | null,
   ownAlias: string,
+  buildCtx?: BuildParseContext,
 ): MessageClass {
   if (
     (ownUserId !== null && msg.author === ownUserId) ||
@@ -75,6 +97,10 @@ export function classifyMessage(
   if (!text) return "noise";
   if (parseRollRequest(text) !== null) return "roll";
   if (parseQuestion(text)) return "question";
+  if (buildCtx) {
+    const build = parseBuildRequest(text, buildCtx);
+    if (build) return build.kind;
+  }
   return "chat";
 }
 
@@ -270,6 +296,12 @@ export interface MonitorOptions {
   onLog?: (log: MonitorLog) => void;
   /** Checked between cycles; when true, the loop stops after the current cycle. */
   shouldStop?: () => boolean;
+  /** Tile-pack manifest path for the build loop (default: the repo's
+   *  own tiles/manifest.json). Loaded lazily on the first build. */
+  packPath?: string;
+  /** Server folder the pack was uploaded to (default: derived from
+   *  the world title, e.g. "worlds/testbed"). */
+  serverBase?: string;
 }
 
 export interface MonitorSummary {
@@ -279,6 +311,8 @@ export interface MonitorSummary {
   rollsHandled: number;
   pinsHandled: number;
   combatAnnouncements: number;
+  buildsHandled: number;
+  clarifications: number;
   skipped: number;
 }
 
@@ -305,9 +339,18 @@ export async function runMonitor(
     rollsHandled: 0,
     pinsHandled: 0,
     combatAnnouncements: 0,
+    buildsHandled: 0,
+    clarifications: 0,
     skipped: 0,
   };
   const pins = new PinProcessor();
+  // The build loop's state lives for the whole monitor run: the
+  // dungeon spec + edit history (in memory — a restart loses it; a
+  // state file is a follow-up, see BACKLOG.md) and the rooms already
+  // built on the server, by room id.
+  const buildSession = new BuildSession();
+  const builtRooms = new Map<string, BuiltTileRoom>();
+  let pack: Pack | null = null;
   const pinQueue: Record<string, unknown>[][] = [];
   const unsubscribe = live.on((event) => {
     if (event.kind === "document" && event.action === "create") {
@@ -330,7 +373,9 @@ export async function runMonitor(
       lastSeen = result.lastSeen;
       for (const msg of result.newMessages) {
         summary.messagesSeen += 1;
-        const cls = classifyMessage(msg, live.userId, alias);
+        const cls = classifyMessage(msg, live.userId, alias, {
+          room: buildSession.activeRoomSpec() ?? undefined,
+        });
         if (cls === "own" || cls === "noise") {
           summary.skipped += 1;
           log({ event: "skip", class: cls, id: msg.id });
@@ -372,6 +417,77 @@ export async function runMonitor(
             } catch (err) {
               log({ event: "error", class: "question", id: msg.id, error: String(err) });
             }
+          }
+          continue;
+        }
+        // Build / clarify / unsupported — the FR-1 loop. The parse runs
+        // again here (classify only returned the class) with the
+        // session's room, so "that door" resolves against the room
+        // being built.
+        if (cls === "build" || cls === "clarify" || cls === "unsupported") {
+          const text = stripHtml(msg.content);
+          const parsed = parseBuildRequest(text, {
+            room: buildSession.activeRoomSpec() ?? undefined,
+          });
+          if (!parsed) {
+            // Classify said build, the parse says otherwise — defensive;
+            // treat as needs-agent rather than building the wrong thing.
+            summary.skipped += 1;
+            log({ event: "needs-agent", id: msg.id, text: text.slice(0, 200) });
+            continue;
+          }
+          if (parsed.kind === "clarify") {
+            if (opts.dryRun) {
+              log({ event: "build-clarify", id: msg.id, question: parsed.question, dryRun: true });
+            } else {
+              await live.sendChat(parsed.question);
+              summary.clarifications += 1;
+              summary.answered += 1;
+              log({ event: "build-clarify", id: msg.id, question: parsed.question });
+            }
+            continue;
+          }
+          if (parsed.kind === "unsupported") {
+            const line = `I can't do that yet — ${parsed.reason}.`;
+            if (opts.dryRun) {
+              log({ event: "build-unsupported", id: msg.id, reason: parsed.reason, dryRun: true });
+            } else {
+              await live.sendChat(line);
+              summary.clarifications += 1;
+              summary.answered += 1;
+              log({ event: "build-unsupported", id: msg.id, reason: parsed.reason });
+            }
+            continue;
+          }
+          if (opts.dryRun) {
+            log({ event: "build", id: msg.id, op: parsed.op, dryRun: true });
+            continue;
+          }
+          try {
+            pack ??= loadPack(opts.packPath);
+            // The executor imports the live composer — lazy, so the
+            // pure tests never load the vendored client.
+            const { executeBuild, serverBaseForWorld } = await import("./build-exec.js");
+            const world = live.getWorldSummary() as { title?: string | null };
+            const line = await executeBuild(live, buildSession, parsed.op, text, {
+              pack,
+              serverBase: opts.serverBase ?? serverBaseForWorld(world.title),
+              built: builtRooms,
+            });
+            await live.sendChat(line);
+            summary.buildsHandled += 1;
+            summary.answered += 1;
+            log({ event: "build", id: msg.id, op: parsed.op, line });
+          } catch (err) {
+            // A failed build never commits: the session is unchanged,
+            // so the GM can rephrase and try again.
+            const line = `I couldn't build that — ${err instanceof Error ? err.message : String(err)}`;
+            try {
+              await live.sendChat(line);
+            } catch {
+              // The table is unreachable; the log line below is the record.
+            }
+            log({ event: "error", class: "build", id: msg.id, error: String(err) });
           }
           continue;
         }

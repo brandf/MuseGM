@@ -107,11 +107,15 @@ export function loadPack(manifestPath?: string): Pack {
 
 export type WallSide = "north" | "south" | "east" | "west";
 
-/** A door in a wall: `at` is the cell index along that wall (0-based). */
+/** A door in a wall: `at` is the cell index along that wall (0-based).
+ *  `secret` (FR-1/FR-8): a hidden door — the wall tile looks like a
+ *  plain wall and the collision segment is a secret door (door: 2),
+ *  so the party only finds it by searching. */
 export interface DoorSpec {
   wall: WallSide;
   /** Cell along the wall, 1..n-2 — doors may not sit in a corner. */
   at: number;
+  secret?: boolean;
 }
 
 /** One dressing/fog placement: top-left cell of the tile. */
@@ -258,17 +262,19 @@ function cellsAlong(side: WallSide, gridW: number, gridH: number): number {
 }
 
 /** A wall-side segment: [firstCell, lastCellInclusive, kind]. */
-export type WallSegmentKind = "wall" | "door" | "open";
+export type WallSegmentKind = "wall" | "door" | "secret" | "open";
 
-/** Split one wall side into plain, door and open segments.
+/** Split one wall side into plain, door, secret-door and open segments.
  *  Returns segments as [firstCell, lastCellInclusive, kind]. */
 function splitWall(
   cells: number,
   doorsAt: number[],
   openAt: number[],
+  secretAt: number[] = [],
 ): [number, number, WallSegmentKind][] {
   const kindAt = new Map<number, WallSegmentKind>();
   for (const at of doorsAt) kindAt.set(at, "door");
+  for (const at of secretAt) kindAt.set(at, "secret");
   for (const at of openAt) kindAt.set(at, "open");
   const segs: [number, number, WallSegmentKind][] = [];
   let i = 0;
@@ -594,8 +600,8 @@ export function layoutRoom(spec: RoomSpec, pack: Pack, serverBase: string): Room
   // through, including a corner cell that is an opening).
   const doors = spec.doors ?? [];
   const openings = spec.openings ?? [];
-  const doorAt = new Map<string, boolean>();
-  for (const d of doors) doorAt.set(`${d.wall}:${d.at}`, true);
+  const doorAt = new Map<string, "door" | "secret">();
+  for (const d of doors) doorAt.set(`${d.wall}:${d.at}`, d.secret ? "secret" : "door");
   const openAt = new Set<string>();
   for (const o of openings) openAt.add(`${o.wall}:${o.at}`);
   const corners: ["nw" | "ne" | "se" | "sw", number, number][] = [
@@ -630,8 +636,10 @@ export function layoutRoom(spec: RoomSpec, pack: Pack, serverBase: string): Room
     for (let at = 1; at <= n - 2; at++) {
       if (openAt.has(`${side}:${at}`)) continue;
       const { gx, gy, rotation } = wallCell(side, at, gridW, gridH);
-      const isDoor = doorAt.has(`${side}:${at}`);
-      tiles.push(tileDoc(isDoor ? doorEntry : straightEntry, serverBase, gx, gy, {
+      const kind = doorAt.get(`${side}:${at}`);
+      // A secret door looks like a plain wall — the straight tile, not
+      // the door tile — so the party can't spot it from the map.
+      tiles.push(tileDoc(kind === "door" ? doorEntry : straightEntry, serverBase, gx, gy, {
         elevation: 0, sort: LAYER_SORT.wall, rotation,
       }));
     }
@@ -692,16 +700,18 @@ export function layoutRoom(spec: RoomSpec, pack: Pack, serverBase: string): Room
   }
 
   // Collision walls: the perimeter, split around the door cells. A door
-  // cell becomes a door segment (door: 1); an opening cell gets no wall
-  // at all; the rest are plain walls. Then the merged maze walls.
+  // cell becomes a door segment (door: 1); a secret door cell becomes a
+  // secret segment (door: 2); an opening cell gets no wall at all; the
+  // rest are plain walls. Then the merged maze walls.
   const walls: WallSpec[] = [];
   for (const side of ["north", "south", "east", "west"] as WallSide[]) {
     const n = cellsAlong(side, gridW, gridH);
-    const doorsHere = doors.filter((d) => d.wall === side).map((d) => d.at);
+    const doorsHere = doors.filter((d) => d.wall === side && !d.secret).map((d) => d.at);
+    const secretHere = doors.filter((d) => d.wall === side && d.secret).map((d) => d.at);
     const openHere = openings.filter((o) => o.wall === side).map((o) => o.at);
-    for (const [first, last, kind] of splitWall(n, doorsHere, openHere)) {
+    for (const [first, last, kind] of splitWall(n, doorsHere, openHere, secretHere)) {
       if (kind === "open") continue;
-      walls.push({ ...wallCoords(side, first, last, width, height), door: kind === "door" ? 1 : 0 });
+      walls.push({ ...wallCoords(side, first, last, width, height), door: kind === "door" ? 1 : kind === "secret" ? 2 : 0 });
     }
   }
   walls.push(...mazeCollisionWalls(spec, grids));
