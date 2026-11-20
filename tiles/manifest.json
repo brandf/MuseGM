@@ -1,0 +1,185 @@
+{
+  "version": 1,
+  "tilePx": 100,
+  "generated": "2026-11-19",
+  "tiles": [
+    {
+      "name": "floor-plain",
+      "file": "pack/floor-plain.png",
+      "sizePx": 100,
+      "layer": "floor",
+      "tags": [
+        "floor",
+        "stone"
+      ]
+    },
+    {
+      "name": "floor-cracked",
+      "file": "pack/floor-cracked.png",
+      "sizePx": 100,
+      "layer": "floor",
+      "tags": [
+        "floor",
+        "stone",
+        "cracked"
+      ]
+    },
+    {
+      "name": "floor-rubble",
+      "file": "pack/floor-rubble.png",
+      "sizePx": 100,
+      "layer": "floor",
+      "tags": [
+        "floor",
+        "stone",
+        "rubble"
+      ]
+    },
+    {
+      "name": "floor-dark",
+      "file": "pack/floor-dark.png",
+      "sizePx": 100,
+      "layer": "floor",
+      "tags": [
+        "floor",
+        "stone",
+        "dark",
+        "deep"
+      ]
+    },
+    {
+      "name": "wall-straight",
+      "file": "pack/wall-straight.png",
+      "sizePx": 100,
+      "layer": "floor",
+      "tags": [
+        "wall",
+        "straight"
+      ]
+    },
+    {
+      "name": "wall-corner",
+      "file": "pack/wall-corner.png",
+      "sizePx": 100,
+      "layer": "floor",
+      "tags": [
+        "wall",
+        "corner"
+      ]
+    },
+    {
+      "name": "wall-door",
+      "file": "pack/wall-door.png",
+      "sizePx": 100,
+      "layer": "floor",
+      "tags": [
+        "wall",
+        "door"
+      ]
+    },
+    {
+      "name": "fog-wisp-small",
+      "file": "pack/fog-wisp-small.png",
+      "sizePx": 200,
+      "layer": "atmosphere",
+      "tags": [
+        "fog",
+        "atmosphere",
+        "green"
+      ]
+    },
+    {
+      "name": "fog-wisp-large",
+      "file": "pack/fog-wisp-large.png",
+      "sizePx": 400,
+      "layer": "atmosphere",
+      "tags": [
+        "fog",
+        "atmosphere",
+        "green"
+      ]
+    },
+    {
+      "name": "fog-pool",
+      "file": "pack/fog-pool.png",
+      "sizePx": 400,
+      "layer": "atmosphere",
+      "tags": [
+        "fog",
+        "atmosphere",
+        "green",
+        "dense"
+      ]
+    },
+    {
+      "name": "rubble",
+      "file": "pack/rubble.png",
+      "sizePx": 200,
+      "layer": "dressing",
+      "tags": [
+        "dressing",
+        "rubble",
+        "stone"
+      ]
+    },
+    {
+      "name": "bones",
+      "file": "pack/bones.png",
+      "sizePx": 200,
+      "layer": "dressing",
+      "tags": [
+        "dressing",
+        "bones"
+      ]
+    },
+    {
+      "name": "pillar",
+      "file": "pack/pillar.png",
+      "sizePx": 200,
+      "layer": "dressing",
+      "tags": [
+        "dressing",
+        "pillar"
+      ]
+    },
+    {
+      "name": "sconce",
+      "file": "pack/sconce.png",
+      "sizePx": 100,
+      "layer": "dressing",
+      "tags": [
+        "dressing",
+        "torch",
+        "sconce"
+      ]
+    },
+    {
+      "name": "ritual-circle",
+      "file": "pack/ritual-circle.png",
+      "sizePx": 200,
+      "layer": "dressing",
+      "tags": [
+        "dressing",
+        "ritual",
+        "lich"
+      ]
+    }
+  ],
+  "gaps": [
+    {
+      "name": "skeleton",
+      "reason": "A full articulated skeleton lying down needs AI art \u2014 procedural bones read as a pile, not a body.",
+      "needs": "ai-image"
+    },
+    {
+      "name": "chest",
+      "reason": "A wooden chest from above needs AI art. The openable chest token already uses Foundry's built-in chest icon.",
+      "needs": "ai-image"
+    },
+    {
+      "name": "altar",
+      "reason": "A ritual altar from above needs AI art.",
+      "needs": "ai-image"
+    }
+  ]
+}

@@ -139,8 +139,14 @@ export async function createSceneFromImage(
   });
   const levelId = String(levels[0]?._id ?? "");
   if (!levelId) throw new Error("Level create returned no _id.");
+  // Set initialLevel AND navigation in one post-create update. The create
+  // silently drops `navigation: true` (the Nov 19 monitor session found
+  // it stored as false despite being sent) — an update after create is
+  // the only way the field sticks. Do NOT set scene-level `background`
+  // here: that update is accepted with no error and does nothing in v14
+  // (the earlier wrong "fix"); the Level above carries the map.
   await live.modifyDocument("Scene", "update", {
-    updates: [{ _id: id, initialLevel: levelId }],
+    updates: [{ _id: id, initialLevel: levelId, navigation: true }],
   });
   return id;
 }

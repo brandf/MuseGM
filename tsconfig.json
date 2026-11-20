@@ -1,1 +1,1 @@
-{"compilerOptions":{"esModuleInterop":true,"forceConsistentCasingInFileNames":true,"module":"ESNext","moduleResolution":"Bundler","outDir":"dist","rootDir":"src","skipLibCheck":true,"strict":true,"target":"ES2022","types":["bun-types","node"]},"include":["src/**/*.ts"]}
+{"compilerOptions":{"esModuleInterop":true,"forceConsistentCasingInFileNames":true,"module":"ESNext","moduleResolution":"Bundler","outDir":"dist","skipLibCheck":true,"strict":true,"target":"ES2022","types":["bun-types","node"]},"include":["src/**/*.ts","tests/**/*.ts"]}

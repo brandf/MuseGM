@@ -110,6 +110,12 @@ bun run src/cli/move.ts demo                        # Otari demo: place → glid
 bun run src/cli/ping.ts --x 500 --y 600 [--scene <id>] [--style pulse|alert|pull|arrow] [--pull]
 bun run src/cli/ping.ts --x 500 --y 600 --cursor   # cursor only, no ping
 
+# Dice on demand: parse a chat message, roll, secret GM roll, group check
+bun run src/cli/dice.ts --parse "roll 1d20+5 for Ezren"   # no connection needed
+bun run src/cli/dice.ts --roll "1d20+5" [--flavor Perception] [--actor Ezren]
+bun run src/cli/dice.ts --roll "1d20+3" --secret [--flavor "kobold save"]
+bun run src/cli/dice.ts --group "1d20+2" [--flavor Perception] [--actors id1,id2]
+
 # Run a timed action sequence from a JSON file, or the demo
 bun run src/cli/sequence.ts --file seq.json
 bun run src/cli/sequence.ts demo
