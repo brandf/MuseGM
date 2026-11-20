@@ -414,6 +414,242 @@ ability and art.
 
 **Status:** [~] built + unit-tested offline Nov 20 — `src/session/treasure.ts` + `src/cli/treasure.ts` + `tests/treasure.test.ts` (17 checks). Budget fitting lands exactly on target; stories unique per hoard; 1–2 signature items with named homebrew abilities and the `art`/`artPrompt` hook. Live test pending: no live layer yet — filling a chest from a hoard and the art-generator step are follow-ups. The loot pipeline (P2) does level-banded tables of real PF2e item names + coins, but it is not value-budgeted, has no stories, no magic abilities, and no artwork. This is the treasure half of FR-11's unique-loot rule, generalized to whole hoards.
 
+### FR-15 — High-level floor generation (the vague-brief mode)
+
+**Creator says:** "Here's an entire floor of a dungeon, roughly: I
+want three kind of puzzles here — pressure plates, they need to do
+something interesting with pressure plates in three different rooms to
+unlock a door. A riddle type thing over here. Two minor encounters,
+one of which is an ambush. Then the big boss battle. Some intrigue.
+And further the main storyline in a few different ways."
+
+**Two modes, not one.** Some people want the hands-on, nitty-gritty
+mode (FR-1: "add a door here") — specific, direct, tile by tile.
+Other people want this mode: vague, high-level, throw out ideas and
+let Muse do the creative work. Both modes live in the same system; the
+creator picks per moment, and can switch mid-build.
+
+**Muse authors:** a floor plan — the rooms and their links, the three
+pressure-plate puzzles (each plate does something interesting, all
+three together unlock the door), the riddle, the two minor encounters
+(one an ambush cutscene), the boss battle, the intrigue beats, and the
+storyline threads it advances. All of it woven from the campaign
+history Muse has been chronicling — the recaps, the journals, the
+dungeon theme. The chronicle is the input: the puzzles reference what
+the party has done, the intrigue plays on relationships the chronicle
+recorded, the boss is someone the story has been building toward.
+
+**The convergence loop (before anything is built):** Muse shows the
+plan — a summary plus a sketch of the layout — and the creator reacts.
+Show a few things, erase them, show alternatives. Ask clarifying
+questions when a fork is real; suggest things to gauge what the creator
+might be interested in *before* building a bunch of stuff they don't
+like. Only when the ideas converge does anything get built — and the
+build itself is the cheap part, because the engine already knows how
+(the composer, the encounter generator, the cutscene player, the
+treasure generator, the trap system). The loop is iterative, but the
+iteration happens at the idea level, not the tile level.
+
+**Acceptance:** a vague brief turns into a floor plan the creator
+recognizes as theirs, after at most a few rounds of show-and-erase;
+the locked plan builds with the existing engine pieces (no new
+one-off code per floor); every puzzle, encounter, and intrigue beat
+traces to something in the chronicle or the brief — nothing generic.
+
+**Status:** planner built + unit-tested Nov 20 (`src/session/floor-plan.ts`, `src/cli/floor-plan.ts`, `tests/floor-plan.test.ts` — 34 checks; `bun run floor-plan --demo` prints the lich's lair floor preview + the locked plan and manifest). Live wiring still pending: executing a locked plan's manifest against a real Foundry, and the chat convergence loop (show the preview, take reactions, re-plan).
+
+### FR-16 — Interactive dressing: the map you can touch
+
+**Creator says:** "The maps should feel a lot more interactive than
+they normally would, sometimes in cosmetic ways. If the players go
+around clicking on torches they should be able to light them up and
+put them out. Click a little candle on a table and it lights up."
+
+**Muse authors:** nothing by hand. The composer generates it: given a
+room spec, a dressing pass sprinkles torches along the walls, candles
+on tables, braziers in corners — each one a tile *plus* its light
+*plus* the click wiring that toggles it. A human placing all of that
+would take forever; a script generates it in one pass. The same
+pass can dress a whole dungeon: every room gets its torches and
+candles, each one clickable, each one with a warm light that turns on
+and off.
+
+**Engine executes:** a torch is a dressing tile with a paired
+AmbientLight (dim, warm, flickering — the light language from FR-7)
+and a click handler (a small module, following the Meroki Pins
+pattern, or a generated macro) that toggles the light and posts a
+one-line flavor note in chat ("The torch sputters to life."). A
+candle is the same shape, smaller radius. The toggle is stateful
+(light on/off persists in the light document), and the cutscene
+engine can also drive it (a `light` step with a named light, or a
+torch-off step in an ambush: the room goes dark, then the mage's
+spell lights the center).
+
+**Acceptance:** a room built by the composer has its torches and
+candles placed, lit, and clickable without any hand work; clicking
+toggles the light and the chat line; the same dressing pass works on
+any room spec (not just the demo room); a torch the players put out
+stays out until someone relights it.
+
+**Status:** [~] generator built + unit-tested offline Nov 20 —
+`src/session/dressing.ts` (pure `planDressing` / `toggleDressing` /
+`validateDressingPlan` / `dressingToRoomSpec` / `formatDressingPlan`)
++ `src/cli/dressing.ts` (`--demo` and `--spec <room-spec.json>` need
+no connection) + `tests/dressing.test.ts` (28 checks) +
+`docs/interactive-dressing.md` (the click-wiring design note). The
+generator places torches along the walls (every 3 cells, skipping
+door cells and corners), candles on tables (or floor cells next to a
+wall when there are no tables — placement recorded), braziers in the
+corners of large (8x8+) rooms; deterministic per seed; never two
+items on a cell, never on a maze wall cell. Lights follow the torch
+language from the lighting fix (torch #ff9a3c dim 300/bright 120
+alpha 0.4; candle dim 120/bright 60; brazier dim 400/bright 200).
+The toggle is stateful (off = hidden + alpha 0, on = shown + the
+item's own alpha — a relight restores the same light) with one chat
+line per kind + state. Tile honesty: the pack has a torch tile
+(`sconce`) but NO candle or brazier tile yet — those items carry
+`tile: null` + `tileNeeded` and the plan lists them in `tileGaps`.
+**Still pending:** the click wiring (module vs generated macro vs
+monitor chat command — decide live; recommendation is a small module
+following the Meroki Pins pattern, see the design note), the composer
+hook that runs the dressing pass on every room it builds (and writes
+the light `_id`s + `flags.meroki.dressingId` back onto the tiles),
+the candle/brazier pack tiles, and the alpha gap (`LightSpec` has no
+alpha; `addLights` hardcodes 0.5 — the hook must set alpha in a
+post-create update or `LightSpec` grows an `alpha` field).
+
+### FR-17 — Sound: effects and background music
+
+**Creator says:** "We'll probably want to get into sound effects and
+background music and stuff like that eventually too."
+
+**Muse authors:** a soundscape per room and per moment — ambient
+music for the dungeon theme (cold, echoing, low), and sound effects
+tied to events: a door creak when the secret door opens, a snap when
+a trap fires, a whoosh when a torch ignites, a swell when the boss
+enters. The cutscene engine gets a `sound` step (play a named effect,
+start/stop a playlist, fade a track over N seconds — the same timed
+transition shape as the light step).
+
+**Engine executes:** Foundry playlists (ambient music per scene,
+fading between rooms) and one-shot effects (a `sound` step in a
+cutscene script, a trap's fire sound, a torch's ignite). The pieces
+are the same as lighting: a named asset, a timed transition, a
+trigger.
+
+**Acceptance:** a room has an ambient track that starts when the
+party enters and fades when they leave; a cutscene can play an
+effect at a timed step; a trap's sound fires with the trap.
+
+**Status:** not built — design only. Open questions before building:
+where do the tracks come from (Foundry's built-in sounds, uploaded
+files, a generated set), and does the table want music at all in the
+first sessions (ask Dave — it's a taste question, not a technical
+one). The `sound` step schema can be built with the cutscene engine
+once the asset question is answered.
+
+### FR-18 — Mid-session emergent sequences (the GM whispers an idea)
+
+**GM says, privately, mid-session:** "The players just started
+screaming, so let's have a whole bunch of mice rush in the room.
+They're going to think it's some minor encounter with mice, but
+really the mice are just running by them, biting, trying to get down
+the hall — because they've alerted a huge ogre. Five rounds later,
+after five rounds of mice biting them as they run by and they're
+trying to work their way down the hall, this ogre shows up and roars
+and smashes on the wall and all the lights go out."
+
+**The mode:** not map building, not design — a mid-session workflow.
+The GM isn't moving things around much; an idea pops into their head
+and they give it to Muse on the side, as a private message. Muse goes
+off and sets the whole thing up real quick while the players are
+sitting there screwing around looking for loot and hidden traps and
+hidden doors — and the next thing they know the sequence just plays
+out. None of it was planned ahead of time. It's emergent behavior,
+driven by an idea in the moment.
+
+**The side channel:** the GM's idea arrives privately, not in the
+public chat — a whisper to Meroki in Foundry (visible only to the GM
+and to us), or a message to the GM's own Muse. The players never see
+the setup. The monitor treats a GM whisper as an instruction, not as
+table chatter — and it acts on it without announcing itself.
+
+**Muse authors:** a multi-phase script, on the fly. Phase one: the
+mice — a swarm of tokens placed at the door, gliding through the room
+and down the hall, biting as they pass (a little damage, a little
+chaos, and the players thinking it's a minor encounter). Phase two,
+five rounds later: the ogre — a big token at the door, a roar in
+chat, a wall smash (a wall segment comes down, rubble dressing
+appears), and all the lights go out (every light dimmed to nothing,
+the room in darkness). The clock is combat rounds, not wall-clock
+seconds — the sequence advances on the round, so it stays in sync
+with the fight the players are already in.
+
+**Engine executes:** the cutscene player, extended with a round clock
+(`waitRound` steps), a rush-through movement pattern (tokens that
+pass through a room and out the far door, biting as they go), a
+lights-out step (all lights off at once), and a wall-break step
+(remove a wall segment, drop rubble). The encounter is generated on
+the fly (the encounter generator: a mouse swarm + an ogre, both
+fleshed out with the FR-11 rules) — nothing is pre-built, nothing is
+canned. From whisper to the first mouse in the room is seconds.
+
+**Acceptance:** a GM whisper turns into a playing sequence in under
+a minute, with no public announcement of the setup; the mice move
+and bite for five rounds and then the ogre arrives on the round
+clock; the wall smash and the lights-out land as part of the same
+script; the players experience it as one continuous event, not as
+Muse doing setup in front of them.
+
+**The trigger can be a player's own line.** The idea pops into the
+GM's head off something a player says while finishing off the ogre —
+"well, at least we have time to rest before the boss!" — and the GM
+decides to answer that assumption. The table's own words are an input
+to the emergent mode, not just noise: the GM hears the line, whispers
+the twist, and within a minute or two the crazy next thing is
+happening and the players are saying "what is going on? This is
+nuts." The latency budget is the point: whisper to first visible
+effect in one to two minutes, or the moment is gone. And the feel
+matters as much as the speed — delighted chaos, not confusion: the
+sequence is surprising but legible (they can see the mice, the ogre,
+the tentacle), so the table reads it as one continuous event, not as
+noise.
+
+**The twist (phase three):** after the ogre battle, the GM gets
+another idea — the players are celebrating, looking through the
+ogre's meager possessions for treasure, and a tentacle rips through
+the ogre's stomach and a tentacle creature emerges: the true boss of
+the level. The ogre was a fake-out. Muse generates, on the fly, a
+gory image — the ogre lying on the ground with a tentacle ripped
+through its stomach — and shows it to the players at the moment it
+happens. The image *is* the reveal: the players see it before they
+see the stat block, and then the real battle starts. The same
+pattern chains: a second whisper arrives mid-celebration, Muse
+appends a new phase to the running sequence (the corpse token becomes
+the emergence point), generates the image, shows it, and the new
+encounter begins. The reveal image is a first-class mechanic — a
+`reveal` step in the cutscene engine (upload the image, post it to
+chat with the image inline, or pop it up on screen), with the prompt
+grounded in the fiction (the room they're in, the corpse on the
+floor, the tentacle). This is also the answer to the open question
+from the Nov 19 session about attaching images to chat or popping
+them up when something big happens.
+
+**Status:** [~] built + unit-tested offline Nov 20 — the round clock
+(`waitRound`), `rush`, `lightsOut`, and `breakWall` steps in the
+cutscene engine (`src/session/cutscene.ts` + `src/session/sequence.ts`
++ `src/session/lights.ts` `lightsOutPlan`/`lightsOut` + `src/session/pins.ts`
+`sceneWalls` now exported for the wall lookup), the `emerge` step,
+and the `reveal` image step (`src/session/reveal.ts` — prompt
+builder grounded in the room + corpse + creature, chat HTML with the
+image inline; popout falls back to chat, honestly). `examples/mice-ogre.json`
+(10 → 38 steps) and `examples/tentacle-twist.json` (7 → 7 steps) both
+validate with `--validate-only`; `tests/emergent.test.ts` (26 checks).
+Still pending: the monitor's GM-whisper handling (a whisper to us is
+an instruction, not chatter), and the live test — which is a real
+mid-session moment, not a lab case, now with the twist: the reveal
+image landing in chat at the moment of the emergence.
+
 ## What exists vs what is next
 
 | Piece | Status |
@@ -432,6 +668,10 @@ ability and art.
 | Scripted tile swaps (FR-13 swapTile) | Built, unit-tested (Nov 20) |
 | Edit history / undo | Not built |
 | Props in the room spec | Not built |
+| High-level floor generation (FR-15) | Planner + preview + manifest built, unit-tested; live wiring pending |
+| Interactive dressing: clickable torches/candles (FR-16) | Generator built, unit-tested (Nov 20); click wiring + composer hook pending |
+| Sound: effects + background music (FR-17) | Not built — design only, asset question open |
+| Mid-session emergent sequences (FR-18) | Built, unit-tested (Nov 20) — round clock + rush + lights-out + wall-break + emerge + reveal image; monitor whisper handling + live test pending |
 
 ## Build order
 
@@ -459,6 +699,24 @@ ability and art.
    (FR-3) — the reveal mechanics.
 9. **Lighting as a language** (FR-7) — timed transitions, named lights.
 10. **Director mode** (FR-9) — v2, after the table has felt cutscenes.
+11. **High-level floor generation** (FR-15) — the vague-brief mode:
+    the floor planner + convergence loop + orchestration of the
+    existing builders. The capstone: it only works once the pieces
+    above exist, and it is the mode that makes the whole thing feel
+    magical.
+12. **Interactive dressing** (FR-16) — the dressing generator +
+    click wiring: torches and candles the players can light and put
+    out. Builds on the lighting language (FR-7) and the Pins module
+    pattern.
+13. **Sound** (FR-17) — effects + background music, once the asset
+    question (where tracks come from, does the table want it) is
+    answered.
+14. **Mid-session emergent sequences** (FR-18) — the GM whispers an
+    idea, Muse sets it up in seconds, it plays out in rounds: the
+    round clock, rush-through movement, lights-out, wall-break.
+    Builds on the cutscene engine, the encounter generator, and the
+    lighting language — and it's the mode the table will feel most
+    directly, so it goes right after the pieces it needs.
 
 ## How the system gets better (Brandon, Nov 19)
 
@@ -484,3 +742,17 @@ one-off becomes a tool, it gets a line there.
 improvement.** Build it, try it live at the table, see what breaks or
 what's slow, fix it, build the next thing. The live session is the test
 — the walkthrough demo each session is where the trial happens.
+
+**The ideas are illustrations, not a build list (Brandon, Nov 19).**
+The mice, the ogre, the tentacle — those are off-the-cuff ideas,
+given to show the direction, not specific things to go build. The
+deliverable is the toolkit: whatever tools Muse thinks it needs, so
+that when the creator comes up with this kind of stuff in the future —
+or anything else they might imagine — the tools are already there to
+make it happen on the fly, as fast as possible, as reliable as
+possible, as high quality as possible. The players are used to this
+stuff having to be planned out weeks in advance; the experience MuseGM
+is aiming for is the opposite — the GM thinks it, and it happens.
+Every feature request in this document should be read that way: a
+scenario is a test case for the toolbox, and the toolbox is the
+product.

@@ -25,11 +25,13 @@ import type { FoundryLive, PingStyle } from "../live.js";
 import { moveTokenTo, placeToken, deleteToken, resolveToken, resolveScene } from "./movement.js";
 import { postVisibleRoll } from "./dice.js";
 import { dedupeKeyFor } from "../idempotency.js";
-import { animateLight } from "./lights.js";
+import { animateLight, lightsOut } from "./lights.js";
 import type { LightSelector, LightState } from "./lights.js";
 import { angleToFace } from "./formations.js";
 import { FLAG_SCOPE } from "../idempotency.js";
 import { swapTileTexture } from "./tile-ops.js";
+import { nearestWall, sceneWalls } from "./pins.js";
+import { revealImageChatHtml } from "./reveal.js";
 
 export type SequenceStep =
   | { kind: "place"; sceneId: string; actor: string; x: number; y: number; name?: string; key?: string }
@@ -48,8 +50,12 @@ export type SequenceStep =
   | { kind: "light"; sceneId: string; light: LightSelector; dim?: number; bright?: number; color?: string; alpha?: number; durationMs?: number; steps?: number; from?: Partial<LightState> }
   | { kind: "prop"; sceneId: string; src: string; x: number; y: number; width?: number; height?: number; rotation?: number; elevation?: number; sort?: number; alpha?: number; hidden?: boolean; key?: string }
   | { kind: "reveal"; what: "scene" | "tile" | "token" | "light"; id: string; sceneId?: string }
+  | { kind: "reveal"; what?: "image"; image: string; caption?: string; mode?: "chat" | "popout"; alias?: string; sceneId?: string }
   | { kind: "wait"; timeout?: number; debounce?: number; match?: string }
-  | { kind: "swapTile"; sceneId: string; tile?: string; cell?: { x: number; y: number }; to: string };
+  | { kind: "swapTile"; sceneId: string; tile?: string; cell?: { x: number; y: number }; to: string }
+  | { kind: "waitRound"; round: number; relative?: boolean; timeoutMs?: number; sceneId?: string }
+  | { kind: "lightsOut"; sceneId: string; durationMs?: number; steps?: number }
+  | { kind: "breakWall"; sceneId: string; wallId?: string; at?: { x: number; y: number }; rubble?: boolean };
 
 export interface StepResult {
   index: number;
@@ -85,7 +91,7 @@ const sleep = (ms: number): Promise<void> =>
 
 const KNOWN_KINDS = new Set([
   "place", "deleteToken", "move", "pause", "chat", "roll", "damage", "heal", "effect", "ping", "cursor", "waitChat",
-  "face", "light", "prop", "reveal", "wait", "swapTile",
+  "face", "light", "prop", "reveal", "wait", "swapTile", "waitRound", "lightsOut", "breakWall",
 ]);
 
 type RawActorAccess = {
@@ -154,7 +160,9 @@ export async function runSequence(
           const placedRef = { id: tokenId, name: tokenName, x: step.x, y: step.y };
           placed.set(tokenName, placedRef);
           placed.set(tokenId, placedRef);
-          result.result = { tokenId, name: tokenName };
+          // The key rides in the step log so a re-run can be traced
+          // to its intent (an emerge key names the corpse token).
+          result.result = key ? { tokenId, name: tokenName, key } : { tokenId, name: tokenName };
           break;
         }
         case "deleteToken":
@@ -350,25 +358,47 @@ export async function runSequence(
           break;
         }
         case "reveal": {
+          // FR-18 image reveal: the image posts inline in chat.
+          // "popout" is accepted by validation but has no client-side
+          // route from the MCP path — it falls back to the chat post
+          // and the result says so, never pretending a popup happened.
+          if (step.what === "image" || ("image" in step && step.image !== undefined)) {
+            const imageStep = step as { image: string; caption?: string; mode?: "chat" | "popout"; alias?: string };
+            const mode = imageStep.mode ?? "chat";
+            const html = revealImageChatHtml(imageStep.image, imageStep.caption);
+            const id = await live.sendChat(html, { alias: imageStep.alias });
+            result.result =
+              mode === "popout"
+                ? {
+                    id,
+                    mode,
+                    popout: false,
+                    note: "No client-side popout is reachable from the MCP path — posted inline in chat instead.",
+                  }
+                : { id, mode };
+            break;
+          }
           // Activating a scene switches the whole table's view to it —
           // the GM's call, and the reason reveal is a deliberate step,
           // not a side effect of building. Unhiding a tile/token/light
-          // just makes that one document visible.
-          if (step.what === "scene") {
+          // just makes that one document visible. (The image variant
+          // returned above, so what is scene|tile|token|light here.)
+          const doc = step as { what: "scene" | "tile" | "token" | "light"; id: string; sceneId?: string };
+          if (doc.what === "scene") {
             await live.modifyDocument("Scene", "update", {
-              updates: [{ _id: step.id, navigation: true, active: true }],
+              updates: [{ _id: doc.id, navigation: true, active: true }],
             });
-            result.result = { sceneId: step.id, active: true };
+            result.result = { sceneId: doc.id, active: true };
           } else {
-            if (!step.sceneId) throw new Error(`reveal ${step.what} needs sceneId.`);
-            const scene = resolveScene(live, step.sceneId);
+            if (!doc.sceneId) throw new Error(`reveal ${doc.what} needs sceneId.`);
+            const scene = resolveScene(live, doc.sceneId);
             const type =
-              step.what === "tile" ? "Tile" : step.what === "token" ? "Token" : "AmbientLight";
+              doc.what === "tile" ? "Tile" : doc.what === "token" ? "Token" : "AmbientLight";
             await live.modifyDocument(type, "update", {
-              updates: [{ _id: step.id, hidden: false }],
+              updates: [{ _id: doc.id, hidden: false }],
               parentUuid: `Scene.${scene._id}`,
             });
-            result.result = { what: step.what, id: step.id, hidden: false };
+            result.result = { what: doc.what, id: doc.id, hidden: false };
           }
           break;
         }
@@ -402,6 +432,114 @@ export async function runSequence(
                 : null;
           if (!target) throw new Error("swapTile step needs tile (id) or cell ({x, y}).");
           result.result = await swapTileTexture(live, step.sceneId, target, step.to);
+          break;
+        }
+        case "waitRound": {
+          // FR-18 round clock: the sequence advances on combat
+          // rounds, not wall-clock seconds, so it stays in sync with
+          // the fight the players are already in. Polls the combat
+          // state every 2s; a round already passed returns at once.
+          const combat = live.getCombatState() as unknown as
+            | { _id: string; round?: number; active?: boolean }
+            | null;
+          if (!combat || combat.round === undefined) {
+            throw new Error("waitRound needs an active combat (no combat state right now).");
+          }
+          const targetRound = step.relative ? combat.round + step.round : step.round;
+          const timeoutMs = step.timeoutMs ?? 30 * 60 * 1000;
+          const startedAt = Date.now();
+          let round = combat.round;
+          while (round < targetRound) {
+            if (Date.now() - startedAt > timeoutMs) {
+              throw new Error(
+                `waitRound timed out after ${timeoutMs}ms waiting for round ${targetRound} (still round ${round}).`,
+              );
+            }
+            await sleep(2000);
+            const now = live.getCombatState() as unknown as
+              | { round?: number; active?: boolean }
+              | null;
+            if (!now || now.round === undefined) {
+              throw new Error("waitRound: combat ended while waiting.");
+            }
+            round = now.round;
+          }
+          result.result = {
+            round,
+            targetRound,
+            waitedMs: Date.now() - startedAt,
+            alreadyPast: round > targetRound,
+          };
+          break;
+        }
+        case "lightsOut": {
+          // FR-18: every light on the scene fades to nothing, in
+          // parallel — a blackout, not a wave.
+          const faded = await lightsOut(live, step.sceneId, {
+            durationMs: step.durationMs,
+            steps: step.steps,
+          });
+          result.result = { lights: faded.length, lightIds: faded.map((f) => f.lightId) };
+          break;
+        }
+        case "breakWall": {
+          // FR-18: smash a wall segment down and drop rubble where
+          // it stood. The wall is picked by _id, or the nearest wall
+          // to the smash point (pins.ts point-to-segment helper).
+          const scene = resolveScene(live, step.sceneId);
+          const { walls } = sceneWalls(live, step.sceneId);
+          let wall: { _id?: string; x1: number; y1: number; x2: number; y2: number } | undefined;
+          let breakAt: { x: number; y: number };
+          if (step.wallId !== undefined) {
+            wall = walls.find((w) => w._id === step.wallId);
+            if (!wall) {
+              throw new Error(`breakWall: no wall with _id ${step.wallId} on scene ${step.sceneId}.`);
+            }
+            breakAt = { x: (wall.x1 + wall.x2) / 2, y: (wall.y1 + wall.y2) / 2 };
+          } else if (step.at !== undefined) {
+            const near = nearestWall(walls, step.at.x, step.at.y);
+            if (!near) {
+              throw new Error(
+                `breakWall: no wall within 150px of (${step.at.x}, ${step.at.y}) on scene ${step.sceneId}.`,
+              );
+            }
+            wall = near.wall;
+            breakAt = { x: step.at.x, y: step.at.y };
+          } else {
+            throw new Error("breakWall step needs wallId or at.");
+          }
+          if (!wall._id) throw new Error("breakWall: the wall to smash has no _id in the cache.");
+          await live.modifyDocument("Wall", "delete", {
+            ids: [wall._id],
+            parentUuid: `Scene.${scene._id}`,
+          });
+          let rubbleTileId: string | undefined;
+          if (step.rubble ?? true) {
+            // Rubble dressing tile from the pack (worlds/testbed/
+            // rubble.png once uploadTilePack has run) — centered on
+            // the break, same Tile shape as the prop handler.
+            const created = await live.modifyDocument("Tile", "create", {
+              data: [
+                {
+                  texture: { src: "worlds/testbed/rubble.png" },
+                  x: Math.round(breakAt.x - 100),
+                  y: Math.round(breakAt.y - 100),
+                  width: 200,
+                  height: 200,
+                  elevation: 0,
+                  sort: 20,
+                  rotation: 0,
+                  alpha: 1,
+                  hidden: false,
+                  locked: false,
+                },
+              ],
+              parentUuid: `Scene.${scene._id}`,
+            });
+            rubbleTileId = String(created[0]?._id ?? "");
+            if (!rubbleTileId) throw new Error("Rubble tile create returned no _id.");
+          }
+          result.result = { wallId: wall._id, breakAt, rubbleTileId };
           break;
         }
       }

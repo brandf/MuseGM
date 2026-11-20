@@ -499,8 +499,8 @@ interface RawScene {
   notes?: { _id?: string; flags?: Record<string, unknown> }[];
 }
 
-/** Read a scene's walls from the cache. */
-function sceneWalls(live: FoundryLive, sceneId: string): { walls: WallSeg[]; size: { width: number; height: number } } {
+/** Read a scene's walls from the cache. Exported for the breakWall step (FR-18). */
+export function sceneWalls(live: FoundryLive, sceneId: string): { walls: WallSeg[]; size: { width: number; height: number } } {
   const raw = live.raw() as unknown as {
     getScenes(): RawScene[];
   };

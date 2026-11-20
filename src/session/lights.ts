@@ -151,8 +151,79 @@ export function resolveLight(
   return { id: best._id, current: lightStateOf(best) };
 }
 
-const sleep = (ms: number): Promise<void> =>
-  new Promise((resolve) => setTimeout(resolve, ms));
+export interface LightsOutTarget {
+  lightId: string;
+  /** Current state (the fade starts here). */
+  from: LightState;
+  /** The dark state: no radius, no alpha, color unchanged. */
+  to: LightState;
+  durationMs: number;
+  steps: number;
+}
+
+export interface LightsOutPlanOptions {
+  /** Total fade time. Default 800ms — fast, but a fade, not a blink. */
+  durationMs?: number;
+  /** Update steps across the fade. Default 8. */
+  steps?: number;
+}
+
+/**
+ * FR-18 lights-out, pure half: every light on the scene fades to
+ * nothing. The target keeps the light's color (a dead torch is still
+ * a torch) and zeroes dim, bright, and alpha. A light already dark
+ * stays in the plan with a zero-length fade — the plan is the full
+ * scene, so the caller can see nothing was missed.
+ */
+export function lightsOutPlan(
+  lights: LightDoc[],
+  opts: LightsOutPlanOptions = {},
+): LightsOutTarget[] {
+  const durationMs = opts.durationMs ?? 800;
+  const steps = opts.steps ?? 8;
+  if (!(durationMs > 0) || !Number.isFinite(durationMs)) {
+    throw new Error(`lightsOutPlan: durationMs must be > 0, got ${durationMs}`);
+  }
+  if (!Number.isInteger(steps) || steps < 1) {
+    throw new Error(`lightsOutPlan: steps must be an integer >= 1, got ${steps}`);
+  }
+  return lights.map((doc) => {
+    const from = lightStateOf(doc);
+    return {
+      lightId: doc._id,
+      from,
+      to: { dim: 0, bright: 0, color: from.color, alpha: 0 },
+      durationMs,
+      steps,
+    };
+  });
+}
+
+/**
+ * FR-18 lights-out, live half: fade every AmbientLight on the scene
+ * to nothing, in parallel (one fade per light — a sequential fade
+ * across ten lights would take ten times as long and read as a
+ * wave, not a blackout). Returns the per-light results.
+ */
+export async function lightsOut(
+  live: FoundryLive,
+  sceneId: string,
+  opts: LightsOutPlanOptions = {},
+): Promise<{ lightId: string; final: LightState }[]> {
+  const lights = resolveSceneLights(live, sceneId);
+  const plan = lightsOutPlan(lights, opts);
+  return Promise.all(
+    plan.map((t) =>
+      animateLight(
+        live,
+        sceneId,
+        { id: t.lightId },
+        t.to,
+        { durationMs: t.durationMs, steps: t.steps, from: t.from },
+      ),
+    ),
+  );
+}
 
 export interface AnimateLightOptions {
   /** Total time for the transition. Default 2000ms. */
@@ -162,6 +233,9 @@ export interface AnimateLightOptions {
   /** Explicit starting state (skips the cache read). */
   from?: Partial<LightState>;
 }
+
+const sleep = (ms: number): Promise<void> =>
+  new Promise((resolve) => setTimeout(resolve, ms));
 
 /**
  * Animate a light from its current state (or `from`) to `target`

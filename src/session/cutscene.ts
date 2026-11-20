@@ -28,6 +28,7 @@ import type { RunSequenceOptions, SequenceResult } from "./sequence.js";
 import { ringPositions, linePositions, wedgePositions } from "./formations.js";
 import type { Point } from "./formations.js";
 import { resolveToken } from "./movement.js";
+import { validateReveal } from "./reveal.js";
 
 export interface FormationStep {
   kind: "formation";
@@ -56,7 +57,55 @@ export interface FormationStep {
   sceneId?: string;
 }
 
-export type CutsceneStep = SequenceStep | FormationStep;
+export interface RushStep {
+  kind: "rush";
+  /** Actor names to place, one token each (duplicates get " 1", " 2" …). */
+  tokens: string[];
+  /** Where the rush starts (usually a door). */
+  from: Point;
+  /** Waypoints in order — the room, the hall, the far door. */
+  through: Point[];
+  /** Where the rush ends (usually the far door). */
+  to: Point;
+  /**
+   * Bite as the rush passes a waypoint: one visible roll per token
+   * per `through` waypoint. The roll IS the damage roll — it posts
+   * in chat with the target named in the flavor. Applying the HP is
+   * the GM's call: the sequence runner has no variable passing, so
+   * a rolled amount cannot feed a `damage` step in the same
+   * expansion. Targets are picked round-robin from the author's
+   * ordered list (list them in the order the rush passes them —
+   * that order is the nearest-target approximation at expansion
+   * time, when live positions are not available).
+   */
+  bite?: { damage: string; targets?: string[] };
+  speed?: number;
+  /** Pause between tokens entering (ms). Default 0. */
+  staggerMs?: number;
+  namePrefix?: string;
+  sceneId?: string;
+}
+
+export interface EmergeStep {
+  kind: "emerge";
+  /** The corpse token the new creature comes out of. */
+  fromToken: string;
+  /** Actor to place (must exist in the world). */
+  actor: string;
+  /** Display name for the new token. Default: the actor's name. */
+  name?: string;
+  /**
+   * Where the corpse is. When present, expansion uses it and never
+   * needs a live resolver (so --validate-only works); when absent,
+   * the live player resolves the corpse token's current position.
+   * Omit it when the corpse may have moved since the script was
+   * written — the token is the authority.
+   */
+  at?: Point;
+  sceneId?: string;
+}
+
+export type CutsceneStep = SequenceStep | FormationStep | RushStep | EmergeStep;
 
 export interface CutsceneScript {
   version: 1;
@@ -69,7 +118,16 @@ export interface CutsceneScript {
 const SEQUENCE_KINDS = new Set([
   "place", "deleteToken", "move", "pause", "chat", "roll", "damage", "heal", "effect",
   "ping", "cursor", "waitChat", "face", "light", "prop", "reveal", "wait", "swapTile",
+  "waitRound", "lightsOut", "breakWall",
 ]);
+
+/**
+ * Intent steps — expanded by expandCutscene before the timeline runs,
+ * like `formation`. `rush` and `emerge` need no live resolver when
+ * their positions are coordinates; a token-resolved position needs
+ * the `centerOf` resolver (playCutscene supplies it).
+ */
+const INTENT_KINDS = new Set(["formation", "rush", "emerge"]);
 
 const STEP_FIELDS: Record<string, Set<string>> = {
   place: new Set(["kind", "sceneId", "actor", "x", "y", "name", "key", "note"]),
@@ -87,10 +145,15 @@ const STEP_FIELDS: Record<string, Set<string>> = {
   face: new Set(["kind", "sceneId", "token", "x", "y", "towardToken", "rotation", "note"]),
   light: new Set(["kind", "sceneId", "light", "dim", "bright", "color", "alpha", "durationMs", "steps", "from", "note"]),
   prop: new Set(["kind", "sceneId", "src", "x", "y", "width", "height", "rotation", "elevation", "sort", "alpha", "hidden", "key", "note"]),
-  reveal: new Set(["kind", "what", "id", "sceneId", "note"]),
+  reveal: new Set(["kind", "what", "id", "sceneId", "image", "caption", "mode", "alias", "note"]),
   wait: new Set(["kind", "timeout", "debounce", "match", "note"]),
   swapTile: new Set(["kind", "sceneId", "tile", "cell", "to", "note"]),
   formation: new Set(["kind", "shape", "count", "actor", "center", "from", "to", "apex", "directionDeg", "spreadDeg", "spacing", "radius", "enterFrom", "speed", "staggerMs", "namePrefix", "prop", "sceneId", "note"]),
+  rush: new Set(["kind", "tokens", "from", "through", "to", "bite", "speed", "staggerMs", "namePrefix", "sceneId", "note"]),
+  waitRound: new Set(["kind", "round", "relative", "timeoutMs", "sceneId", "note"]),
+  lightsOut: new Set(["kind", "sceneId", "durationMs", "steps", "note"]),
+  breakWall: new Set(["kind", "wallId", "at", "rubble", "sceneId", "note"]),
+  emerge: new Set(["kind", "fromToken", "actor", "name", "at", "sceneId", "note"]),
 };
 
 function isRecord(v: unknown): v is Record<string, unknown> {
@@ -186,7 +249,7 @@ export function validateCutscene(
     const fields = STEP_FIELDS[kind];
     if (!fields) {
       errors.push(
-        `Step ${i}: unknown kind ${JSON.stringify(kind)} (known: ${[...SEQUENCE_KINDS, "formation"].sort().join(", ")}).`,
+        `Step ${i}: unknown kind ${JSON.stringify(kind)} (known: ${[...SEQUENCE_KINDS, ...INTENT_KINDS].sort().join(", ")}).`,
       );
       continue;
     }
@@ -276,12 +339,35 @@ export function validateCutscene(
         numField(errors, raw, i, "sort", {});
         numField(errors, raw, i, "alpha", { min: 0 });
         break;
-      case "reveal":
-        if (raw.what !== "scene" && raw.what !== "tile" && raw.what !== "token" && raw.what !== "light") {
-          errors.push(`Step ${i} (reveal): "what" must be scene|tile|token|light, got ${JSON.stringify(raw.what)}.`);
+      case "reveal": {
+        // Two shapes, one kind: unhide a document (what + id), or
+        // show an image (what: "image" — or no `what` at all when
+        // `image` is present, the shape the FR-18 brief writes).
+        const isImage =
+          raw.what === "image" ||
+          (raw.what === undefined && typeof raw.image === "string");
+        if (isImage) {
+          if (raw.what !== undefined && raw.what !== "image") {
+            errors.push(`Step ${i} (reveal): "what" must be image when "image" is given.`);
+          }
+          const checked = validateReveal(raw as unknown as Parameters<typeof validateReveal>[0]);
+          if (!checked.ok) {
+            for (const e of checked.errors) errors.push(`Step ${i} (${kind}): ${e}`);
+          }
+          if (raw.id !== undefined) {
+            errors.push(`Step ${i} (reveal): "id" does not apply to an image reveal.`);
+          }
+        } else {
+          if (raw.what !== "scene" && raw.what !== "tile" && raw.what !== "token" && raw.what !== "light") {
+            errors.push(`Step ${i} (reveal): "what" must be scene|tile|token|light|image, got ${JSON.stringify(raw.what)}.`);
+          }
+          strField(errors, raw, i, "id", true);
+          if (raw.image !== undefined || raw.caption !== undefined || raw.mode !== undefined) {
+            errors.push(`Step ${i} (reveal): "image"/"caption"/"mode" only apply when "what" is "image".`);
+          }
         }
-        strField(errors, raw, i, "id", true);
         break;
+      }
       case "swapTile": {
         const hasTile = typeof raw.tile === "string" && raw.tile.length > 0;
         const hasCell = isPoint(raw.cell);
@@ -334,6 +420,77 @@ export function validateCutscene(
         }
         break;
       }
+      case "rush": {
+        if (!Array.isArray(raw.tokens) || raw.tokens.length === 0) {
+          errors.push(`Step ${i} (rush): "tokens" must be a non-empty array of actor names.`);
+        } else {
+          for (const t of raw.tokens) {
+            if (typeof t !== "string" || t.length === 0) {
+              errors.push(`Step ${i} (rush): every "tokens" entry must be a non-empty string.`);
+              break;
+            }
+          }
+        }
+        if (!isPoint(raw.from)) errors.push(`Step ${i} (rush): "from" must be {x, y}.`);
+        if (!isPoint(raw.to)) errors.push(`Step ${i} (rush): "to" must be {x, y}.`);
+        if (!Array.isArray(raw.through)) {
+          errors.push(`Step ${i} (rush): "through" must be an array of {x, y} waypoints (possibly empty).`);
+        } else {
+          for (const w of raw.through) {
+            if (!isPoint(w)) {
+              errors.push(`Step ${i} (rush): every "through" waypoint must be {x, y}.`);
+              break;
+            }
+          }
+        }
+        if (raw.bite !== undefined) {
+          if (!isRecord(raw.bite) || typeof raw.bite.damage !== "string" || raw.bite.damage.length === 0) {
+            errors.push(`Step ${i} (rush): "bite" must be {damage: "1d4", targets?: [...]}.`);
+          } else if (
+            raw.bite.targets !== undefined &&
+            (!Array.isArray(raw.bite.targets) ||
+              raw.bite.targets.some((t) => typeof t !== "string" || t.length === 0))
+          ) {
+            errors.push(`Step ${i} (rush): "bite.targets" must be an array of non-empty strings.`);
+          }
+        }
+        numField(errors, raw, i, "speed", { min: 1 });
+        numField(errors, raw, i, "staggerMs", { min: 0, integer: true });
+        break;
+      }
+      case "waitRound":
+        numField(errors, raw, i, "round", { required: true, min: 1, integer: true });
+        numField(errors, raw, i, "timeoutMs", { min: 1, integer: true });
+        break;
+      case "lightsOut":
+        numField(errors, raw, i, "durationMs", { min: 1 });
+        numField(errors, raw, i, "steps", { min: 1, integer: true });
+        break;
+      case "breakWall": {
+        const hasId = typeof raw.wallId === "string" && raw.wallId.length > 0;
+        const hasAt = isPoint(raw.at);
+        if (hasId && raw.at !== undefined) {
+          errors.push(`Step ${i} (breakWall): give exactly one of "wallId" or "at" ({x, y}), not both.`);
+        } else if (!hasId && !hasAt) {
+          errors.push(`Step ${i} (breakWall): give "wallId" (the Wall _id) or "at" ({x, y}) to pick the wall to smash.`);
+        } else if (raw.at !== undefined && !hasAt) {
+          errors.push(`Step ${i} (breakWall): "at" must be {x, y}.`);
+        } else if (raw.wallId !== undefined && !hasId) {
+          errors.push(`Step ${i} (breakWall): "wallId" must be a non-empty string (the Wall _id).`);
+        }
+        if (raw.rubble !== undefined && typeof raw.rubble !== "boolean") {
+          errors.push(`Step ${i} (breakWall): "rubble" must be a boolean.`);
+        }
+        break;
+      }
+      case "emerge":
+        strField(errors, raw, i, "fromToken", true);
+        strField(errors, raw, i, "actor", true);
+        if (raw.name !== undefined) strField(errors, raw, i, "name");
+        if (raw.at !== undefined && !isPoint(raw.at)) {
+          errors.push(`Step ${i} (emerge): "at" must be {x, y}.`);
+        }
+        break;
     }
   }
   if (errors.length > 0) return { ok: false, errors };
@@ -370,6 +527,14 @@ export function expandCutscene(
       out.push(...expandFormation(script, step, i, opts.centerOf));
       continue;
     }
+    if (step.kind === "rush") {
+      out.push(...expandRush(script, step, i));
+      continue;
+    }
+    if (step.kind === "emerge") {
+      out.push(...expandEmerge(script, step, i, opts.centerOf));
+      continue;
+    }
     const s = { ...step } as Record<string, unknown>;
     if (defaultSceneId && s.sceneId === undefined && STEP_FIELDS[step.kind].has("sceneId")) {
       s.sceneId = defaultSceneId;
@@ -378,6 +543,101 @@ export function expandCutscene(
     out.push(s as unknown as SequenceStep);
   }
   return out;
+}
+
+/**
+ * Expand a rush intent: one token per entry in `tokens`, placed at
+ * `from`, gliding through each waypoint in order to `to`, staggered
+ * so the swarm reads as a stream rather than a single block. A bite
+ * fires after each `through` waypoint (not at `to` — by then the
+ * token has left the room): one visible roll per token per waypoint,
+ * the target picked round-robin from the author's ordered list.
+ * Pure — no live resolver needed, so --validate-only expands it.
+ */
+function expandRush(script: CutsceneScript, step: RushStep, index: number): SequenceStep[] {
+  const sceneId = step.sceneId ?? script.sceneId;
+  if (!sceneId) {
+    throw new Error(`Rush step ${index}: no sceneId (set it on the step or the script).`);
+  }
+  const out: SequenceStep[] = [];
+  const staggerMs = step.staggerMs ?? 0;
+  const speed = step.speed;
+  const waypoints = [...step.through, step.to];
+  const counts = new Map<string, number>();
+  for (let n = 0; n < step.tokens.length; n++) {
+    const actor = step.tokens[n];
+    const seen = (counts.get(actor) ?? 0) + 1;
+    counts.set(actor, seen);
+    const name =
+      step.tokens.filter((t) => t === actor).length > 1
+        ? `${step.namePrefix ?? actor} ${seen}`
+        : (step.namePrefix ?? actor);
+    const key = `cutscene:${script.name}:rush-${index}-${n + 1}`;
+    if (n > 0 && staggerMs > 0) out.push({ kind: "pause", ms: staggerMs });
+    out.push({ kind: "place", sceneId, actor, x: step.from.x, y: step.from.y, name, key });
+    for (let w = 0; w < waypoints.length; w++) {
+      const wp = waypoints[w];
+      out.push({ kind: "move", sceneId, token: name, x: wp.x, y: wp.y, speed });
+      // Bite only at the `through` waypoints — the last waypoint is
+      // `to`, the exit, where the token is already leaving.
+      if (step.bite && w < step.through.length) {
+        const targets = step.bite.targets ?? [];
+        const target = targets.length > 0 ? targets[n % targets.length] : undefined;
+        out.push({
+          kind: "roll",
+          formula: step.bite.damage,
+          flavor: target ? `${name} bites ${target}` : `${name} bites as it rushes past`,
+          showInChat: true,
+        });
+      }
+    }
+  }
+  return out;
+}
+
+/**
+ * Expand an emerge intent: a new token placed at a corpse token's
+ * position. The position comes from `at` when given (so
+ * --validate-only works with no live state); otherwise the live
+ * player resolves the corpse token's current position through
+ * `centerOf`. The corpse token is recorded in the place key
+ * (`...:emerge-<index>-from-<corpse>`), which the timeline's step
+ * log carries — the log says where the creature came from.
+ */
+function expandEmerge(
+  script: CutsceneScript,
+  step: EmergeStep,
+  index: number,
+  centerOf?: ExpandOptions["centerOf"],
+): SequenceStep[] {
+  const sceneId = step.sceneId ?? script.sceneId;
+  if (!sceneId) {
+    throw new Error(`Emerge step ${index}: no sceneId (set it on the step or the script).`);
+  }
+  let pos: Point;
+  if (step.at) {
+    pos = step.at;
+  } else {
+    if (!centerOf) {
+      throw new Error(
+        `Emerge step ${index}: corpse token "${step.fromToken}" needs a live resolver — ` +
+          `play through playCutscene, or give "at" ({x, y}) in the step.`,
+      );
+    }
+    pos = centerOf(step.fromToken, sceneId);
+  }
+  const slug = step.fromToken.replace(/[^A-Za-z0-9]+/g, "-").replace(/^-|-$/g, "") || "corpse";
+  return [
+    {
+      kind: "place",
+      sceneId,
+      actor: step.actor,
+      x: pos.x,
+      y: pos.y,
+      name: step.name,
+      key: `cutscene:${script.name}:emerge-${index}-from-${slug}`,
+    },
+  ];
 }
 
 function expandFormation(
