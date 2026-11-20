@@ -13,7 +13,7 @@ machine, no extra app at the table.
 
 ## The vision
 
-**[MuseGM — The Table That Keeps Up With You](https://docs.google.com/document/d/1e75xsxwanm-Nf02y02XBLnOOrRrmRbgOnUEfU6jzBEM/edit)** — the illustrated vision
+**[MuseGM — The Table That Keeps Up With You](https://docs.google.com/document/d/1XFRPBCAXEzPiJ7cfQLpduyxPN-GGI4XcNrLPNzdsC2E/edit)** — the illustrated vision
 document: what it feels like when the GM thinks it and it is on the table.
 A whole floor from a sentence, a mid-session ogre that dies twice, maps you
 can touch, and a campaign of one-shots where each GM — even a first-timer —
