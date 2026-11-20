@@ -1,0 +1,94 @@
+/**
+ * @fileoverview Shared combatant turn-order helper (#214).
+ *
+ * FoundryVTT resolves `Combat#turn` against the **initiative-sorted** turn
+ * order, not the stored (creation) order of `Combat#combatants`. Every handler
+ * that maps a `turn` index onto a combatant — the read path
+ * (`get_combat_state`) and the write path (`next_turn`) alike — must therefore
+ * derive that list here, so the two can never drift apart through slightly
+ * different comparators.
+ *
+ * The comparator mirrors core's `Combat._sortCombatants`: initiative
+ * descending, non-numeric (un-rolled) initiative last, ties broken by document
+ * id so the order is deterministic and stable.
+ */
+/** Un-rolled / malformed initiative sorts to the very end of the order. */
+function initiativeOf(c) {
+    return typeof c.initiative === 'number' && Number.isFinite(c.initiative)
+        ? c.initiative
+        : Number.NEGATIVE_INFINITY;
+}
+/**
+ * Compares two combatants by Foundry's turn-order rules.
+ *
+ * Initiative descending; combatants without a rolled initiative go last; ties
+ * (including two un-rolled combatants, whose difference is `NaN`) fall back to
+ * the document id so the ordering is total and deterministic.
+ */
+export function compareCombatants(a, b) {
+    const byInitiative = initiativeOf(b) - initiativeOf(a);
+    if (byInitiative && !Number.isNaN(byInitiative)) {
+        return byInitiative;
+    }
+    if (a._id === b._id) {
+        return 0;
+    }
+    return a._id > b._id ? 1 : -1;
+}
+/**
+ * Returns the combatants of `combat` in turn order.
+ *
+ * Sorts a **copy** — `combat` is a live reference into the world-data cache, so
+ * sorting in place would silently reorder cached state as a side effect of a
+ * read.
+ */
+export function getTurnOrder(combat) {
+    return [...combat.combatants].sort(compareCombatants);
+}
+/**
+ * Whether the encounter is under way, derived the way core derives it.
+ *
+ * `Combat#started` is a **client-side getter** (`turns.length > 0 && round >
+ * 0`), not schema data: `BaseCombat.defineSchema()` does not declare it, so a
+ * Combat document read out of `worldData` never carries the key. Reading
+ * `combat.started` therefore evaluates to `undefined` on every real world —
+ * only hand-written fixtures have it — so started-ness is computed here from
+ * the two fields the transport does deliver.
+ */
+export function isCombatStarted(combat) {
+    return combat.round > 0 && combat.combatants.length > 0;
+}
+/**
+ * Returns the combatant `combat.turn` currently points at, if any.
+ *
+ * Yields `undefined` when nobody is acting yet — the encounter has not been
+ * started (initiatives are commonly assigned during round 0 setup), `turn` is
+ * null, or the stored index no longer resolves to a combatant.
+ */
+export function getCurrentCombatant(combat) {
+    if (!isCombatStarted(combat) || combat.turn === null || combat.turn === undefined) {
+        return undefined;
+    }
+    return getTurnOrder(combat)[combat.turn];
+}
+/**
+ * Computes where `actingCombatantId` lands in the turn order once `change` is
+ * applied — i.e. the `turn` index that keeps the same combatant acting.
+ *
+ * The change is projected onto a copy rather than read back from the cache:
+ * `setCombatantInitiative` resolves on the `modifyDocument` ack, while the
+ * cache is updated by the separate broadcast, so the cached initiative may or
+ * may not have caught up by the time this runs. Projecting is correct either
+ * way (re-applying the same value is a no-op).
+ *
+ * @returns the new index, or `undefined` if the acting combatant is gone.
+ */
+export function turnIndexAfterInitiativeChange(combat, change, actingCombatantId) {
+    const projected = {
+        ...combat,
+        combatants: combat.combatants.map((c) => c._id === change.combatantId ? { ...c, initiative: change.initiative } : c),
+    };
+    const index = getTurnOrder(projected).findIndex((c) => c._id === actingCombatantId);
+    return index === -1 ? undefined : index;
+}
+//# sourceMappingURL=combat-order.js.map

@@ -1,0 +1,8 @@
+node_modules/
+*.log
+*.png
+*.jpg
+*.jpeg
+maps/
+.muse-github-snapshot-sync.json
+.DS_Store

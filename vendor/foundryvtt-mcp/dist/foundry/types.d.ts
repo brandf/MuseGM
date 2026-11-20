@@ -1,0 +1,921 @@
+/**
+ * @fileoverview TypeScript type definitions for FoundryVTT data structures
+ *
+ * This module contains comprehensive type definitions for all FoundryVTT entities
+ * including actors, items, scenes, tokens, and other game objects. These types
+ * provide type safety and intellisense when working with FoundryVTT data.
+ *
+ * @version 0.1.0
+ * @author FoundryVTT MCP Team
+ * @see {@link https://foundryvtt.com/api/} FoundryVTT API Documentation
+ */
+/**
+ * Represents an actor (character, NPC, or creature) in FoundryVTT
+ *
+ * Actors are the primary entities that represent characters, NPCs, monsters,
+ * and other creatures in the game world. This interface covers the common
+ * properties shared across different game systems.
+ *
+ * @example
+ * ```typescript
+ * const hero: FoundryActor = {
+ *   _id: 'actor-123',
+ *   name: 'Aragorn',
+ *   type: 'character',
+ *   hp: { value: 45, max: 45 },
+ *   ac: { value: 16 },
+ *   level: 5
+ * };
+ * ```
+ */
+export interface FoundryActor {
+    _id: string;
+    name: string;
+    type: string;
+    img?: string;
+    data?: Record<string, unknown>;
+    hp?: {
+        value: number;
+        max: number;
+        temp?: number;
+    };
+    ac?: {
+        value: number;
+    };
+    attributes?: Record<string, unknown>;
+    abilities?: Record<string, {
+        value: number;
+        mod: number;
+        save?: number;
+    }>;
+    skills?: Record<string, {
+        value: number;
+        mod: number;
+        proficient?: boolean;
+    }>;
+    level?: number;
+    experience?: {
+        value: number;
+        max: number;
+    };
+    currency?: Record<string, number>;
+    biography?: string;
+    notes?: string;
+}
+/**
+ * Represents an item (weapon, armor, spell, etc.) in FoundryVTT
+ *
+ * Items represent equipment, spells, features, and other objects that can be
+ * owned by actors or exist independently in the game world.
+ *
+ * @example
+ * ```typescript
+ * const sword: FoundryItem = {
+ *   _id: 'item-456',
+ *   name: 'Longsword +1',
+ *   type: 'weapon',
+ *   rarity: 'uncommon',
+ *   damage: { parts: [['1d8+1', 'slashing']] },
+ *   price: { value: 315, denomination: 'gp' }
+ * };
+ * ```
+ */
+export interface FoundryItem {
+    _id: string;
+    name: string;
+    type: string;
+    img?: string;
+    data?: Record<string, unknown>;
+    description?: string;
+    rarity?: string;
+    price?: {
+        value: number;
+        denomination: string;
+    };
+    weight?: number;
+    quantity?: number;
+    equipped?: boolean;
+    identified?: boolean;
+    damage?: {
+        parts: Array<[string, string]>;
+        versatile?: string;
+    };
+    range?: {
+        value: number;
+        long?: number;
+        units: string;
+    };
+    armor?: {
+        value: number;
+        type: string;
+        dex?: number;
+    };
+    level?: number;
+    school?: string;
+    components?: {
+        vocal: boolean;
+        somatic: boolean;
+        material: boolean;
+        value?: string;
+    };
+    duration?: {
+        value: number;
+        units: string;
+    };
+    itemRange?: {
+        value: number;
+        units: string;
+    };
+}
+/**
+ * Represents a scene (map/battleground) in FoundryVTT
+ *
+ * Scenes are the visual environments where gameplay takes place, containing
+ * background images, tokens, lighting, walls, and other elements.
+ *
+ * @example
+ * ```typescript
+ * const dungeon: FoundryScene = {
+ *   _id: 'scene-789',
+ *   name: 'Ancient Tomb',
+ *   active: true,
+ *   width: 4000,
+ *   height: 3000,
+ *   grid: { size: 100, type: 1 }
+ * };
+ * ```
+ */
+export interface FoundryScene {
+    _id: string;
+    name: string;
+    active: boolean;
+    navigation: boolean;
+    img?: string;
+    background?: string;
+    width: number;
+    height: number;
+    padding: number;
+    initial?: {
+        x: number;
+        y: number;
+        scale: number;
+    };
+    grid?: {
+        type: number;
+        size: number;
+        color: string;
+        alpha: number;
+        distance: number;
+        units: string;
+    };
+    shiftX: number;
+    shiftY: number;
+    description?: string;
+    notes?: string;
+    weather?: string;
+    environment?: string;
+    globalLight: boolean;
+    globalLightThreshold?: number;
+    darkness: number;
+    tokens?: FoundryToken[];
+    walls?: FoundryWall[];
+    lights?: FoundryLight[];
+    sounds?: FoundrySound[];
+    drawings?: FoundryDrawing[];
+}
+/**
+ * Represents a token on a scene in FoundryVTT
+ *
+ * Tokens are the visual representations of actors placed on scenes.
+ * They contain position, appearance, and gameplay-related information.
+ *
+ * @example
+ * ```typescript
+ * const heroToken: FoundryToken = {
+ *   _id: 'token-123',
+ *   name: 'Aragorn',
+ *   x: 1000,
+ *   y: 1500,
+ *   actorId: 'actor-123',
+ *   disposition: 1 // friendly
+ * };
+ * ```
+ */
+export interface FoundryToken {
+    _id: string;
+    name: string;
+    img: string;
+    x: number;
+    y: number;
+    width: number;
+    height: number;
+    scale: number;
+    rotation: number;
+    actorId?: string;
+    actorLink: boolean;
+    disposition: number;
+    hidden: boolean;
+    vision: boolean;
+    dimSight: number;
+    brightSight: number;
+    bar1?: {
+        attribute: string;
+    };
+    bar2?: {
+        attribute: string;
+    };
+    effects?: string[];
+}
+/**
+ * Represents a wall segment in a FoundryVTT scene
+ *
+ * Walls control movement, vision, and sound propagation in scenes.
+ * They define the physical boundaries and obstacles in the environment.
+ *
+ */
+export interface FoundryWall {
+    _id: string;
+    c: [number, number, number, number];
+    move: number;
+    sense: number;
+    sound: number;
+    door: number;
+    ds: number;
+}
+/**
+ * Represents a light source in a FoundryVTT scene
+ *
+ * Light sources provide illumination and create atmospheric effects
+ * in scenes, affecting token vision and creating ambiance.
+ *
+ */
+export interface FoundryLight {
+    _id: string;
+    x: number;
+    y: number;
+    rotation: number;
+    config: {
+        bright: number;
+        dim: number;
+        angle: number;
+        color?: string;
+        alpha: number;
+        animation?: {
+            type: string;
+            speed: number;
+            intensity: number;
+        };
+    };
+    hidden: boolean;
+}
+/**
+ * Represents an ambient sound in a FoundryVTT scene
+ *
+ * Sound objects provide audio atmosphere and effects in scenes,
+ * with positional audio and volume controls.
+ *
+ */
+export interface FoundrySound {
+    _id: string;
+    x: number;
+    y: number;
+    radius: number;
+    path: string;
+    repeat: boolean;
+    volume: number;
+    hidden: boolean;
+}
+/**
+ * Represents a drawing/annotation in a FoundryVTT scene
+ *
+ * Drawings allow GMs and players to add visual annotations,
+ * shapes, and text directly onto scenes.
+ *
+ */
+export interface FoundryDrawing {
+    _id: string;
+    type: string;
+    x: number;
+    y: number;
+    width?: number;
+    height?: number;
+    points?: number[];
+    shape?: {
+        type: string;
+        points?: number[];
+        radius?: number;
+        width?: number;
+        height?: number;
+    };
+    fillType: number;
+    fillColor?: string;
+    strokeWidth: number;
+    strokeColor?: string;
+    text?: string;
+    fontSize?: number;
+    fontFamily?: string;
+    textColor?: string;
+    hidden: boolean;
+    locked: boolean;
+}
+/**
+ * Represents world information in FoundryVTT
+ *
+ * Contains metadata about the current game world including
+ * system information, modules, and world settings.
+ *
+ * @example
+ * ```typescript
+ * const world: FoundryWorld = {
+ *   id: 'my-campaign',
+ *   title: 'Adventures in Middle-earth',
+ *   system: 'dnd5e',
+ *   coreVersion: '11.315',
+ *   playtime: 144000 // in seconds
+ * };
+ * ```
+ */
+export interface FoundryWorld {
+    id: string;
+    title: string;
+    description: string;
+    system: string;
+    coreVersion: string;
+    systemVersion: string;
+    lastPlayed?: string;
+    playtime: number;
+    created: string;
+    modified: string;
+    background?: string;
+    nextSession?: string;
+    modules?: Array<{
+        id: string;
+        title: string;
+        active: boolean;
+    }>;
+}
+export interface FoundryJournal {
+    _id: string;
+    name: string;
+    content: string;
+    img?: string;
+    folder?: string;
+    permission: Record<string, number>;
+    pages?: Array<{
+        name: string;
+        type: string;
+        title: string;
+        content?: string;
+        src?: string;
+    }>;
+}
+export interface FoundryMacro {
+    _id: string;
+    name: string;
+    type: string;
+    scope: string;
+    command: string;
+    img?: string;
+    folder?: string;
+    author: string;
+    ownership: Record<string, number>;
+}
+export interface FoundryPlaylist {
+    _id: string;
+    name: string;
+    description?: string;
+    mode: number;
+    playing: boolean;
+    fade: number;
+    folder?: string;
+    sounds: Array<{
+        _id: string;
+        name: string;
+        path: string;
+        playing: boolean;
+        repeat: boolean;
+        volume: number;
+        fade: number;
+    }>;
+}
+export interface FoundryCombat {
+    _id: string;
+    scene?: string;
+    active: boolean;
+    round: number;
+    turn: number;
+    started: boolean;
+    combatants: Array<{
+        _id: string;
+        tokenId: string;
+        actorId?: string;
+        name: string;
+        img?: string;
+        initiative?: number;
+        hidden: boolean;
+        defeated: boolean;
+    }>;
+    settings: {
+        resource?: string;
+        skipDefeated: boolean;
+    };
+}
+/**
+ * Represents the result of a dice roll in FoundryVTT
+ *
+ * Contains all information about a completed dice roll including
+ * the formula used, total result, breakdown, and metadata.
+ *
+ * @example
+ * ```typescript
+ * const attackRoll: DiceRoll = {
+ *   formula: '1d20+5',
+ *   total: 18,
+ *   breakdown: '13 + 5',
+ *   reason: 'Sword attack',
+ *   timestamp: '2024-01-15T10:30:00Z',
+ *   source: 'server'
+ * };
+ * ```
+ */
+export interface DiceRoll {
+    formula: string;
+    total: number;
+    breakdown: string;
+    reason?: string;
+    timestamp: string;
+    /**
+     * Where the roll was evaluated: `'server'` when FoundryVTT's own `Roll`
+     * engine produced it over the REST transport, `'local'` when this MCP server
+     * rolled it itself — always on the Socket.IO transport, and on REST when the
+     * server call failed and fell back (#254).
+     */
+    source: 'server' | 'local';
+}
+export interface FoundryUser {
+    _id: string;
+    name: string;
+    role: number;
+    active: boolean;
+    color: string;
+    avatar?: string;
+    character?: string;
+    permissions: Record<string, boolean>;
+}
+/**
+ * Result structure for actor search operations
+ *
+ * Contains paginated search results for actor queries
+ * along with metadata about the search.
+ *
+ * @example
+ * ```typescript
+ * const searchResult: ActorSearchResult = {
+ *   actors: [],
+ *   total: 25,
+ *   page: 1,
+ *   limit: 10
+ * };
+ * ```
+ */
+export interface ActorSearchResult {
+    actors: FoundryActor[];
+    total: number;
+    page: number;
+    limit: number;
+}
+/**
+ * Result structure for item search operations
+ *
+ * Contains paginated search results for item queries
+ * along with metadata about the search.
+ *
+ * @example
+ * ```typescript
+ * const searchResult: ItemSearchResult = {
+ *   items: [],
+ *   total: 42,
+ *   page: 1,
+ *   limit: 20
+ * };
+ * ```
+ */
+export interface ItemSearchResult {
+    items: FoundryItem[];
+    total: number;
+    page: number;
+    limit: number;
+}
+/**
+ * A single compendium search result entry.
+ *
+ * Carries enough metadata to disambiguate near-identical entries across
+ * packs and rule revisions (e.g. Divine Smite PHB-2014 vs PHB-2024 via
+ * `system.source.rules`). `compendiumId` scopes the entry to its pack and
+ * `itemId` identifies the entry within that pack.
+ */
+export interface CompendiumSearchEntry {
+    compendiumId: string;
+    itemId: string;
+    name: string;
+    type: string;
+    img?: string;
+    system?: {
+        level?: number;
+        school?: string;
+        source?: {
+            rules?: string;
+            custom?: string;
+        };
+    };
+}
+/**
+ * Result envelope for a compendium search.
+ *
+ * `restAvailable` signals whether the REST API module (FOUNDRY_API_KEY) was
+ * present. When false, `results` is empty and the handler surfaces a note
+ * explaining that compendium search requires REST mode.
+ *
+ * `nextCursor` carries the opaque pagination cursor for the following page
+ * (an offset, base64-encoded); it is `null` when no further results exist.
+ */
+export interface CompendiumSearchResult {
+    results: CompendiumSearchEntry[];
+    total: number;
+    page: number;
+    limit: number;
+    restAvailable: boolean;
+    nextCursor: string | null;
+}
+/**
+ * Source for creating an item on an actor.
+ *
+ * Either references a compendium entry to copy (the compendium pack id plus the
+ * item id within that pack — pairs with the compendium search tool) or supplies
+ * an inline item document to create directly.
+ */
+export type ActorItemCreateSource = {
+    type: 'compendium';
+    compendiumId: string;
+    itemId: string;
+} | {
+    type: 'inline';
+    item: Partial<FoundryItem>;
+};
+/**
+ * A single page to create on a new journal entry.
+ *
+ * `content` is plain text/HTML for a text-type page; {@link FoundryClient.createJournalEntry}
+ * maps it into Foundry's native `JournalEntryPage` shape
+ * (`type: "text"`, `text: { content, format: 1 }` — format 1 is
+ * `CONST.JOURNAL_ENTRY_PAGE_FORMATS.HTML`).
+ */
+export interface JournalPageCreateSource {
+    name: string;
+    content: string;
+}
+/**
+ * Default visibility for a newly created document (#204).
+ *
+ * FoundryVTT ownership levels are `NONE 0`, `LIMITED 1`, `OBSERVER 2`,
+ * `OWNER 3`. A document created without an explicit `ownership` defaults to
+ * `NONE` for everyone but the creating GM — so a journal written for the table
+ * is invisible to the table until someone grants access in the Foundry UI.
+ */
+export type DocumentVisibility = 'gm-only' | 'observer' | 'owner';
+/** {@link DocumentVisibility} → the `ownership.default` level it maps to. */
+export declare const VISIBILITY_LEVELS: Record<DocumentVisibility, number>;
+/**
+ * Result structure for an actor attribute update (#143).
+ *
+ * Returned by `FoundryClient.updateActorAttribute`. The `updatedAttributes`
+ * map echoes back the post-update value for every patched dot-path so callers
+ * can confirm what changed.
+ *
+ * @example
+ * ```typescript
+ * const result: ActorAttributeUpdateResult = {
+ *   success: true,
+ *   updatedAttributes: { 'attributes.hp.value': 30, 'currency.gp': 12 },
+ * };
+ * ```
+ */
+export interface ActorAttributeUpdateResult {
+    success: boolean;
+    updatedAttributes: Record<string, unknown>;
+}
+/**
+ * Generic API response structure for FoundryVTT REST API
+ *
+ * Standardized response format for API calls including
+ * success status, data payload, and error information.
+ *
+ * @typeParam T - Type of the response data
+ * @example
+ * ```typescript
+ * const response: FoundryAPIResponse<FoundryActor[]> = {
+ *   success: true,
+ *   data: [],
+ *   message: 'Actors retrieved successfully'
+ * };
+ * ```
+ */
+export interface FoundryAPIResponse<T = unknown> {
+    success: boolean;
+    data?: T;
+    error?: string;
+    message?: string;
+}
+/**
+ * Structure for WebSocket messages exchanged with FoundryVTT
+ *
+ * Defines the format for real-time communication messages
+ * between the MCP server and FoundryVTT.
+ *
+ * @example
+ * ```typescript
+ * const message: FoundryWebSocketMessage = {
+ *   type: 'combatUpdate',
+ *   data: { round: 3, turn: 2 },
+ *   user: 'user-123',
+ *   timestamp: '2024-01-15T10:30:00Z'
+ * };
+ * ```
+ */
+export interface FoundryWebSocketMessage {
+    type: string;
+    data?: unknown;
+    user?: string;
+    timestamp: string;
+}
+/**
+ * Structure for AI-generated NPC data
+ *
+ * Contains all information needed to create a complete NPC
+ * including personality, appearance, and background details.
+ *
+ * @example
+ * ```typescript
+ * const npc: GeneratedNPC = {
+ *   name: 'Thorin Ironforge',
+ *   race: 'Dwarf',
+ *   class: 'Fighter',
+ *   personality: ['Gruff but loyal', 'Speaks little but acts decisively'],
+ *   appearance: 'Short and stocky with a magnificent braided beard',
+ *   motivations: ['Protect the clan honor', 'Forge the perfect weapon']
+ * };
+ * ```
+ */
+export interface GeneratedNPC {
+    name: string;
+    race: string;
+    class?: string;
+    level?: number;
+    background?: string;
+    personality: string[];
+    appearance: string;
+    motivations: string[];
+    stats?: Record<string, number>;
+    equipment?: string[];
+}
+export interface GeneratedLocation {
+    name: string;
+    type: string;
+    description: string;
+    features: string[];
+    inhabitants?: string[];
+    hooks?: string[];
+    connections?: string[];
+}
+export interface GeneratedQuest {
+    title: string;
+    type: string;
+    giver: string;
+    description: string;
+    objectives: string[];
+    rewards: string[];
+    complications?: string[];
+    timeLimit?: string;
+}
+/**
+ * Raw actor document from worldData.
+ * The `system` field shape varies by game system (dnd5e, pf2e, etc.).
+ */
+export interface WorldActor {
+    _id: string;
+    name: string;
+    type: string;
+    img?: string;
+    system: Record<string, unknown>;
+    items?: WorldItem[];
+    effects?: WorldEffect[];
+    folder?: string | null;
+    sort?: number;
+    ownership?: Record<string, number>;
+    flags?: Record<string, unknown>;
+    prototypeToken?: Record<string, unknown>;
+}
+/**
+ * Raw item document from worldData.
+ */
+export interface WorldItem {
+    _id: string;
+    name: string;
+    type: string;
+    img?: string;
+    system: Record<string, unknown>;
+    effects?: WorldEffect[];
+    folder?: string | null;
+    sort?: number;
+    ownership?: Record<string, number>;
+    flags?: Record<string, unknown>;
+}
+/**
+ * Raw scene document from worldData.
+ */
+export interface WorldScene {
+    _id: string;
+    name: string;
+    active: boolean;
+    navigation: boolean;
+    img?: string;
+    background?: Record<string, unknown>;
+    width: number;
+    height: number;
+    padding: number;
+    grid?: Record<string, unknown>;
+    tokens?: Array<Record<string, unknown>>;
+    walls?: Array<Record<string, unknown>>;
+    lights?: Array<Record<string, unknown>>;
+    drawings?: Array<Record<string, unknown>>;
+    sounds?: Array<Record<string, unknown>>;
+    notes?: Array<Record<string, unknown>>;
+    tiles?: Array<Record<string, unknown>>;
+    darkness: number;
+    globalLight: boolean;
+    globalLightThreshold?: number;
+    folder?: string | null;
+    sort?: number;
+    ownership?: Record<string, number>;
+    flags?: Record<string, unknown>;
+}
+/**
+ * Raw journal entry from worldData.
+ */
+export interface WorldJournal {
+    _id: string;
+    name: string;
+    pages?: Array<{
+        _id: string;
+        name: string;
+        type: string;
+        title?: {
+            show: boolean;
+            level: number;
+        };
+        text?: {
+            content: string;
+            format: number;
+        };
+        image?: Record<string, unknown>;
+        video?: Record<string, unknown>;
+        src?: string;
+        sort?: number;
+    }>;
+    folder?: string | null;
+    sort?: number;
+    ownership?: Record<string, number>;
+    flags?: Record<string, unknown>;
+}
+/**
+ * Raw chat message from worldData.
+ */
+export interface WorldMessage {
+    _id: string;
+    type: number;
+    user: string;
+    timestamp: number;
+    flavor?: string;
+    content: string;
+    speaker?: {
+        scene?: string;
+        actor?: string;
+        token?: string;
+        alias?: string;
+    };
+    rolls?: string[];
+    sound?: string;
+    whisper?: string[];
+    blind?: boolean;
+    flags?: Record<string, unknown>;
+}
+/**
+ * Raw combat document from worldData.
+ */
+export interface WorldCombat {
+    _id: string;
+    scene?: string;
+    active: boolean;
+    round: number;
+    turn: number | null;
+    /**
+     * **Not persisted by FoundryVTT — do not gate behaviour on it.**
+     *
+     * `Combat#started` is a client-side derived getter (`turns.length > 0 &&
+     * round > 0`); `BaseCombat.defineSchema()` never declares it, so a document
+     * arriving in the `world` socket payload (validated only as
+     * `z.array(z.unknown())` and cast, see `client.ts`) carries no such key.
+     * Optional here so the compiler cannot imply the transport provides it —
+     * derive started-ness from `round` and `combatants` instead.
+     */
+    started?: boolean;
+    combatants: Array<{
+        _id: string;
+        actorId?: string;
+        tokenId?: string;
+        sceneId?: string;
+        name: string;
+        img?: string;
+        initiative: number | null;
+        hidden: boolean;
+        defeated: boolean;
+        flags?: Record<string, unknown>;
+    }>;
+    /**
+     * Combat tracker settings. The core `skipDefeated` toggle lives in the
+     * `core.combatTrackerConfig` world setting and may not be present in every
+     * worldData snapshot, so it is optional here.
+     */
+    settings?: {
+        skipDefeated?: boolean;
+        resource?: string;
+    };
+    flags?: Record<string, unknown>;
+}
+/**
+ * Raw user document from worldData.
+ */
+export interface WorldUser {
+    _id: string;
+    name: string;
+    role: number;
+    color: string;
+    avatar?: string;
+    character?: string;
+    password?: string;
+    pronouns?: string;
+    flags?: Record<string, unknown>;
+}
+/**
+ * Active effect on an actor or item.
+ */
+export interface WorldEffect {
+    _id: string;
+    name: string;
+    img?: string;
+    type?: string;
+    system?: Record<string, unknown>;
+    changes?: Array<{
+        key: string;
+        mode: number;
+        value: string;
+        priority?: number;
+    }>;
+    disabled?: boolean;
+    duration?: Record<string, unknown>;
+    /**
+     * Status condition ids represented by this effect (e.g. `["prone"]`).
+     * FoundryVTT v11+ models conditions as ActiveEffects carrying a `statuses`
+     * array; `Actor#toggleStatusEffect` matches/toggles by this field.
+     */
+    statuses?: string[];
+    flags?: Record<string, unknown>;
+}
+/**
+ * Complete world data returned by the Socket.IO 'world' event.
+ */
+export interface WorldData {
+    userId: string;
+    release: Record<string, unknown>;
+    world: Record<string, unknown>;
+    system: Record<string, unknown>;
+    modules: Array<Record<string, unknown>>;
+    demoMode: boolean;
+    actors: WorldActor[];
+    scenes: WorldScene[];
+    items: WorldItem[];
+    journal: WorldJournal[];
+    messages: WorldMessage[];
+    combats: WorldCombat[];
+    users: WorldUser[];
+    activeUsers: string[];
+    settings: unknown[];
+    folders: Array<Record<string, unknown>>;
+    macros: Array<Record<string, unknown>>;
+    playlists: Array<Record<string, unknown>>;
+    tables: Array<Record<string, unknown>>;
+    cards: Array<Record<string, unknown>>;
+    packs: Array<Record<string, unknown>>;
+    [key: string]: unknown;
+}
+//# sourceMappingURL=types.d.ts.map
