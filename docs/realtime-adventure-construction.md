@@ -756,3 +756,37 @@ is aiming for is the opposite — the GM thinks it, and it happens.
 Every feature request in this document should be read that way: a
 scenario is a test case for the toolbox, and the toolbox is the
 product.
+
+## Why this exists: the one-shot campaign (Brandon, Nov 19)
+
+The group is stepping back after two multi-year, back-to-back
+campaigns wrapping up. The next campaign is different: a series of
+one-shots, where each person in the group GMs a one- or two-session
+mini quest, under an overarching frame like Sliders or an isekai —
+the party hops between worlds. The sessions have wildly different
+themes: one session they're all dragons, fighting a big dragon battle
+or playing dragon soccer; the next they're isekai'd into a western,
+robbing banks and trains; the next it's a sci-fi battle with laser
+guns.
+
+That is what the toolkit is for. The creation tools have to be
+flexible across genres, not just dungeon fantasy — themes are a
+parameter everywhere (rooms, tiles, encounters, music), and a new
+theme should be a pack, not a rebuild. And they have to be easy
+enough for people who have never created a map or a campaign or run
+a game as a GM. The bar is Scott: a first-time GM should be able to
+run a session without reading the whole Game Master manual. The
+vague-brief mode (FR-15) is the answer to that — he describes the
+mini quest in plain language, Muse asks the real questions, shows
+him the plan, and builds it. Heavy AI assistance is the point: the
+GM brings the idea, the toolkit brings everything else.
+
+**The GM never touches Foundry.** Scott shouldn't have to figure out
+how to do things in Foundry at all. He talks to Muse, says what he
+wants, and Muse helps him make it — the conversation *is* the
+interface. And during the session it's the same: Muse does the
+nitty-gritty assistance during combat and everything else, and Scott
+just tells Muse what to do. The GM directs; Muse operates. That is
+the bar for every tool in the kit: if it requires the GM to learn
+Foundry's UI, it's the wrong shape — the tool should take a sentence
+and do the Foundry work itself.

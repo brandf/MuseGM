@@ -11,6 +11,15 @@ Live against Foundry 14.370 / PF2e 8.7.0 (TestBed world), through the MIT
 a conversation through Foundry chat alone — no local AI client on the DM's
 machine, no extra app at the table.
 
+## The vision
+
+**[MuseGM — The Table That Keeps Up With You](https://docs.google.com/document/d/1e75xsxwanm-Nf02y02XBLnOOrRrmRbgOnUEfU6jzBEM/edit)** — the illustrated vision
+document: what it feels like when the GM thinks it and it is on the table.
+A whole floor from a sentence, a mid-session ogre that dies twice, maps you
+can touch, and a campaign of one-shots where each GM — even a first-timer —
+just talks to Muse. The conversation is the interface; the GM directs, Muse
+operates.
+
 ## What it does
 
 - **Live table presence** — watches Foundry chat, answers as the table's
