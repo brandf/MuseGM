@@ -16,6 +16,15 @@
  *   fallback, so a missed broadcast can only delay a wake-up by ~1s.
  */
 import { FoundryClient } from "../vendor/foundryvtt-mcp/dist/foundry/client.js";
+import { evaluateDiceFormula } from "../vendor/foundryvtt-mcp/dist/foundry/dice-formula.js";
+import {
+  FLAG_FIELDS,
+  flagValue,
+  hashStringToSeed,
+  rngFromSeed,
+  findMessageByDedupeKey as findKeyedMessage,
+} from "./idempotency.js";
+import type { DedupeMessage } from "./idempotency.js";
 import type {
   ChatMessage,
   DiceRollResult,
@@ -76,7 +85,7 @@ export interface PingOptions {
 interface ModifyDocumentClient {
   modifyDocument(
     type: string,
-    action: "create" | "update" | "delete",
+    action: "create" | "update" | "delete" | "get",
     operation: Record<string, unknown>,
   ): Promise<Record<string, unknown>[]>;
 }
@@ -90,6 +99,16 @@ export class FoundryLive {
   private waiters: Array<(event: FoundryEvent) => void> = [];
   private socketHandler: ((payload: unknown) => void) | null = null;
   private watching = false;
+  /**
+   * Dedupe keys this connection has already sent, key -> message _id. The
+   * world-payload scan (findMessageByDedupeKey) closes the cross-process
+   * gap; this map closes the same-process gap, because a connection never
+   * reliably sees its OWN creates in its worldData cache — without it, a
+   * second sendChatIdempotent call with the same key in one process would
+   * miss in the scan and post twice. The map remembers the id, so the
+   * re-send returns the original message without touching the server.
+   */
+  private sentDedupeKeys = new Map<string, string>();
 
   private constructor(client: FoundryClient, username: string) {
     this.client = client;
@@ -220,6 +239,11 @@ export class FoundryLive {
    * same `modifyDocument` socket protocol the MCP uses for journals/items,
    * with document type `ChatMessage`. Foundry 13+ wants `author`, not `user`.
    * Returns the created message document _id.
+   *
+   * When `opts.dedupeKey` is set, the key is stored in the message's flags
+   * — but this method does NOT check for a previous send. Use
+   * `sendChatIdempotent` for the check-then-send path (crash re-dispatch);
+   * this method stays the plain "post it" primitive.
    */
   async sendChat(content: string, opts: SendChatOptions = {}): Promise<string> {
     if (!this.ownUserId) {
@@ -232,10 +256,60 @@ export class FoundryLive {
       author: this.ownUserId,
     };
     if (opts.whisperTo && opts.whisperTo.length > 0) doc.whisper = opts.whisperTo;
+    if (opts.dedupeKey) doc.flags = flagValue(FLAG_FIELDS.chatDedupe, opts.dedupeKey);
     const created = await this.modifyDocument("ChatMessage", "create", { data: [doc] });
     const id = String((created[0] as Record<string, unknown> | undefined)?._id ?? "");
     if (!id) throw new Error("Chat message create returned no _id.");
+    if (opts.dedupeKey) this.sentDedupeKeys.set(opts.dedupeKey, id);
     return id;
+  }
+
+  /**
+   * Find a message this user already posted with the given dedupe key, in
+   * the last 50 chat messages. Returns undefined when nothing matches.
+   * The scan is author-scoped: one Muse's key can never claim another
+   * user's message.
+   */
+  findMessageByDedupeKey(dedupeKey: string): ChatMessage | undefined {
+    const messages = this.getChatMessages(50) as unknown as DedupeMessage[];
+    const found = findKeyedMessage(messages, dedupeKey, this.ownUserId ?? undefined);
+    if (!found) return undefined;
+    return this.getChatMessages(50).find((m) => m.id === found.id);
+  }
+
+  /**
+   * Retry-safe send: post once, return the already-posted message on a
+   * re-run instead of posting twice.
+   *
+   * Check order: (1) this connection's sent-keys map — covers a second
+   * call in the same process, where the worldData cache cannot see our
+   * own creates; (2) a scan of the last 50 chat messages for the key —
+   * covers a fresh connection after a crash re-dispatch. Returns
+   * `{ id, duplicate }` so the caller (and the phase-two layer) can tell
+   * a re-run from a fresh send.
+   *
+   * Residual race, documented honestly: the check-then-create is not
+   * atomic. Two processes racing with the same key can both miss and both
+   * post. The realistic hazard — a crash re-dispatch — is sequential, so
+   * the check closes it; true concurrency is not closed.
+   */
+  async sendChatIdempotent(
+    content: string,
+    opts: SendChatOptions & { dedupeKey: string },
+  ): Promise<{ id: string; duplicate: boolean }> {
+    if (!this.ownUserId) {
+      throw new Error("Cannot send chat: own user _id is unknown (not resolved at connect).");
+    }
+    const key = opts.dedupeKey;
+    const alreadySent = this.sentDedupeKeys.get(key);
+    if (alreadySent) return { id: alreadySent, duplicate: true };
+    const existing = this.findMessageByDedupeKey(key);
+    if (existing) {
+      this.sentDedupeKeys.set(key, existing.id);
+      return { id: existing.id, duplicate: true };
+    }
+    const id = await this.sendChat(content, opts);
+    return { id, duplicate: false };
   }
 
   /**
@@ -243,28 +317,58 @@ export class FoundryLive {
    * engine is only reachable via the REST API module, which this setup does
    * not use), so `source` is 'local'. With `showInChat`, the result is also
    * posted to Foundry chat as a message.
+   *
+   * With `opts.seed`, the roll is deterministic: the formula is evaluated
+   * with a seeded PRNG derived from the seed string, so a re-run with the
+   * same seed reproduces the same total and breakdown. Seeded rolls are
+   * always local (the server roller cannot be seeded). Use the seed
+   * together with `dedupeKey` to make "roll and post" retry-safe end to
+   * end: the re-run rolls the same number and finds the already-posted
+   * message instead of posting a second, different roll.
    */
   async rollDice(
     formula: string,
-    opts: { flavor?: string; showInChat?: boolean } = {},
+    opts: { flavor?: string; showInChat?: boolean; seed?: string; dedupeKey?: string } = {},
   ): Promise<DiceRollResult> {
-    const roll = (await this.client.rollDice(
-      formula,
-      opts.flavor,
-    )) as unknown as DiceRollResult;
+    let roll: DiceRollResult;
+    if (opts.seed !== undefined) {
+      const { total, breakdown } = evaluateDiceFormula(
+        formula,
+        rngFromSeed(hashStringToSeed(opts.seed)),
+      );
+      roll = {
+        formula,
+        total,
+        breakdown,
+        timestamp: new Date().toISOString(),
+        source: "local",
+      };
+      if (opts.flavor) roll.reason = opts.flavor;
+    } else {
+      roll = (await this.client.rollDice(
+        formula,
+        opts.flavor,
+      )) as unknown as DiceRollResult;
+    }
     if (opts.showInChat) {
       const text = opts.flavor
         ? `🎲 ${opts.flavor}: ${roll.formula} = **${roll.total}** (${roll.breakdown})`
         : `🎲 ${roll.formula} = **${roll.total}** (${roll.breakdown})`;
-      await this.sendChat(text);
+      await this.sendChat(text, { dedupeKey: opts.dedupeKey });
     }
     return roll;
   }
 
-  /** Low-level document mutation over the Socket.IO `modifyDocument` protocol. */
+  /** Low-level document operation over the Socket.IO `modifyDocument` protocol.
+   *
+   * Action "get" is a READ, not a mutation: `modifyDocument(type, "get",
+   * { query, pack })` returns matching documents from a compendium pack
+   * (see docs/compendium-import.md). The server's dispatch accepts it; the
+   * vendored client's types only list the three write actions, so the union
+   * here is deliberately wider than the vendored one. */
   async modifyDocument(
     type: string,
-    action: "create" | "update" | "delete",
+    action: "create" | "update" | "delete" | "get",
     operation: Record<string, unknown>,
   ): Promise<Record<string, unknown>[]> {
     // modifyDocument is private on the vendored client's types; it is a

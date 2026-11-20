@@ -163,23 +163,53 @@
         "ritual",
         "lich"
       ]
-    }
-  ],
-  "gaps": [
+    },
+    {
+      "name": "spear",
+      "file": "pack/spear.png",
+      "sizePx": 200,
+      "layer": "dressing",
+      "tags": [
+        "dressing",
+        "prop",
+        "spear",
+        "weapon"
+      ]
+    },
     {
       "name": "skeleton",
-      "reason": "A full articulated skeleton lying down needs AI art \u2014 procedural bones read as a pile, not a body.",
-      "needs": "ai-image"
+      "file": "pack/skeleton.png",
+      "sizePx": 200,
+      "layer": "dressing",
+      "tags": [
+        "dressing",
+        "skeleton",
+        "bones"
+      ]
     },
     {
       "name": "chest",
-      "reason": "A wooden chest from above needs AI art. The openable chest token already uses Foundry's built-in chest icon.",
-      "needs": "ai-image"
+      "file": "pack/chest.png",
+      "sizePx": 200,
+      "layer": "dressing",
+      "tags": [
+        "dressing",
+        "chest",
+        "treasure"
+      ]
     },
     {
       "name": "altar",
-      "reason": "A ritual altar from above needs AI art.",
-      "needs": "ai-image"
+      "file": "pack/altar.png",
+      "sizePx": 200,
+      "layer": "dressing",
+      "tags": [
+        "dressing",
+        "altar",
+        "ritual",
+        "lich"
+      ]
     }
-  ]
+  ],
+  "gaps": []
 }

@@ -44,6 +44,11 @@ export interface CombatStatus {
   active: boolean;
   combatants: CombatantStatus[];
   current: CombatantStatus | null;
+  /**
+   * Only set by advanceTurn(): true when this call advanced the turn,
+   * false when it found the turn already advanced (retry-safe re-run).
+   */
+  advanced?: boolean;
 }
 
 export interface Condition {
@@ -74,6 +79,8 @@ interface RawActor {
   name: string;
   type?: string;
   system?: { attributes?: { hp?: { value?: number; max?: number } } };
+  /** ActiveEffect documents on the actor (name + statuses, as stored). */
+  effects?: { _id: string; name?: string; statuses?: string[] | unknown }[];
 }
 
 interface RawToken {
@@ -91,18 +98,21 @@ export class CombatAutopilot {
   constructor(live: FoundryLive, combatId: string) {
     this.live = live;
     this.combatId = combatId;
-    // Conditions and downed callouts are tracked in memory, but one-shot
-    // CLI runs are separate processes — persist them so the calls compose
-    // into a real autopilot across invocations.
+    // Conditions are tracked in memory, but one-shot CLI runs are separate
+    // processes — persist them so the calls compose into a real autopilot
+    // across invocations. The file is a CACHE, not the source of truth:
+    // the effects themselves live on the actors in the world, so a lost
+    // file only loses expiry rounds, never the conditions. (downAnnounced
+    // is deliberately NOT persisted: it is derivable from the world's
+    // `defeated` flag on the combatant, and persisting it made a stale
+    // file able to suppress a real callout.)
     try {
       const saved = JSON.parse(fs.readFileSync(STATE_FILE, "utf-8")) as {
         combatId?: string;
         conditions?: Condition[];
-        downAnnounced?: string[];
       };
       if (saved.combatId === combatId) {
         this.conditions = saved.conditions ?? [];
-        this.downAnnounced = new Set(saved.downAnnounced ?? []);
       }
     } catch {
       // No state yet — start fresh.
@@ -116,7 +126,6 @@ export class CombatAutopilot {
         JSON.stringify({
           combatId: this.combatId,
           conditions: this.conditions,
-          downAnnounced: [...this.downAnnounced],
         }),
         "utf-8",
       );
@@ -193,12 +202,27 @@ export class CombatAutopilot {
     return raw.getRawActor(actorId);
   }
 
-  /** Advance to the next turn (wrapping to the next round), expiring due conditions. */
-  async advanceTurn(): Promise<CombatStatus> {
+  /**
+   * Advance to the next turn (wrapping to the next round), expiring due conditions.
+   *
+   * With `opts.expectTurn`, the advance is compare-and-set: the turn is
+   * read from current world state first, and when it is not the expected
+   * turn the call returns the current state with `advanced: false` and
+   * does NOTHING — no second advance, no second turn announcement. That
+   * makes a crash re-dispatch of "next turn" safe: the re-run sees the
+   * turn already advanced and reports it instead of advancing again.
+   * `expectTurn` is the turn index before advancing (null/not-started
+   * counts as -1). Without it, behavior is unchanged.
+   */
+  async advanceTurn(opts: { expectTurn?: number } = {}): Promise<CombatStatus> {
     const before = this.status();
+    const currentTurn = before.turn ?? -1;
+    if (opts.expectTurn !== undefined && currentTurn !== opts.expectTurn) {
+      return { ...before, advanced: false };
+    }
     const order = before.combatants;
     if (order.length === 0) throw new Error("Combat has no combatants.");
-    let turn = (before.turn ?? -1) + 1;
+    let turn = currentTurn + 1;
     let round = before.round;
     if (turn >= order.length) {
       turn = 0;
@@ -228,6 +252,7 @@ export class CombatAutopilot {
       round,
       turn,
       current: order[turn] ?? null,
+      advanced: true,
     };
     const current = after.current;
     if (current) {
@@ -243,6 +268,13 @@ export class CombatAutopilot {
     return after;
   }
 
+  /** Conditions on one combatant, for turn reminders (P2). Read-only. */
+  listConditions(combatantId: string): { statusId: string; expiresRound: number }[] {
+    return this.conditions
+      .filter((c) => c.combatantId === combatantId)
+      .map((c) => ({ statusId: c.statusId, expiresRound: c.expiresRound }));
+  }
+
   /** Apply a condition to a combatant for `rounds` rounds (default 1). */
   async applyCondition(
     combatantId: string,
@@ -252,6 +284,24 @@ export class CombatAutopilot {
     const st = this.status();
     const combatant = st.combatants.find((c) => c.combatantId === combatantId);
     if (!combatant) throw new Error(`Combatant ${combatantId} not in this combat.`);
+    // Retry-safe: if the actor already has this condition (an effect whose
+    // statuses include it, or named for it), return the existing effect
+    // instead of stacking a second one. A crash re-dispatch of "apply
+    // prone" must not double-apply.
+    const actor = this.actorOf(combatant.actorId);
+    const existing = (actor?.effects ?? []).find(
+      (e) =>
+        (Array.isArray(e.statuses) && e.statuses.includes(statusId)) ||
+        e.name === statusId,
+    );
+    if (existing) {
+      const expiresRound = Math.max(st.round, 1) + rounds;
+      if (!this.conditions.some((c) => c.effectId === existing._id)) {
+        this.conditions.push({ combatantId, statusId, effectId: existing._id, expiresRound });
+        this.saveState();
+      }
+      return existing._id;
+    }
     const raw = this.live.raw() as unknown as {
       createActorStatusEffect(parentActorUuid: string, statusId: string, options?: { name?: string }): Promise<{ _id: string }>;
     };
@@ -297,12 +347,28 @@ export class CombatAutopilot {
     }
   }
 
-  /** Deal damage to an actor (linked tokens share the actor's HP). Returns the new HP. */
-  async damage(actorId: string, amount: number): Promise<{ hp: number; down: boolean }> {
+  /**
+   * Deal damage to an actor (linked tokens share the actor's HP). Returns the new HP.
+   *
+   * With `opts.expectHp`, the write is compare-and-set: the current HP is
+   * read first, and when it is not the expected value the call returns
+   * `{ hp: current, down: false, skipped: true }` and applies NOTHING.
+   * That makes a crash re-dispatch safe: the first run already subtracted
+   * the damage, so the re-run sees a different HP and skips instead of
+   * subtracting twice. Without it, behavior is unchanged.
+   */
+  async damage(
+    actorId: string,
+    amount: number,
+    opts: { expectHp?: number } = {},
+  ): Promise<{ hp: number; down: boolean; skipped?: boolean }> {
     const actor = this.actorOf(actorId);
     if (!actor) throw new Error(`Actor ${actorId} not found.`);
     const hp = actor.system?.attributes?.hp;
     const current = hp?.value ?? 0;
+    if (opts.expectHp !== undefined && current !== opts.expectHp) {
+      return { hp: current, down: false, skipped: true };
+    }
     const next = Math.max(0, current - amount);
     const raw = this.live.raw() as unknown as {
       updateActorAttribute(actorId: string, patch: Record<string, number>): Promise<unknown>;
@@ -322,13 +388,24 @@ export class CombatAutopilot {
     return { hp: next, down };
   }
 
-  /** Heal an actor. Returns the new HP. */
-  async heal(actorId: string, amount: number): Promise<{ hp: number }> {
+  /**
+   * Heal an actor. Returns the new HP. Same compare-and-set contract as
+   * damage(): with `opts.expectHp` set and the current HP different, the
+   * call returns `{ hp: current, skipped: true }` and applies nothing.
+   */
+  async heal(
+    actorId: string,
+    amount: number,
+    opts: { expectHp?: number } = {},
+  ): Promise<{ hp: number; skipped?: boolean }> {
     const actor = this.actorOf(actorId);
     if (!actor) throw new Error(`Actor ${actorId} not found.`);
     const hp = actor.system?.attributes?.hp;
     const current = hp?.value ?? 0;
     const max = hp?.max ?? current;
+    if (opts.expectHp !== undefined && current !== opts.expectHp) {
+      return { hp: current, skipped: true };
+    }
     const next = Math.min(max, current + amount);
     const raw = this.live.raw() as unknown as {
       updateActorAttribute(actorId: string, patch: Record<string, number>): Promise<unknown>;

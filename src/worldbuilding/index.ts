@@ -35,6 +35,7 @@
 import * as fs from "node:fs";
 import type { FoundryLive } from "../live.js";
 import { uploadImage } from "./upload.js";
+import { FLAG_FIELDS, docHasFlag, findDocByFlag, flagValue } from "../idempotency.js";
 
 export interface SceneSpec {
   name: string;
@@ -44,6 +45,12 @@ export interface SceneSpec {
   height: number;
   /** Grid size in pixels. Default: 100. */
   gridSize?: number;
+  /**
+   * Idempotency key for this scene. When set, the key is stored in the
+   * scene's flags and a re-run returns the already-created scene instead
+   * of creating a second one. Without it, behavior is unchanged.
+   */
+  buildKey?: string;
 }
 
 export interface WallSpec {
@@ -82,6 +89,13 @@ export interface ChestSpec {
   y: number;
   name?: string;
   loot?: LootSpec[];
+  /**
+   * Idempotency key for this chest. When set, the key is stored in the
+   * loot actor's flags and a re-run returns the already-created chest
+   * instead of creating a second actor + token. Without it, behavior is
+   * unchanged.
+   */
+  key?: string;
 }
 
 export interface BuiltChest {
@@ -92,11 +106,36 @@ export interface BuiltChest {
 
 const CHEST_IMG = "icons/containers/chest/chest-wooden-tied-white.webp";
 
+interface RawSceneDoc {
+  _id: string;
+  name?: string;
+  flags?: Record<string, Record<string, unknown> | undefined> | null;
+  tokens?: { _id: string; actorId?: string }[];
+}
+
+/**
+ * Find a scene already created under this build key, or null. Reads
+ * current world state — the check a keyed re-run makes before creating.
+ */
+export function findSceneByBuildKey(live: FoundryLive, buildKey: string): string | null {
+  const raw = live.raw() as unknown as {
+    getScenes(): RawSceneDoc[];
+  };
+  const found = findDocByFlag(raw.getScenes(), FLAG_FIELDS.sceneBuild, buildKey);
+  return found ? found._id : null;
+}
+
 /** Create a Scene. A local imagePath is uploaded first (target worlds/<world>/maps). */
 export async function createSceneFromImage(
   live: FoundryLive,
   spec: SceneSpec,
 ): Promise<string> {
+  // Keyed resume: the scene already exists — return it. The Level, walls
+  // and lights were built with it; creating again would duplicate the room.
+  if (spec.buildKey) {
+    const existing = findSceneByBuildKey(live, spec.buildKey);
+    if (existing) return existing;
+  }
   let img = spec.imagePath;
   if (fs.existsSync(spec.imagePath)) {
     // Upload first: the scene background must live on the Foundry server.
@@ -108,14 +147,16 @@ export async function createSceneFromImage(
     const uploaded = await uploadImage(spec.imagePath, `worlds/${worldFolder}`);
     img = uploaded.path;
   }
+  const sceneData: Record<string, unknown> = {
+    name: spec.name,
+    width: spec.width,
+    height: spec.height,
+    grid: { size: spec.gridSize ?? 100, type: 1, distance: 5, units: "ft" },
+    navigation: true,
+  };
+  if (spec.buildKey) sceneData.flags = flagValue(FLAG_FIELDS.sceneBuild, spec.buildKey);
   const created = await live.modifyDocument("Scene", "create", {
-    data: [{
-      name: spec.name,
-      width: spec.width,
-      height: spec.height,
-      grid: { size: spec.gridSize ?? 100, type: 1, distance: 5, units: "ft" },
-      navigation: true,
-    }],
+    data: [sceneData],
   });
   const id = String(created[0]?._id ?? "");
   if (!id) throw new Error("Scene create returned no _id.");
@@ -201,6 +242,10 @@ export async function addLights(
 /**
  * Add an openable chest: a `loot` actor holding the loot items, plus a
  * token on the scene linked to it. Returns actor/token/item ids.
+ *
+ * With `spec.key`, the chest is retry-safe: the key is stored in the loot
+ * actor's flags, and a re-run returns the already-created actor + token
+ * (with the item ids it already holds) instead of creating a second chest.
  */
 export async function addChest(
   live: FoundryLive,
@@ -208,8 +253,35 @@ export async function addChest(
   spec: ChestSpec,
 ): Promise<BuiltChest> {
   const name = spec.name ?? "Old Chest";
+  if (spec.key) {
+    const found = (await live.searchActors(name)) as {
+      actors?: { _id: string; name: string }[];
+    };
+    for (const candidate of found.actors ?? []) {
+      const actor = (await live.getActorDetails(candidate._id)) as {
+        _id?: string;
+        flags?: Record<string, Record<string, unknown> | undefined> | null;
+        items?: { _id: string }[];
+      } | null;
+      if (actor && docHasFlag(actor, FLAG_FIELDS.chest, spec.key)) {
+        const actorId = String(actor._id ?? candidate._id);
+        const raw = live.raw() as unknown as { getScenes(): RawSceneDoc[] };
+        const scene = raw.getScenes().find((s) => s._id === sceneId);
+        const token = scene?.tokens?.find((t) => t.actorId === actorId);
+        if (token) {
+          return {
+            actorId,
+            tokenId: token._id,
+            itemIds: (actor.items ?? []).map((i) => String(i._id)),
+          };
+        }
+      }
+    }
+  }
+  const actorData: Record<string, unknown> = { name, type: "loot", img: CHEST_IMG };
+  if (spec.key) actorData.flags = flagValue(FLAG_FIELDS.chest, spec.key);
   const actorCreated = await live.modifyDocument("Actor", "create", {
-    data: [{ name, type: "loot", img: CHEST_IMG }],
+    data: [actorData],
   });
   const actorId = String(actorCreated[0]?._id ?? "");
   if (!actorId) throw new Error("Loot actor create returned no _id.");
@@ -268,6 +340,12 @@ export async function activateScene(live: FoundryLive, sceneId: string): Promise
  * Build a whole room in one call: scene + rectangle walls + lights + a
  * chest, then post the room description to chat. The scene is NOT
  * activated (the GM activates it when ready).
+ *
+ * With `opts.buildKey`, the build is retry-safe: a re-run finds the
+ * scene already built and returns `{ sceneId, duplicate: true }` (with
+ * empty wall/light/chest lists — the originals already exist in the
+ * world) instead of building a second room. The chest gets the key
+ * `<buildKey>:chest` and the announcement `<buildKey>:announce`.
  */
 export async function buildRoom(
   live: FoundryLive,
@@ -281,14 +359,22 @@ export async function buildRoom(
     lights?: LightSpec[];
     chest?: ChestSpec & { loot?: LootSpec[] };
     doorAt?: { x1: number; y1: number; x2: number; y2: number };
+    buildKey?: string;
   },
-): Promise<{ sceneId: string; wallIds: string[]; lightIds: string[]; chest: BuiltChest | null }> {
+): Promise<{ sceneId: string; wallIds: string[]; lightIds: string[]; chest: BuiltChest | null; duplicate?: boolean }> {
+  if (opts.buildKey) {
+    const existing = findSceneByBuildKey(live, opts.buildKey);
+    if (existing) {
+      return { sceneId: existing, wallIds: [], lightIds: [], chest: null, duplicate: true };
+    }
+  }
   const sceneId = await createSceneFromImage(live, {
     name: opts.name,
     imagePath: opts.imagePath,
     width: opts.width,
     height: opts.height,
     gridSize: opts.gridSize,
+    buildKey: opts.buildKey,
   });
   const { width, height } = opts;
   const walls: WallSpec[] = [
@@ -300,10 +386,19 @@ export async function buildRoom(
   if (opts.doorAt) walls.push({ ...opts.doorAt, door: 1 });
   const wallIds = await addWalls(live, sceneId, walls);
   const lightIds = await addLights(live, sceneId, opts.lights ?? []);
-  const chest = opts.chest ? await addChest(live, sceneId, opts.chest) : null;
-  await live.sendChat(
+  const chest = opts.chest
+    ? await addChest(live, sceneId, {
+        ...opts.chest,
+        key: opts.buildKey ? `${opts.buildKey}:chest` : opts.chest.key,
+      })
+    : null;
+  const announce =
     `🏰 **${opts.name}**\n${opts.description}` +
-      (chest ? `\nThere is a chest here, waiting to be opened.` : ""),
-  );
+    (chest ? `\nThere is a chest here, waiting to be opened.` : "");
+  if (opts.buildKey) {
+    await live.sendChatIdempotent(announce, { dedupeKey: `${opts.buildKey}:announce` });
+  } else {
+    await live.sendChat(announce);
+  }
   return { sceneId, wallIds, lightIds, chest };
 }

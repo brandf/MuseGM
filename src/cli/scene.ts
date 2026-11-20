@@ -2,14 +2,16 @@
  * scene CLI — build scenes, walls, lights, chests; or run the full demo.
  *
  *   bun run src/cli/scene.ts upload --file <local-image> --target worlds/testbed/maps
- *   bun run src/cli/scene.ts create --name "Cathedral" --image <local-file-or-server-path> --width 400 --height 300 [--grid 50]
+ *   bun run src/cli/scene.ts create --name "Cathedral" --image <local-file-or-server-path> --width 400 --height 300 [--grid 50] [--build-key <key>]
  *   bun run src/cli/scene.ts walls --scene <id> --walls '[{"x1":0,"y1":0,"x2":400,"y2":0}]'
  *   bun run src/cli/scene.ts lights --scene <id> --lights '[{"x":200,"y":150,"dim":300,"bright":100}]'
- *   bun run src/cli/scene.ts chest --scene <id> --x 200 --y 150 [--name "Old Chest"] [--loot '[{"name":"Gold","price":50}]']
+ *   bun run src/cli/scene.ts chest --scene <id> --x 200 --y 150 [--name "Old Chest"] [--loot '[{"name":"Gold","price":50}]'] [--key <key>]
  *   bun run src/cli/scene.ts delete --scene <id> [--actor <loot-actor-id>]
  *   bun run src/cli/scene.ts demo            # full room build, prints ids
  *   bun run src/cli/scene.ts demo-cleanup --scene <id> [--actor <id>]
  *
+ * With --build-key, a re-run of `create` returns the already-created scene
+ * instead of creating a second one.
  * Prints JSON. The demo builds a room and posts its description to chat;
  * it does NOT activate the scene (the GM's call).
  *
@@ -56,6 +58,7 @@ async function main(): Promise<void> {
           width,
           height,
           gridSize: Number(arg("--grid") ?? "100"),
+          buildKey: arg("--build-key"),
         });
         out = { sceneId };
         break;
@@ -85,6 +88,7 @@ async function main(): Promise<void> {
           y,
           name: arg("--name") ?? "Old Chest",
           loot,
+          key: arg("--key"),
         });
         break;
       }

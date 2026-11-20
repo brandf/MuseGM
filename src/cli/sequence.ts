@@ -58,6 +58,7 @@ async function main(): Promise<void> {
     }
     const result = await runSequence(live, steps, {
       continueOnError: process.argv.includes("--continue-on-error"),
+      runKey: arg("--run-key"),
     });
     console.log(JSON.stringify(result, null, 2));
     if (!result.ok) process.exitCode = 1;

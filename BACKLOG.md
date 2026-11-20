@@ -11,8 +11,19 @@ table's Muse is **Meroki**; Dave's Muse would be someone else. The repo is
 the shared tooling (MuseGM), the persona is per-instance. Two Muses can
 connect to the same Foundry session and divide the work (one builds maps
 while the other runs combat), coordinating through Foundry chat and the
-shared backlog.
-**AgentTS hookup:** design only so far — see [docs/agentts-hookup.md](./docs/agentts-hookup.md) (recommends AgentTS as orchestrator over the CLIs for bounded jobs; live monitor stays outside AgentTS).
+shared backlog. Coordination design: [docs/multi-muse.md](./docs/multi-muse.md)
+(one chat monitor per session; Builder vs Table roles; pin claim protocol;
+explicit announced takeover when one goes offline; compound-request
+divide-and-conquer). Agent coordination skills: [docs/agent-coordination.md](./docs/agent-coordination.md)
+(coordinating through Foundry as the channel, negotiating new protocols
+on the fly, teaching each other tricks, and collaborating on the GitHub
+repo as contributors — pull before building, announce pushes, review each
+other's work).
+**AgentTS hookup:** design only so far — see [docs/agentts-hookup.md](./docs/agentts-hookup.md) (recommends AgentTS as orchestrator over the CLIs for bounded jobs; live monitor stays outside AgentTS). **Decision (Brandon, Nov 19): core stays independent of AgentTS; the AgentTS layer is phase two, possibly a separate repo — no AgentTS work in MuseGM until then.** **AgentTS-friendly core (built offline Nov 19, code + unit tests only — NOT live-tested):** retry-safety across the core via `flags["foundry-live"]` keys (`src/idempotency.ts`): `send --dedupe-key`, seeded rolls, `buildEncounter --encounter-key`, `scene create --build-key`, `chest --key`, `sequence --run-key`, CAS `--expect-turn`/`--expect-hp`, tolerant deletes; audit table + live-test checklist in the hookup doc's "AgentTS-friendly core" section. Still open: `buildTileRoom` key treatment (wave-2 builder owns `tiles.ts`); live confirmation of flags round-trip, dedupe end-to-end, seeded rolls, keyed resume, CAS paths.
+
+**Real-time adventure construction (Brandon's vision, Nov 19):** see [docs/realtime-adventure-construction.md](./docs/realtime-adventure-construction.md) — scoped feature requests FR-1..FR-14: conversational room building, theme re-skin, multi-floor + gated reveal, trigger zones, cutscene scripting + playback (the ambush), props, lighting as a language, undo/tweak, director mode (v2), rapid custom encounter generation, mutable maps + maze generator, iterative refinement (regional overlays + scripted tile swaps), value-budgeted treasure, and the speed budget. Governing principle: **Muse authors a small cutscene script (JSON), the engine plays it out on a timed timeline** — not canned responses; Muse's tokens go to decisions, code does the enumeration and playback.
+
+**The toolbox grows (Brandon, Nov 19):** reflect every session on what the toolbox could and couldn't do for the requests; when a request has no tool, build the tool — even a one-off (a maze generator for one maze). If it turns out reusable, it joins the toolbox permanently. The backlog is the toolbox's inventory.
 
 ## Priority (triage Nov 19 — build in this order, demo as we go)
 
@@ -129,6 +140,22 @@ re-uploading images per room. The earlier bake-first decision is reversed.
     it byte-identically) — the tiles read as a room: seamless floor,
     wall ring, door with leaf + swing arc, bones/skull, ritual circle,
     pillar, rubble, green fog haze over it all.
+  - **GAPS CLOSED Nov 20 — AI dressing tiles, built + unit-tested, live test pending.**
+    Skeleton, chest, altar generated with the image tool on flat magenta
+    (#FF00FF) backgrounds, top-down, STYLE.md palette — all three came
+    back clean on the first pass (articulated skeleton diagonal, chest
+    with iron bands + padlock, altar slab with moons/star/skull). Cut out
+    by `tiles/procedural/cutout.py` (global chroma-key: key colour sampled
+    from the corners, soft alpha ramp 40→90 RGB distance, 1px MinFilter
+    on alpha to kill the magenta fringe; then cropped to the opaque
+    bounding box and fitted into a 200x200 transparent tile). Verified
+    composited over a floor tile — no fringe, floor shows through the
+    ribcage gaps. Raw art in `tiles/ai-source/` (media-generation-*-raw
+    files + canonical cut `skeleton.png` / `chest.png` / `altar.png`);
+    `build_pack()` copies the cut files into the pack and lists them in
+    the manifest. **Pack is now 18 tiles, 0 gaps.** Preview regenerated
+    with all three in the room (skeleton top-right, chest bottom-left,
+    altar bottom-right).
 - [~] Composer: room spec (grid width/height, door walls/positions, tile
   layout by layer) → place Tile documents (sort order = layer) + walls +
   lights + tokens on the scene; resize = change grid dims, no new images
@@ -149,14 +176,16 @@ re-uploading images per room. The earlier bake-first decision is reversed.
     the top-left corner, elevation + sort order the layers, rotation is
     clockwise. Layers: floor (0, 0), wall (0, 10), dressing (0, 20),
     fog (elevation 1, sort 0 — overhead, above tokens).
-    Tests: `tests/tiles.test.ts`, 18 checks — floor coverage,
+    Tests: `tests/tiles.test.ts`, 25 checks — floor coverage,
     determinism, resize (+10 columns = +10*gridH floor tiles, every src
     still a pack file), wall rotations, door segments, layer
-    elevation/sort, hidden/alpha, validation errors. `bun run typecheck`
-    clean; `bun test tests/` 34 pass / 0 fail (18 tiles + 16 pre-existing
-    dice). tsconfig `rootDir` removed so tests/ typechecks too.
+    elevation/sort, hidden/alpha, validation errors, plus the 7-check
+    dungeon-graph block (Nov 20). `bun run typecheck`
+    clean; `bun test tests/tiles.test.ts tests/dice.test.ts` 41 pass /
+    0 fail (25 tiles + 16 dice). tsconfig `rootDir` removed so tests/
+    typechecks too.
   - **LIVE-TEST CHECKLIST (next session, Dave's Foundry on):**
-    1. `uploadTilePack` — 15 files land in `worlds/testbed/`, GET back
+    1. `uploadTilePack` — 18 files land in `worlds/testbed/`, GET back
        byte-identical (same check as the map upload).
     2. `buildTileRoom` a 8x6 room with a south door, bones, fog, 2
        torches — scene loads (colour-only Level background!), tiles
@@ -169,8 +198,84 @@ re-uploading images per room. The earlier bake-first decision is reversed.
     5. Fog: drifts over tokens, toggles off via `hidden`.
     6. `rebuildTileRoom` with gridW+10 — room widens, no new images.
     7. GM ownership: Dave can edit the scene (he's added at create).
-- [ ] Dungeon graph: rooms + door links; walking through a door moves the
+    8. AI tiles: skeleton, chest, altar render clean on the table — no
+       magenta fringe, transparency reads as floor through the ribs.
+- [~] Dungeon graph: rooms + door links; walking through a door moves the
   party to the next scene at the matching door
+  - **BUILT offline Nov 20 — [~], live test pending.**
+    `src/worldbuilding/tiles-layout.ts`: `layoutDungeon` (pure) — rooms
+    + links validated (duplicate/empty room ids, link ends naming an
+    unknown room or a cell that is not a declared door, a door used in
+    two links, self-links, duplicated links — reversed duplicates are
+    caught as duplicates, not misreported as door reuse — and the graph
+    must be connected, BFS from the first room) and laid out; each link
+    resolves to arrival cells one cell inside each door
+    (`doorEntryCell`, `resolveDoorWalk`). `src/worldbuilding/tiles.ts`:
+    `buildDungeon` (one scene per room via `buildTileRoom`, fails before
+    creating anything when the graph is invalid) and `walkThroughDoor`
+    (deletes each token on the old scene, re-places it in the linked
+    room at the matching door's arrival cell — actorLink, so HP and
+    conditions survive; new token _ids are returned, old ones are gone).
+    Tests: `tests/tiles.test.ts` dungeon block, 7 checks (two-room link
+    + arrival cells, entry cells on all four walls, walk resolution both
+    ways + unlinked door, three-room chain, all validation errors).
+    `bun test tests/tiles.test.ts tests/dice.test.ts` 41 pass / 0 fail.
+  - **LIVE-TEST CHECKLIST (next session):**
+    1. `buildDungeon` hall → crypt — two scenes created, both load.
+    2. `walkThroughDoor` — party steps through the hall's south door
+       and appears in the crypt just inside its north door, HP intact.
+    3. Walk back through the same doors returns them to the hall.
+- [~] Mutable maps + maze generator (FR-12) and regional overlays (FR-13)
+  - **BUILT offline Nov 20 — [~], live test pending.**
+    `src/worldbuilding/maze.ts` (pure): seeded recursive-backtracker maze
+    (`generateMaze` — long winding corridors, spanning-tree construction
+    so "perfect" is provable: edges == cells - 1; iterative, no call
+    stack risk), `toSquares` (100 m -> 66 squares, 5 ft = 1 square, PF2e
+    1 square = 5 ft = 1.524 m), ASCII rendering + analysis helpers
+    (connectivity, cell-graph edge count, dead ends). `mulberry32` moved
+    here from `tiles-layout.ts` (re-exported, no behaviour change).
+    `src/worldbuilding/tiles-layout.ts`: layout ops, all pure and
+    non-mutating (input spec untouched, so edit history = list of specs
+    and undo = the previous one) — `addCorridor` (from a wall/door cell,
+    a direction, a length in m/ft/squares; adds the door to the source
+    room when missing; 1–2 wide corridors get open ends, 3+ get doors),
+    `linkRooms`, `carveMazeRegion` (odd-sized, strictly interior, no
+    overlap, door entries must stay walkable), `widenRoom` (shifts doors,
+    dressing, fog, torches, lights, maze regions and overlays when
+    growing west/north), `applyOverlay` (FR-13: floor-variant swap in a
+    rectangular region only, later overlays win). `RoomSpec` gains
+    `openings` (perimeter cells with no wall at all — a 1-wide
+    corridor's ends; linkable in the dungeon graph like doors),
+    `mazes` and `overlays`. `layoutRoom` renders maze regions (wall
+    cells get a wall-straight tile facing the first open neighbour, or
+    floor-dark when enclosed; merged collision walls along every
+    wall/floor boundary; floor skipped on wall cells; overlays remap the
+    rolled floor name inside their region). Room minimum relaxed 3x3 ->
+    1x1 (corridors are 1-wide by design; corner tiles deduped by cell)
+    and the old tiles test updated to match. CLI: `bun run maze --cells
+    10x8 [--seed 7] [--ascii]`, `bun run maze --corridor 100m`.
+    Tests: `tests/maze.test.ts`, 35 checks — units, maze properties
+    (connected, perfect, dead ends, deterministic, entrance/exit sides),
+    all five ops + validation, overlay region-only/1:1/later-wins, and a
+    BFS walk from a door through a maze to its exit. Full suite 269
+    pass / 0 fail, `bun run typecheck` clean.
+  - **FR-13 note:** the overlay half is built; real wet-variant tiles
+    (floor-wet) are a later pack addition — the variant set today is the
+    existing floor tiles (e.g. plain -> dark reads as waterlogged). The
+    scripted trap-door swap half of FR-13 is the cutscene builder's job
+    (a `swapTile` step in the timeline player), not this one.
+  - **LIVE-TEST CHECKLIST (next session):**
+    1. Corridor + maze on the table: hall -> 100 m corridor north ->
+       maze room; walk the party through both doors into the maze and
+       out the exit, tokens stop at maze walls.
+    2. Maze wall tiles face the walkable floor; enclosed wall cells
+       read as dark floor, not a hole.
+    3. `widenRoom` on a live room (rebuildTileRoom) — room widens, all
+       content shifts with it, no new images.
+    4. Overlay: "make this part of the maze partially underwater" —
+       region goes dark/wet, the rest of the map untouched; re-roll the
+       maze seed ("different maze") and it rebuilds.
+    5. `bun run maze --cells 12x8 --seed <n>` eyeballed vs the table.
 - [ ] Green eerie fog is the dungeon's fog (STYLE.md) — pieces and bakes
   both use it
 
@@ -217,12 +322,53 @@ on the DM's Foundry and enabled in the world.
 - [ ] Right-click canvas context-menu entry (v1.1) — needs the v14
   `ContextMenu` API verified against the 14.370 client bundle; the toolbar
   tool is the v1 path.
-- [ ] Monitor side: watch for pins, act, reply, mark done (contract is
-  written; the loop is not built yet).
+- [x] Monitor side: watch for pins, act, reply, mark done — built offline
+  Nov 20 (no live test yet — Foundry was off): `src/session/pins.ts`
+  (`extractPin` / `parsePinRequest` / `extractRoomName` / `nearestWall` /
+  `splitWallForDoor` / `planPinAction`, all pure + unit-tested) +
+  `handlePin` / `PinProcessor` (dedupe in memory + `.pins-state.json`) /
+  `findOpenPins` (picks up pins dropped while the monitor was offline).
+  Secret door = split a 100px piece out of the nearest wall (door type 2)
+  + build the named room behind it as its own tile-room scene with the
+  door on the facing side; chest / light / plain door / named room also
+  planned; unknown requests get a clarification reply and are marked done
+  (so they don't re-fire forever). `tests/pins.test.ts` green. The
+  worldbuilding builders are dynamically imported only when a plan
+  actually builds, so the tests never touch the MCP client.
+  **Still needs live testing:** drop a real pin, watch the monitor pick
+  it up, verify the wall split + room build + chat reply + journal
+  append + status "done" on both docs.
 - [ ] Migrate the dialog from V1 `Dialog` to `DialogV2` once
   `DialogV2.wait`'s button-callback signature is verified against the
   14.370 bundle; same for programmatically switching the active tool back
   after a pin is placed.
+
+## Monitor CLI — first-class loop (built offline Nov 20)
+
+The wait → answer → wait loop the Nov 19 subagent monitor was doing by
+hand, now as library code: `bun run monitor` (`src/cli/monitor.ts` +
+`src/session/monitor.ts`).
+
+- [x] `runMonitor` — waitForChat loop (starts from the newest message,
+  never re-answers history), first cycle scans for open pins dropped
+  while offline, combat turn announcements, clean shutdown on
+  SIGINT/SIGTERM, JSON log lines on stderr, `--once` prints a summary
+  JSON on stdout, `--dry-run` classifies without posting.
+- [x] Routing (pure, unit-tested): own messages (by author _id or
+  speaker alias) never wake it; empty messages are noise; roll requests
+  → `rollForChat`; data questions → `answerQuestion`; everything else
+  is logged as "needs-agent" and skipped — the CLI never improvises.
+- [x] Questions it answers, from live data only (turn / round / HP /
+  AC / initiative / scene). A missing actor / field / combat is reported
+  as "couldn't find it", never filled in. `tests/monitor.test.ts` green.
+- [x] Turn announcements only: the monitor announces turn changes
+  (the GM advancing the tracker). HP / down / combat end belong to the
+  autopilot — the code path that changes HP owns the callout — so the
+  monitor never double-posts a down message.
+- [ ] **LIVE test pending next session:** run `bun run monitor` against
+  TestBed, post a roll request + a question in chat, drop a pin, advance
+  the tracker, confirm the answers + turn announcement land and the
+  "needs-agent" lines stay out of chat.
 
 ## Session automation (P1 first, in demo order)
 
@@ -240,16 +386,44 @@ on the DM's Foundry and enabled in the world.
   - Done Nov 19: `src/session/movement.ts` (`moveTokenTo` / `placeToken` / `deleteToken` / `resolveScene` / `resolveToken` / `getSceneTokens`) + `src/cli/move.ts`. Native-animation finding: a single Token update DOES animate on clients (`animate` defaults to true in the 14.370 bundle), so stepping is for long paths / controlled speed, not short hops. Demo live on Otari (inactive scene): Kobold Warrior token `VbfTstrhKePRJ2qK` glided 200,200 → 800,200 in 12 steps / 3279ms at 300px/s, final position verified by a FRESH connection, token deleted. Two real bugs found and fixed in the demo: (1) the demo CLI's `process.exit(0)` in a `finally` swallowed the failure and reported success — all three new CLIs now use the `main().catch` pattern; (2) a connection never sees its own creates/moves in its cache, so `moveTokenTo` takes a `TokenRef` descriptor (`{id, name, x, y}` from the create response) as the start position when the cache lacks the token, and the sequence runner tracks tokens it placed. Scene/token are resolved against current state at call time, never from earlier probes.
 - [x] Sequence runner — fire off a timed sequence of actions (move → pause → roll → apply effect → chat) that plays out on the code side, paced, with no round-trip to Muse per step
   - Done Nov 19: `src/session/sequence.ts` (`runSequence`) + `src/cli/sequence.ts` (`--file` / `demo`). Steps: place, deleteToken, move, pause, chat, roll, damage, heal, effect, ping, cursor, waitChat; stops on first failure unless `--continue-on-error`; per-step log returned. Demo live on Otari: 6 steps (place → move → pause 1000ms → roll 1d20+5 = 20 → pulse ping → delete), all ok in 4230ms, token cleaned up (Otari tokens: []).
+  - Extended Nov 20 (cutscene engine): new step kinds `face`, `light`, `prop`, `reveal`, `wait`, `swapTile`; `place` keeps its `key` (formation retry-safety). See the cutscene entry below.
+- [~] Cutscene script engine (FR-5) + scripted tile swaps (FR-13) — Muse authors a small JSON script, the engine plays it on a timed timeline
+  - Built offline Nov 20 — [~], live test pending. `src/session/cutscene.ts` (versioned script schema, strict validation — every error listed, never a silent skip; formation expansion; `playCutscene` via runSequence) + `src/session/formations.ts` (ring/line/wedge + facing angles, pure) + `src/session/lights.ts` (timed light transitions — dim/bright/color lerp, `animateLight`) + `src/session/tile-ops.ts` (FR-13 `swapTile`: texture swap in place by Tile _id or by cell when the cache carries tiles) + `src/cli/cutscene.ts` (`--file`, `--validate-only` needs no connection) + `examples/ambush.json` (the ambush: 9 soldiers glide in, spears, mage, center light blooms — validates, expands to 51 steps) + `tests/cutscene.test.ts` (22 checks). Spear prop tile added to the pack procedurally (pack now 19 tiles, 0 gaps). **Still needs live testing:** play the ambush against TestBed (Soldier/Mage actors must exist; spear tile uploaded to `worlds/testbed/`); verify the token-rotation convention (0 = north, clockwise), the dot-notation light/tile updates (`config.dim`, `texture.src`), the light-bloom timing, and a `swapTile` by _id (cell addressing needs a tile cache the client may not carry — the _id path is the reliable one). Spec: `docs/realtime-adventure-construction.md` FR-5 + FR-13.
 - [x] Ping & cursor — `ping(x, y, {style})` via the `userActivity` socket message (`{cursor, ping: {scene, pull, style, zoom}}`); cursor position rides the same message. Proven live Nov 19 (test ping sent on Landing)
   - Done Nov 19: `FoundryLive.ping()` / `moveCursor()` in `src/live.ts` + `src/cli/ping.ts`. Protocol verified in the 14.370 client bundle: `socket.volatile.emit("userActivity", userId, {cursor, ping: {scene, pull, style, zoom}})`; valid styles are pulse/alert/chevron/arrow, and the GM PULL ping is style "chevron" with `pull: true` (the library maps `style: "pull"` to that). Demo live: one pulse ping at 400,400 on the active scene (Floor 1 at the time) + one cursor-only move to 500,500 — both emitted cleanly. Caveat: volatile emit has no server ack, so the result means "emitted on a live socket", not "seen by a client". No chat spam from any of the three demos.
-- [ ] Loot pipeline — generate treasure, put it in a chest token, hand it to the right character sheet on open
-- [ ] Turn reminders — whisper the player whose turn starts with what they can do and what conditions they have
-- [ ] Session recaps — read the chat log after a game, write the recap into a journal entry
-- [ ] Player Q&A — answer AC, inventory, spells left, etc. straight from actor data
+- [~] Loot pipeline — generate treasure, put it in a chest token, hand it to the right character sheet on open
+  - Built offline Nov 20 — [~] means built + unit-tested, NOT live-tested (the backlog rule: [x] only after a live test against TestBed). `src/session/loot.ts` (pure `generateLoot` / `splitCoins` / `lootValueGp` / `formatLoot` — seeded deterministic RNG, house treasure table clearly labeled NOT the PF2e rulebook table; live `fillChest` / `generateAndFillChest` / `openChest` over `modifyDocument`, same chest route as `addChest`) + `src/cli/loot.ts` (`--generate` needs no connection) + `tests/loot.test.ts` (13 checks). Coins go in as one "Coins" treasure item — a PF2e loot actor has no coin purse; the GM converts them on handover. **Still needs live testing:** a real `--fill` + `--open` against TestBed.
+- [~] Value-budgeted treasure (FR-14) — "I want 500 gp worth of treasure, and make it interesting"
+  - Built offline Nov 20 — [~], live test pending. `src/session/treasure.ts` (pure `generateTreasure` / `treasureValueGp` / `formatTreasure` — seeded deterministic RNG, reuses loot's `rngFromSeed` + `splitCoins`) + `src/cli/treasure.ts` (`--budget <gp> --level <n> [--seed] [--theme]` needs no connection) + `tests/treasure.test.ts` (17 checks). Budget fitting: 1–2 signature items (20–35% of budget each, capped 45%, topped up instead of dumping into coins when the pool is thin) + greedy unique-item selection + stack growth on gems/consumables + coins as the small remainder, so the total lands exactly on the budget; pool is the union of all level bands at or below the level (a small budget at a high level still has cheap items to spend on — caught by a failing test, fixed). Every item gets a unique story line (owner/place/quirk, themed: dungeon/gothic/underwater/crypt); signature items have a named homebrew ability (labeled homebrew in data + text) and the artwork hook (`art: null` + `artPrompt` per signature item — one square image each, filled in later by the art generator; artwork never blocks the drop). House table, clearly labeled NOT the PF2e rulebook table. **Still needs live testing:** no live layer exists yet — filling a chest from a treasure hoard (map to `fillChest`) and the art-generator step that fills `art` are follow-ups.
+- [~] Turn reminders — whisper the player whose turn starts with what they can do and what conditions they have
+  - Built offline Nov 20 — [~], live test pending. `src/session/reminders.ts` (pure `buildTurnReminder` / `formatConditions` / `hpStatus` — generic PF2e 3-action hint, NOT tailored to the character's feats/spells; downed combatants get a "you're down" line, not actions) + `src/cli/remind.ts` (`--demo` needs no connection). Live `remindTurn` whispers to the current combatant's owning player (non-GM OWNER from actor ownership; public post when no owner is found) — needs a new `CombatAutopilot.listConditions()` accessor (added, read-only). **Still needs live testing:** a real `--combat` against TestBed.
+- [~] Session recaps — read the chat log after a game, write the recap into a journal entry
+  - Built offline Nov 20 — [~], live test pending. `src/session/recap.ts` (pure `buildRecap` / `recapToText` / `recapToJournalHtml`). HONESTY RULE: the recap only reports what the log contains — kills/loot/combat/rolls/rooms are pattern-matched from Meroki's announcement lines with the source message cited; player chatter is never turned into facts; a quiet log says "nothing notable". Live `postRecap` reads the log, creates the journal entry via `createJournalEntry`, and posts the summary to chat. `src/cli/recap.ts` (`--from-json` needs no connection) + `tests/recap.test.ts` (12 checks, fixture log modeled on the Nov 19 session). **Still needs live testing:** a real `--post` against TestBed.
+- [~] Player Q&A — answer AC, inventory, spells left, etc. straight from actor data
+  - Built offline Nov 20 — [~], live test pending. `src/session/qa.ts` (pure `parseQuestion` / `answerQuestion` / `readAc` / `readHp` / `readInventory` / `readSpellsLeft` / `findItem`). HONESTY RULE: every value comes from the actor record; a missing field answers "can't find X on the sheet" — nothing is invented. Defensive readers over the raw PF2e record (several known paths; handles both spell-slot shapes — `value/max` and `prepared` lists — and PF2e's 3-letter ability keys). `src/cli/qa.ts` (`--fixture` needs no connection; `--actor` resolves by id or name) + `tests/qa.test.ts` (12 checks). **Still needs live testing:** a real `--actor` question against a TestBed PC.
+  - P2 test totals (verified Nov 20): `bun test tests/` 87 pass / 0 fail — 46 new P2 checks (loot 12, reminders 8, recap 12, qa 14) + 16 dice + 25 tiles (the tile file grew since the earlier 18 — a concurrent worker added checks); `bun run typecheck` clean.
+- [~] Rapid custom encounter generation (FR-11) — story-aware NPCs in under a minute from one sentence
+  - Built offline Nov 20 — [~], live test pending. `src/session/encounter-gen.ts` (pure generation + thin live wrappers) + `src/cli/encounter-gen.ts` (`--demo` / `--generate` need no connection) + `tests/encounter-gen.test.ts` (26 checks). Muse authors a compact spec (names, roles, one-liners, formation); code expands it: role templates scaled to party level (house stats), gear/spells filtered by role AND theme (death-theme mage spells all from the death list), backstories built ONLY from the spec one-liner + verbatim story-context facts/people (no invented plot; empty context → explicitly generic), tokens placed by ring/line/wedge formation helpers (local — merge with cutscene.ts helpers when they land). **Two rules (Brandon, Nov 19):** (1) every NPC gets a LIVING KIT — rations, waterskin, bedroll, rope, torches, whetstone + one personal item (letter from home, etc.), price 0 (characterization, not loot); (2) every NPC gets ONE UNIQUE SIGNATURE ITEM that drops on death — named + one-line story, unique within the encounter (pool without replacement + fallback composer; Muse-authored signatures used verbatim, duplicates rejected). Live: `createCustomActors` (Actor create, then Item creates with `parentUuid: Actor.<id>`) + `createCustomEncounter` (P1 builder for tokens + combat, then glide to formation). Actor doc is a minimal house-shaped PF2e NPC using only field paths qa.ts already reads; perception is written at BOTH `attributes.perception.value` and `perception.mod` because this codebase reads both — resolve live. Backstory lives in `flags.musegm` (no biography field path verified yet — live-test item). **Still needs live testing:** a real `--build` against TestBed (actors render on sheets, tokens in formation, combat starts, signature items on the sheets).
 - [ ] Quest log — running journal that ticks objectives off when the thing actually happens in game
 - [ ] Downtime — shopping, crafting, healing handled in chat
 - [ ] Real rule lookup — `lookup_rule` in the MCP is a stub; build a real one from compendium + journal search
-- [ ] Compendium import — the MCP cannot import compendium creatures at all (`searchCompendium` returns 0 results for everything, no import tool). Needed for the Dracolich: 29 lich / 666 dragon entries exist in the installed books, zero dracolich, and there is no way to pull any of them into the world as actors. Either fix/search the MCP's compendium path or build an import from pack index data.
+- [x] Compendium import — **research done + code built offline Nov 20, live
+  test pending.** The MCP's `searchCompendium` was never broken, it was
+  REST-gated (returns empty without the removed REST module). The working
+  path is the plain socket: pack indexes are already in the `world`
+  payload (`worldData.packs[].index` — the monitor's live count: 29 lich /
+  666 dragon / 0 dracolich), and full documents come from
+  `modifyDocument("Actor", "get", { query: { _id }, pack })` — verified in
+  an independent implementation (Pelmog/foundry-mcp, v13-tested) and in the
+  v13/v14 type definitions, NOT yet run on 14.370. See
+  [docs/compendium-import.md](./docs/compendium-import.md).
+  `src/session/compendium.ts` (`searchPackIndex`, `getPackDocument`,
+  `importPackActor`, `mapCompendiumActorToWorld`, `applyDracolichPatch`,
+  `DRACOLICH_DRAFT`) + `src/cli/compendium.ts` + `tests/compendium.test.ts`
+  (18 tests green, typecheck clean). **Live checklist next session:**
+  `--get` one pack doc, `--import` a Lich, verify the world Actor + items
+  land, verify a `query: {_id}` miss falls back to `{_id__in: [...]}`, and
+  confirm the mcp-api user can read the pack (permissions).
 
 ## Done
 
@@ -265,10 +439,11 @@ combat `1hlTZdDIHFGIXu93` round 1.
 
 - [ ] **Dracolich — needs Dave's pick next session.** No Dracolich exists
   in the installed compendiums (searched all 101 pack indexes: 29 lich,
-  666 dragon, zero dracolich). Options: custom-build a Dracolich actor or
-  use the Lich. Deeper gap: the MCP cannot import compendium creatures at
-  all — `searchCompendium` returns 0 results for everything and there is
-  no import tool. Needs a backlog item of its own (compendium import).
+  666 dragon, zero dracolich). Recommended: import the Lich (import path
+  now built — see Compendium import above + `docs/compendium-import.md`)
+  and apply the draconic patch; fallback is the homebrew `DRACOLICH_DRAFT`
+  (`--dracolich`). **Level warning:** party is level 1–2, a level 12
+  Dracolich is a story device / future boss, not a fight — Dave's call.
 - [ ] **Token-sync — top open issue.** MCP-originated token moves don't
   show live in browsers (reload only). Investigate what event the client
   expects that the MCP's update doesn't produce.

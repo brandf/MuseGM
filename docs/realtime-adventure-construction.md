@@ -1,0 +1,486 @@
+# Real-time adventure construction — feature requests
+
+**Status:** spec, Nov 19, 2026. Written from Brandon's live-session vision
+(real-time adventure construction in Foundry) and the speed principle he
+stated the same night. No implementation yet except where noted as built.
+
+## The governing principle: Muse authors a small script, the engine plays it
+
+This is NOT canned responses to things Brandon says. The shape is:
+
+1. Brandon says what should happen, in intent ("nine soldiers rush in
+   and surround them").
+2. Muse authors a **small declarative script (JSON)** — the decisions
+   only: which tokens, where roughly, in what order, what it should feel
+   like. The script is compact; Muse's tokens go to the creative calls,
+   never to enumerating placements.
+3. The engine executes the script on a **timed timeline** — hundreds of
+   placements, movements, facings, light changes, prop drops — with no
+   further tokens and no round-trip per step.
+
+The sequence runner (`src/session/sequence.ts`) is already this shape:
+a JSON step list played out on the code side, paced, one call from Muse.
+The cutscene engine is that idea grown up: a richer step vocabulary, a
+real timeline, and a script-authoring surface for Muse.
+
+**The speed budget (the constraint every feature below carries):**
+Muse's decision is a short script, seconds of tokens at most. Code
+execution is seconds. Time from Brandon's sentence to the change visible
+on the table should be measured in seconds, not in a long token stream.
+If a feature needs Muse to enumerate placements one by one, the feature
+is shaped wrong — push the enumeration into code.
+
+## First principles: what a content creator needs mid-session
+
+The creator's loop is: **say what should happen → see it happen →
+react to the players → say the next thing.** Everything below serves
+that loop. The failure mode is dead air: every second the table waits
+while the creator describes coordinates or watches a build is lost
+energy. So:
+
+- **The creator speaks in intent, not coordinates.** "Add a door here"
+  (pointing), "make it gothic", "soldiers rush in" — the system resolves
+  intent to concrete placements. Code does the geometry.
+- **Everything is a small, reversible edit.** Add → look → adjust →
+  undo. "A bit wider", "darker", "more fog" are one short message each.
+  The dungeon is data (room specs + a graph); edits are spec diffs.
+- **The table never sees the scaffolding.** Changes land live and
+  smoothly — tokens glide, lights fade, fog drifts in. No jarring pops,
+  no "hold on while I build" pauses.
+- **Surprise is preserved.** Hidden rooms, secret doors, unrevealed
+  floors — players see only what they should, when they should. Reveal
+  is a first-class action, gated on the fiction (climbing the stairs),
+  not on the build.
+- **The creator stays in the fiction.** They talk to the table and to
+  Muse in the same channel (Foundry chat). No dashboard to switch to.
+
+## Feature requests
+
+### FR-1 — Conversational room building (iterative)
+
+**Creator says:** "Start with a small entry room." Then: "Add a door
+here." Then: "Add a hidden room over here that takes you into a long
+hallway over to here."
+
+**Muse authors:** a room spec per step (dimensions, door wall/position,
+link to the next room). "Here" resolves from the creator's ping/cursor
+or the named wall — never from coordinates in chat.
+
+**Engine executes:** the composer places the tiles, walls, lights
+(`buildTileRoom`); the dungeon graph links the rooms (`layoutDungeon`,
+`walkThroughDoor`).
+
+**Acceptance:** a 3-room dungeon built in under 2 minutes of chat, no
+coordinate talk, each step visible within seconds of the message.
+
+**Status:** composer + dungeon graph built and unit-tested (18-tile
+pack, 0 gaps); live test pending. The chat-driven iterative loop
+(monitor → composer) is not yet wired.
+
+### FR-2 — Theme re-skin
+
+**Creator says:** "Skin this to be more of a gothic theme."
+
+**Muse authors:** one word — the theme name. Maybe a note ("colder,
+taller windows").
+
+**Engine executes:** the same room spec rebuilt with a different tile
+pack (floor/wall/dressing swapped) + light palette change, in code, in
+seconds. A room spec references a theme; re-skin is a pack swap.
+
+**Acceptance:** a built room re-skinned in under 10 seconds of
+execution; the layout (walls, doors, links) is unchanged, only the look.
+
+**Status:** not built. Needs themed packs (gothic, crypt, tavern,
+forest…) and a `theme` parameter on the room spec + composer. The base
+pack is the template; each theme is a pack variant in the same STYLE.md
+language.
+
+### FR-3 — Multi-floor + gated reveal
+
+**Creator says:** "A staircase goes up here to a second floor that is
+only revealed when the characters actually go up here."
+
+**Muse authors:** a staircase zone + a second-floor room spec linked
+as "up" from the first room.
+
+**Engine executes:** the second floor exists (built) but is hidden /
+inactive — its scene is not activated and its contents are not visible
+until a token enters the staircase zone, at which point the reveal
+fires: scene activates, tokens move up, the floor is shown.
+
+**Acceptance:** the players cannot see the second floor before climbing;
+the climb itself triggers the reveal with no creator action in the
+moment.
+
+**Status:** not built. Needs: a staircase zone type, scene
+visibility/reveal control, and the zone→reveal wiring (extends the
+trigger-zone system, FR-4).
+
+### FR-4 — Trigger zones
+
+**Creator says:** "A trigger zone over here — the first player that
+steps into this area…"
+
+**Muse authors:** a zone (rectangle on the map) + a trigger (first token
+enters) + the script it fires (see FR-5).
+
+**Engine executes:** the zone watches token movement (the trap/zone
+trigger system) and fires the linked script once, on entry.
+
+**Acceptance:** a zone defined in one message; fires exactly once on
+first entry; the creator can arm/disarm it.
+
+**Status:** trap & zone triggers built (step on it and it fires live).
+The zone→cutscene-script link is not yet built.
+
+### FR-5 — Cutscene scripting + playback (the ambush)
+
+**Creator says:** "Nine soldiers rush in the door and surround them
+around the perimeter of the walls and point spears towards the center,
+and then a mage enters and starts casting a spell that lights up the
+room in the center and it glows brightly."
+
+**Muse authors:** one cutscene script (JSON) — the decisions: 9 soldier
+tokens, perimeter positions, spears pointed at the center, mage enters
+last, light blooms in the center. Muse does NOT enumerate the 9
+positions one by one in tokens; it writes the intent ("ring of 9 around
+center, radius R") and code expands it.
+
+**Engine executes:** the timeline — door opens, soldiers glide in one
+by one (or in waves), take perimeter positions, face the center, spear
+props appear in their hands / pointed inward, mage glides in, casting
+effect, the center light blooms (timed intensity/color transition),
+narration in chat. All on the code side, paced, no round-trip per step.
+
+**Acceptance:** the ambush plays in under 30 seconds from the creator's
+sentence; tokens animate smoothly; the table watches a scene, not a
+build.
+
+**Status:** built offline Nov 20, unit-tested, live test pending.
+`src/session/cutscene.ts` (versioned script schema, strict validation —
+every error listed, never a silent skip; formation expansion;
+`playCutscene` via the sequence runner) + `src/session/formations.ts`
+(ring/line/wedge + facing angles) + `src/session/lights.ts` (timed
+light transitions) + `src/cli/cutscene.ts` (`--file`, `--validate-only`
+needs no connection) + `examples/ambush.json` (the ambush: 9 soldiers,
+spears, mage, light bloom — validates and expands to 51 steps) +
+`tests/cutscene.test.ts` (22 checks). The sequence runner gained
+`face`, `light`, `prop`, `reveal`, `wait` steps. **Still needs live
+testing:** play the ambush against TestBed (Soldier/Mage actors must
+exist; spear tile uploaded); verify the token-rotation convention
+(0 = north, clockwise), the dot-notation light updates, and the
+light-bloom timing.
+
+### FR-6 — Props as first-class objects
+
+**Creator says:** "Put spears in their hands", "a brazier in the
+corner", "rubble everywhere".
+
+**Muse authors:** prop placements (what, where roughly).
+
+**Engine executes:** props are tiles/tokens placed, movable, removable
+— the dressing layer generalized. Spears in the ambush are props, not
+part of the soldier tokens.
+
+**Acceptance:** a prop placed, moved, or removed in one short message;
+props persist with the room spec (so a re-skin keeps them, or swaps
+them per theme).
+
+**Status:** partially built — dressing tiles exist (bones, chest, altar,
+pillar, rubble, spear) and sit on their own layer, and prop *placement
+by the cutscene engine* is built (`prop` step + formation props, Nov 20).
+Prop persistence in the room spec is not built.
+
+### FR-7 — Lighting as a language
+
+**Creator says:** "Light up the room in the center and make it glow
+brightly."
+
+**Muse authors:** a light change (which light, to what, over how long).
+
+**Engine executes:** named lights with timed intensity/color
+transitions — a bloom is a fade over seconds, not an instant swap. The
+mage's casting light is a light animation, not a new static light.
+
+**Acceptance:** a light bloom reads as a spell being cast, not as a
+light switch; the creator can name a light ("the center light") and
+change it in one message.
+
+**Status:** not built. Lights today are static (dim/bright/color set at
+build). Needs timed light transitions + named lights in the room spec.
+
+### FR-8 — Undo / tweak
+
+**Creator says:** "A bit wider", "move that door left", "darker",
+"actually undo that room".
+
+**Muse authors:** a spec diff (one field changed) or an undo.
+
+**Engine executes:** rebuild the affected room from the edited spec
+(fast — tiles are data, no new images), or restore the previous spec.
+
+**Acceptance:** any build action reversible in one message; a tweak
+lands in seconds.
+
+**Status:** not built. Needs an edit history (spec versions) + a
+rebuild-from-spec path (the composer already rebuilds; the history and
+the chat → diff parsing are missing).
+
+### FR-9 — Pacing / director mode (v2)
+
+**Creator says:** nothing — the system paces itself.
+
+**Idea:** cutscenes pause for the table's reaction (wait for a player
+message or a beat) instead of running wall-to-wall; the director
+(monitor) notices when the table is engaged and holds the next beat.
+Explicitly v2 — FR-5 first, pacing after the table has felt a few
+cutscenes.
+
+**Status:** not scoped beyond this paragraph.
+
+### FR-10 — The speed budget (governs all of the above)
+
+Every feature carries a latency budget: Muse's script is seconds of
+tokens; code execution is seconds. Measure it: time from the creator's
+message to the change visible on the table. If a feature needs Muse to
+enumerate placements one by one, the feature is shaped wrong — push the
+enumeration into code. This is the same principle as the monitor (code
+watches, Muse only wakes when needed) and the sequence runner (code
+plays, no round-trip per step).
+
+### FR-11 — Rapid custom encounter generation (story-aware NPCs)
+
+**Creator says:** "Set up a custom encounter — a patrol of the lich's
+honor guard, ambushing the party in the hallway. Give them backstories,
+interesting gear, spells that fit who they are."
+
+**The human cost this replaces:** building that by hand is hours — stat
+blocks, gear and spell selection that actually fits the fiction,
+backstories that tie each NPC to the plot, tokens placed with the right
+look and positions. The system should do it in seconds to a minute.
+
+**Muse authors:** a compact encounter spec — who they are (names,
+roles, one-line backstories tied to the storyline), what makes each one
+distinct (one signature item or spell each), and the formation. Muse
+does NOT write out full stat blocks or item lists in tokens; it writes
+the creative calls.
+
+**Engine executes:** from the spec + the story context (the campaign's
+running record — session recaps, journal entries, the dungeon theme,
+the current scene), code expands each NPC into a full actor: stats
+scaled to the party's level from templates, gear and spells picked from
+the library filtered by role and theme (a lich's honor guard gets
+necrotic-touched gear and death-flavored spells, not random loot),
+backstory text attached to the actor, tokens created and placed in
+formation with the right look. The story context is what makes the gear
+and backstories *specific* instead of generic — the generator reads the
+recaps and journals first.
+
+**Acceptance:** a 4–6 NPC custom encounter, backstoried and equipped to
+the storyline, on the table in under a minute from the creator's
+sentence; every NPC has a reason to be there that a player could
+discover by asking.
+
+**Two rules that make it feel real (Brandon, Nov 19):**
+
+- **Every character is fleshed out, even the mooks.** Not just the
+  boss — every enemy gets a backstory, a personality hook, and gear
+  that fits a living person. A guard isn't "a dagger and a rapier and
+  nothing else" — a living person carries the stuff that keeps them
+  alive: rations, a waterskin, a bedroll, rope, torches, a whetstone, a
+  letter from home. The **living kit** is part of every NPC's gear, and
+  it is how the players learn who this person was after the fight.
+- **Unique loot, not generic loot.** When you kill a creature you get
+  something interesting and specific — a signature item with a story
+  (the guard captain's notched blade with the oath etched in it, the
+  mage's cracked focus that still hums), not a generic dagger. The loot
+  IS characterization: what a creature carried tells you who they were.
+  Every NPC gets one unique signature item that drops on death, and the
+  generator must never emit the same generic weapon list twice.
+
+**Status:** not built. The encounter builder (P1) places monsters and
+starts combat, but it uses existing actors. This is the *custom* half:
+story-aware NPC generation (templates + level scaling + gear/spell
+selection + backstories from the story context) and token setup from the
+generated actors. Depends on the recap/journal record being the story
+context (FR: recaps are built; the generator reads them).
+
+### FR-12 — Mutable maps + procedural layout generation
+
+**Creator says:** "Along this wall, let's make a corridor that goes
+north for like 100 meters and then turn it into a small maze."
+
+**The point:** maps are data, so they should be *mutable*. The creator
+never redraws anything — they describe a change and the map changes.
+A corridor is a layout operation on the room spec; a maze is a small
+script run locally that generates a layout, which the composer turns
+into tiles.
+
+**Muse authors:** a layout operation — "corridor, north, from this
+wall, length 100m" — then "maze region, seeded, at the end of it".
+Units are the creator's (meters, feet, squares — code converts; in
+PF2e a square is 5 ft ≈ 1.5 m, so 100 m is about 66 squares).
+
+**Engine executes:** a maze generator (recursive backtracker or Prim's,
+seeded so the same seed gives the same maze) produces a tile layout;
+the composer rebuilds the affected rooms from the edited spec — no new
+images, tiles only. The whole change lands in about 30 seconds.
+
+**Acceptance:** corridor + maze on the table ~30 seconds after the
+message; the maze is a real maze (connected, one solution path, dead
+ends), the corridor links to the existing room's door, and the creator
+can say "different maze" to re-roll the seed.
+
+**Status:** built offline Nov 20 — [~], live test pending.
+`src/worldbuilding/maze.ts` (seeded recursive backtracker, `toSquares`,
+ASCII + analysis helpers) + layout ops in `tiles-layout.ts`
+(`addCorridor`, `linkRooms`, `carveMazeRegion`, `widenRoom`) and the
+composer wiring (maze wall tiles, merged collision walls, `openings` for
+corridor ends). The composer rebuilds rooms from specs (the mechanism
+exists) and the ops are pure, non-mutating edits on the spec. CLI:
+`bun run maze --cells 10x8 [--seed 7] [--ascii]`. Tests:
+`tests/maze.test.ts`, 35 checks. Live test next session: corridor +
+maze on the table, walk-through, re-roll the seed.
+
+### FR-13 — Iterative refinement: hash on it (regional overlays + scripted tile swaps)
+
+**Creator says:** "No — let's actually make this part of the maze
+partially underwater." Then: "There's going to be a trap door here.
+When the players step on this, I want you to swap this tile for that
+tile."
+
+**The point:** the build is a conversation, not a single order. Brandon
+hashes on it with Muse — each turn is a small edit, fast, and Muse
+drives the change from the request. Two new mechanics make that work:
+
+- **Regional theme overlays.** A theme isn't whole-map-or-nothing: a
+  *region* of the maze goes underwater. The engine adds water tiles on
+  top, or swaps tiles for wet variations (floor-plain → floor-wet) in
+  that region only. The rest of the map is untouched. Same mechanism as
+  the re-skin (FR-2), scoped to a region.
+- **Scripted tile swaps.** A trigger (step on this tile) → swap this
+  tile for that tile — the trap door opens, the floor becomes a pit, the
+  wall becomes a passage. Scripted so the code does it: the swap is a
+  step in a cutscene/trigger script (FR-4 + FR-5), not a manual edit in
+  the moment.
+
+**Muse authors:** the overlay ("water, this region") and the swap
+script ("on step, tile A → tile B").
+
+**Engine executes:** region-scoped tile swaps at build time (overlay)
+and at trigger time (scripted swap, executed by the timeline player).
+
+**Acceptance:** "make it underwater" lands in seconds on that region
+only; the trap-door swap fires exactly when stepped on and the table
+sees the tile change live.
+
+**Status:** both halves built offline Nov 20 — [~], live test pending.
+The `swapTile` step is built: schema + validation (exactly one of tile
+_id / cell, non-empty target) + timeline-player execution (updates
+`texture.src` in place, retry-safe by nature) + unit tests
+(`tests/cutscene.test.ts`, `tile-ops.ts`). The overlay half is built
+too: `applyOverlay` in `tiles-layout.ts` (pure spec edit; the composer
+remaps floor tiles inside the region only, later overlays win) +
+`tests/maze.test.ts` (region-only, 1:1 variants, later-wins). The
+variant set today is the existing floor tiles (plain -> dark reads as
+waterlogged); real wet-variant tiles (floor-wet) are a later pack
+addition. Note: a cell address only resolves when the connection's tile
+cache carries tiles — the vendored client does not track Tile documents,
+so the _id path is the reliable one (buildTileRoom returns the tile ids).
+
+### FR-14 — Value-budgeted treasure with stories (not generic loot)
+
+**Creator says:** "I want this amount of value of treasure" — a number,
+say 500 gp worth — "and make it interesting."
+
+**Muse authors:** the budget and the theme; the rest is generation.
+
+**Engine executes:** from the value budget, the generator assembles a
+hoard that actually totals (approximately) the requested value — a
+budget-fitting selection from a valued item pool, not a random table
+roll. Every item is distinct and comes with a story and details:
+provenance, a previous owner, a quirk, a reason it exists. Signature
+items get unique magic abilities (homebrew, labeled as homebrew — never
+presented as rulebook items) and custom artwork (generated per
+signature item, offline/async — artwork never blocks the treasure
+drop). The result is a hoard a player would remember, not "3 daggers
+and 47 gp".
+
+**Acceptance:** the hoard's total value lands within ~10% of the
+requested budget; every item has a story line; no two items in one
+hoard are the same generic weapon; signature items have a named magic
+ability and art.
+
+**Status:** [~] built + unit-tested offline Nov 20 — `src/session/treasure.ts` + `src/cli/treasure.ts` + `tests/treasure.test.ts` (17 checks). Budget fitting lands exactly on target; stories unique per hoard; 1–2 signature items with named homebrew abilities and the `art`/`artPrompt` hook. Live test pending: no live layer yet — filling a chest from a hoard and the art-generator step are follow-ups. The loot pipeline (P2) does level-banded tables of real PF2e item names + coins, but it is not value-budgeted, has no stories, no magic abilities, and no artwork. This is the treasure half of FR-11's unique-loot rule, generalized to whole hoards.
+
+## What exists vs what is next
+
+| Piece | Status |
+|---|---|
+| Sequence runner (JSON steps, code-side, paced) | Built |
+| Tile composer + dungeon graph (rooms + door links) | Built, unit-tested |
+| 19-tile pack (0 gaps, incl. spear prop) | Built |
+| Trap & zone triggers | Built |
+| Chat-driven iterative building loop | Not wired |
+| Theme packs + re-skin | Not built |
+| Multi-floor + gated reveal | Not built |
+| Zone → cutscene link | Not built |
+| Cutscene script schema + timeline player | Built, unit-tested (Nov 20) |
+| Formation helpers (ring, line, wedge) | Built, unit-tested (Nov 20) |
+| Timed light transitions + named lights | Transitions built (light step); named lights still use id/proximity |
+| Scripted tile swaps (FR-13 swapTile) | Built, unit-tested (Nov 20) |
+| Edit history / undo | Not built |
+| Props in the room spec | Not built |
+
+## Build order
+
+1. **Cutscene script + player** (FR-5 core: schema, timeline player,
+   `face`/`light`/`prop`/`reveal` steps, formation helpers) — it is the
+   engine everything else plays through.
+2. **Chat-driven building loop** (FR-1 wiring: monitor → composer) +
+   **undo** (FR-8) — the iterative loop, since it is the daily use.
+3. **Rapid custom encounter generation** (FR-11) — story-aware NPCs
+   with backstories, gear, and spells from the story context. High
+   creator value; builds on the encounter builder and the formation
+   helpers.
+4. **Value-budgeted treasure** (FR-14) — hoards that hit a requested
+   value with storied, unique, magical items + art. The treasure half
+   of FR-11.
+5. **Mutable maps: layout ops + maze generator** (FR-12) — corridor
+   carving, maze regions, seed re-rolls. The map itself becomes as
+   editable as the rooms.
+6. **Iterative refinement: regional overlays + scripted tile swaps**
+   (FR-13) — water (or any theme) on a region, trap-door tile swaps
+   fired by triggers. The hash-on-it loop.
+7. **Theme packs + re-skin** (FR-2) — one new themed pack (gothic)
+   proves the swap.
+8. **Trigger zones → cutscene** (FR-4 link) + **multi-floor reveal**
+   (FR-3) — the reveal mechanics.
+9. **Lighting as a language** (FR-7) — timed transitions, named lights.
+10. **Director mode** (FR-9) — v2, after the table has felt cutscenes.
+
+## How the system gets better (Brandon, Nov 19)
+
+Two rules, every session:
+
+1. **Reflect on the toolbox you have.** After each session, look at
+   what was asked and what the toolbox could do today — what worked,
+   what was missing, what was slow. The reflection is the work: it is
+   how the next session gets better than this one.
+2. **No tool is never a stop.** If a request has no tool in the
+   toolbox, that doesn't stop anything — build the tool. If Brandon
+   wants a one-off maze, write a little maze generator for it. If it
+   turns out reusable, it joins the toolbox permanently ("add it to the
+   toolbox, baby"). The toolbox grows by doing the work, not by
+   planning it.
+
+This is already how the project has gone tonight: the maze generator
+started as a one-off answer to "a corridor and a small maze" and is now
+a tool in the composer. The backlog is the toolbox's inventory — when a
+one-off becomes a tool, it gets a line there.
+
+**That is how MuseGM develops: trial and error and constant
+improvement.** Build it, try it live at the table, see what breaks or
+what's slow, fix it, build the next thing. The live session is the test
+— the walkthrough demo each session is where the trial happens.

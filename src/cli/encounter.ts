@@ -2,8 +2,10 @@
  * encounter CLI — build (or clean up) a combat encounter live.
  *
  * Build:
- *   bun run src/cli/encounter.ts --monsters "Kobold Warrior x2, Kobold Scout" [--scene <id>] [--origin 900,700]
+ *   bun run src/cli/encounter.ts --monsters "Kobold Warrior x2, Kobold Scout" [--scene <id>] [--origin 900,700] [--encounter-key <key>]
  *   -> {"sceneId","sceneName","combatId","tokens":[{tokenId,combatantId,actorId,name,x,y,hp,hpMax,initiative,initiativeMod}],"order":[...]}
+ *   With --encounter-key, a re-run resumes the same encounter instead of
+ *   building a second one (same tokens, same combat, same initiative).
  *
  * Clean up a demo encounter (ends combat, deletes its tokens):
  *   bun run src/cli/encounter.ts --cleanup --combat <id> --tokens <id1,id2> --scene <id>
@@ -59,6 +61,7 @@ async function main(): Promise<void> {
     const result = await buildEncounter(live, parseMonsters(spec), {
       sceneId: arg("--scene"),
       origin,
+      encounterKey: arg("--encounter-key"),
     });
     process.stdout.write(JSON.stringify(result) + "\n");
   } finally {

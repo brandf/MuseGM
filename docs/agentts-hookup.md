@@ -458,3 +458,118 @@ per BRA-179, and the trap boundary is JSON-only).
   `~/workspace/foundry-live/package.json` (library API, CLIs, backlog,
   tile design, multi-Muse vision)
 - `~/workspace/agentts-repo/CHANGELOG.md` (grep: r1 Nov 19, r2 in progress)
+
+---
+
+## Decision (Brandon, Nov 19, 21:43) — core stays independent, AgentTS is a phase-two layer
+
+- **MuseGM core has no AgentTS dependency.** The library, CLIs, tile
+  pack, pins module, and monitor all run standalone. Nothing in the core
+  imports AgentTS or assumes its runtime.
+- **Phase two (later): a second layer that combines AgentTS with the
+  core** to make it more powerful (durable between-session jobs, gated
+  room builds, recaps — the Option B shape in this doc). That layer
+  lives **possibly in a different repository** — the repo boundary is
+  still open, but the default is: core in `brandf/MuseGM`, AgentTS layer
+  separate. Do not merge the layer into the core repo without Brandon
+  deciding the boundary.
+- Until phase two starts, no AgentTS work in MuseGM. This doc is the
+  record; the open questions above still stand for phase two.
+
+## Clarification (Brandon, Nov 19, 21:45) — use AgentTS for dev, design the core to fit it
+
+- Using AgentTS **for my own development purposes is fine** (like the
+  other AgentTS dev session) — the constraint is only about the core's
+  *dependency* on AgentTS, not about using it as a tool.
+- **Design the core layer with the AgentTS use case in mind** so the
+  phase-two layer works really well: the core's interfaces should be
+  AgentTS-friendly from the start. Concretely that means:
+  - CLIs stay JSON-in / JSON-out (one JSON object on stdout, already
+    the pattern) with small, bounded output (exec has a 16 MB stdout
+    cap) and fast, synchronous completion (exec is blocking).
+  - Operations are **idempotent / retry-safe** — a crash mid-dispatch
+    re-runs the command, so a re-run must not double-apply. Flagged:
+    `send` is not idempotent today and could double-post a chat message;
+    fix that in the core first.
+  - No hidden state: resolve everything against current world state at
+    call time (already the library's pattern), so a re-run sees the
+    truth, not a stale cache.
+  - Long-running loops (the monitor) stay outside AgentTS permanently —
+    the 50-suspension drive cap and tick-agent latency rule them out;
+    only bounded jobs cross the boundary.
+
+---
+
+## AgentTS-friendly core — audit + fixes (Nov 19, offline)
+
+Core-side work to make the phase-two layer easy. No AgentTS dependency,
+import, or reference anywhere in the core — every fix is a plain core
+improvement that happens to be retry-safe / JSON-clean. Dave's Foundry
+was off, so all of this is code + unit tests only; the live checks are
+listed at the end and still need a live session.
+
+### How retry-safety is done here
+
+One mechanism, reused everywhere: a client-generated key carried in the
+document's `flags["foundry-live"]` (see `src/idempotency.ts`). A keyed
+re-run reads current world state first and reuses what it finds instead
+of creating again. Seeded rolls (`seed` option on `rollDice`, seeded by
+key) reproduce the same result on a re-run. Compare-and-set guards
+(`--expect-turn`, `--expect-hp`) refuse to double-apply a combat change.
+
+Honest limits (documented in `src/idempotency.ts` too):
+- Check-then-create is **not atomic**: two processes running the same
+  keyed command at the same instant can both pass the check and both
+  create. The single orchestrator in phase two makes this a non-issue
+  in practice; it is not a guarantee against concurrent duplicates.
+- The chat dedupe scan covers the last 50 messages only; a key re-used
+  after 50+ intervening messages will post again. Keys must be unique
+  per logical operation (e.g. `demo-1:announce`, not `announce`).
+- Flags on created documents round-trip through Foundry — this needs
+  one live confirmation (see "Still needs live testing").
+
+### Audit table (operation | retry-safe? | fix | status)
+
+| Operation | Retry-safe? | Fix | Status |
+|---|---|---|---|
+| `send` (chat post) | **No** — double-posts on re-dispatch | `--dedupe-key`; `sendChatIdempotent` checks an in-process sent-keys map, then scans the last 50 messages for the key (author-scoped); attaches `flags["foundry-live"].dedupeKey` | Fixed, unit-tested |
+| Local rolls (`rollDice`, dice CLI) | **No** — re-run rolls a different result | `seed` option (FNV-1a → mulberry32); dice CLI `--dedupe-key` seeds the roll by key and dedupes the chat post | Fixed, unit-tested |
+| `buildEncounter` | **No** — blind creates duplicate tokens/combat/initiative | `--encounter-key`: reuses keyed tokens, keyed combat + combatants, keeps existing initiative, seeds new initiative rolls by token id, dedupes the announce | Fixed, needs live test |
+| `clearEncounter` | **No** — bulk delete of already-deleted ids could throw | Per-token tolerant `deleteToken` (missing token = success) | Fixed, needs live test |
+| `placeToken` | **No** — blind create duplicates the token | `opts.key`: flag + reuse existing token; `findTokenByPlaceKey` | Fixed, needs live test |
+| `deleteToken` | **No** — delete of a missing token threw | Missing token = success | Fixed, needs live test |
+| `advanceTurn` | **No** — re-run advances a second time | `--expect-turn <n>`: returns `advanced: false` without advancing on CAS miss | Fixed, needs live test |
+| `damage` / `heal` | **No** — read-modify-write double-applies | `--expect-hp <n>`: returns `skipped: true` on CAS miss | Fixed, needs live test |
+| `applyCondition` / sequence `effect` | **No** — duplicate effects | Returns the existing effect instead of duplicating | Fixed, needs live test |
+| `runSequence` | **No** — re-run re-executes every step | `--run-key`: per-step derived keys (`<runKey>:<kind>:<index>`) for place/chat/roll/damage/heal/effect | Fixed, needs live test |
+| `createSceneFromImage` / `buildRoom` | **No** — blind create duplicates the scene (and walls/lights/chest) | `--build-key` (scene CLI) / `buildKey` (buildRoom): flag on the scene, re-run returns the existing scene with `duplicate: true` | Fixed, needs live test |
+| `addChest` | **No** — blind create duplicates actor + token | `key` (chest CLI `--key`): flag on the loot actor, re-run returns the existing actor/token/item ids | Fixed, needs live test |
+| Autopilot `.autopilot-state.json` | **Mostly** — `downAnnounced` was persisted local state | `downAnnounced` no longer persisted; derived from the world's `defeated` flag instead (file is a cache, world is truth) | Fixed, needs live test |
+| `buildTileRoom` / `rebuildTileRoom` | **No** (same blind-create pattern) | **Not fixed here** — a wave-2 builder is actively editing `src/worldbuilding/tiles.ts`; same key treatment is a follow-up | Open |
+| `uploadImage` | Assumed safe — re-upload overwrites the same path | None (no code change) | Needs live confirmation |
+| `traps.ts` fired-set | **No** — in-memory only; a restart re-fires | None — monitor-hosted, out of exec scope; note only | Open (monitor) |
+| `wait`, `combat watch`, `trap --zones`, monitor | **N/A** — long-running loops, not exec-shaped (120s worker timeout) | None — stay outside AgentTS permanently, per the clarification | By design |
+| All CLIs (JSON-cleanliness) | **Yes** — every CLI already forces `LOG_LEVEL=error` and prints exactly one JSON object on stdout; outputs are bounded (`wait` caps at 50 messages, `status` at 5) | None needed | Verified by audit |
+
+### Still needs live testing (Dave's Foundry on)
+
+- Flags round-trip: `flags` on created docs (chat, token, combat,
+  scene, actor) survive a create and are readable back.
+- Dedupe end-to-end: `send --dedupe-key` twice posts once.
+- Seeded-roll reproduction: same seed, same total, live.
+- Keyed resume: `buildEncounter --encounter-key` / `scene create
+  --build-key` / `chest --key` re-run returns the same ids, no dupes.
+- Tolerant deletes: `clearEncounter` re-run succeeds.
+- CAS paths: `next --expect-turn` / `damage --expect-hp` refuse the
+  second apply.
+- `uploadImage` re-upload overwrites cleanly.
+- `buildTileRoom` key treatment (follow-up, after the wave-2 builder
+  lands).
+
+### Tests
+
+`tests/idempotency.test.ts` (21 checks, pure functions): hash
+determinism + range, RNG determinism + stream reproduction, key
+derivation, flag matching (incl. author scoping and other-scope
+rejection), find-by-key. Suite after this work: `bun run typecheck`
+clean, `bun test tests/` **195 pass / 0 fail** (11 files).

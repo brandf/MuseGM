@@ -266,13 +266,21 @@ export async function listPlayerCharacters(
  * visible-roll helper (see the module header: /tmp/post-roll.mjs was lost).
  * This is what the monitor calls after rolling: the message IS the roll
  * the table sees, since the local roller has no native roll card.
+ *
+ * With `opts.dedupeKey`, the post is retry-safe (sendChatIdempotent):
+ * a re-run returns the already-posted message instead of posting the
+ * roll twice. Pair it with the same key as the roll's `seed` and the
+ * whole "roll and post" is reproducible end to end.
  */
 export async function postVisibleRoll(
   live: FoundryLive,
   result: DiceRollResult,
-  opts: { flavor?: string; actorName?: string } = {},
+  opts: { flavor?: string; actorName?: string; dedupeKey?: string } = {},
 ): Promise<string> {
   const text = formatRollResult(result, opts);
+  if (opts.dedupeKey) {
+    return (await live.sendChatIdempotent(text, { dedupeKey: opts.dedupeKey })).id;
+  }
   return live.sendChat(text);
 }
 
@@ -281,71 +289,107 @@ export async function postVisibleRoll(
  * message _id, or null when the message isn't a roll request. A bad formula
  * is reported in chat (the roller's own error) and returns null — the
  * requester sees what went wrong instead of silence.
+ *
+ * With `opts.dedupeKey`, the roll is seeded by the key (same key = same
+ * roll) and the post is deduped by it, so a crash re-dispatch reproduces
+ * the original roll instead of rolling — and posting — a second one.
  */
 export async function rollForChat(
   live: FoundryLive,
   text: string,
+  opts: { dedupeKey?: string } = {},
 ): Promise<string | null> {
   const req = parseRollRequest(text);
   if (!req) return null;
   if (req.group) {
-    const { messageId } = await groupCheck(live, req.formula, { flavor: req.flavor });
+    const { messageId } = await groupCheck(live, req.formula, {
+      flavor: req.flavor,
+      dedupeKey: opts.dedupeKey,
+    });
     return messageId;
   }
   if (req.secret) {
     const { publicMessageId } = await secretRoll(live, req.formula, {
       flavor: req.flavor,
       actorName: req.actorName,
+      dedupeKey: opts.dedupeKey,
     });
     return publicMessageId;
   }
   let result: DiceRollResult;
   try {
-    result = await live.rollDice(req.formula, { flavor: req.flavor });
+    result = await live.rollDice(req.formula, {
+      flavor: req.flavor,
+      seed: opts.dedupeKey,
+    });
   } catch (err) {
     await live.sendChat(`🎲 Couldn't roll \`${req.formula}\`: ${err instanceof Error ? err.message : String(err)}`);
     return null;
   }
-  return postVisibleRoll(live, result, { flavor: req.flavor, actorName: req.actorName });
+  return postVisibleRoll(live, result, {
+    flavor: req.flavor,
+    actorName: req.actorName,
+    dedupeKey: opts.dedupeKey,
+  });
 }
 
 /**
  * A secret GM roll: the result is whispered to the GM only. Chat gets a
  * single "rolls behind the screen" line with no result, so the requester
- * knows the roll happened.
+ * knows the roll happened. With `opts.dedupeKey`, the roll is seeded by
+ * the key and both posts are deduped (`<key>:gm`, `<key>:public`).
  */
 export async function secretRoll(
   live: FoundryLive,
   formula: string,
-  opts: { flavor?: string; actorName?: string } = {},
+  opts: { flavor?: string; actorName?: string; dedupeKey?: string } = {},
 ): Promise<{ gmMessageId: string; publicMessageId: string; total: number }> {
   const gmId = resolveGamemasterId(live);
-  const result = await live.rollDice(formula, { flavor: opts.flavor });
+  const result = await live.rollDice(formula, {
+    flavor: opts.flavor,
+    seed: opts.dedupeKey,
+  });
   const text = `🤫 ${formatRollResult(result, opts)} (secret — GM only)`;
-  const gmMessageId = await live.sendChat(text, { whisperTo: [gmId] });
-  const publicMessageId = await live.sendChat(
-    `🤫 Meroki rolls behind the screen${opts.flavor ? ` (${opts.flavor})` : ""}…`,
-  );
+  const gmMessageId = opts.dedupeKey
+    ? (await live.sendChatIdempotent(text, { whisperTo: [gmId], dedupeKey: `${opts.dedupeKey}:gm` })).id
+    : await live.sendChat(text, { whisperTo: [gmId] });
+  const publicMessageId = opts.dedupeKey
+    ? (await live.sendChatIdempotent(
+        `🤫 Meroki rolls behind the screen${opts.flavor ? ` (${opts.flavor})` : ""}…`,
+        { dedupeKey: `${opts.dedupeKey}:public` },
+      )).id
+    : await live.sendChat(
+        `🤫 Meroki rolls behind the screen${opts.flavor ? ` (${opts.flavor})` : ""}…`,
+      );
   return { gmMessageId, publicMessageId, total: result.total };
 }
 
 /**
  * A group check: roll the same formula once per player character (each PC
  * gets their own random result) and post a summary, best first.
+ * With `opts.dedupeKey`, each PC's roll is seeded `<key>:<pc id>` (same
+ * key = same per-PC results) and the summary post is deduped by the key.
  */
 export async function groupCheck(
   live: FoundryLive,
   formula: string,
-  opts: { flavor?: string; actorIds?: string[] } = {},
+  opts: { flavor?: string; actorIds?: string[]; dedupeKey?: string } = {},
 ): Promise<{ messageId: string; entries: GroupCheckEntry[] }> {
   const pcs = opts.actorIds
     ? opts.actorIds.map((id) => ({ id, name: id }))
     : await listPlayerCharacters(live);
   const entries: GroupCheckEntry[] = [];
   for (const pc of pcs) {
-    const result = await live.rollDice(formula, { flavor: opts.flavor });
+    const result = await live.rollDice(formula, {
+      flavor: opts.flavor,
+      seed: opts.dedupeKey ? `${opts.dedupeKey}:${pc.id}` : undefined,
+    });
     entries.push({ name: pc.name, total: result.total, breakdown: result.breakdown });
   }
-  const messageId = await live.sendChat(formatGroupCheckResult(entries, opts.flavor));
+  const messageId = opts.dedupeKey
+    ? (await live.sendChatIdempotent(formatGroupCheckResult(entries, opts.flavor), {
+        dedupeKey: opts.dedupeKey,
+      })).id
+    : await live.sendChat(formatGroupCheckResult(entries, opts.flavor));
   return { messageId, entries };
 }

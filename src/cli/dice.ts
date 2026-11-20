@@ -16,6 +16,11 @@ export {};
  *       Group check: one roll per player character (or per --actors id),
  *       summary posted to chat.
  *
+ * All live commands accept [--dedupe-key <key>]: the roll is seeded by
+ * the key (same key = same roll) and the chat post is deduped by it, so
+ * a crash re-dispatch reproduces the original roll instead of rolling —
+ * and posting — a second one.
+ *
  * LOG_LEVEL is forced to error before the library import so the vendored
  * client's info logs don't corrupt stdout (see wait.ts).
  */
@@ -54,6 +59,7 @@ async function main(): Promise<void> {
   if (!roll && !group) usage();
 
   const flavor = arg("--flavor");
+  const dedupeKey = arg("--dedupe-key");
   const { FoundryLive } = await import("../live.js");
   const live = await FoundryLive.connect();
   try {
@@ -62,6 +68,7 @@ async function main(): Promise<void> {
       const { messageId, entries } = await groupCheck(live, group, {
         flavor,
         actorIds: actors ? actors.split(",").map((s) => s.trim()).filter(Boolean) : undefined,
+        dedupeKey,
       });
       process.stdout.write(JSON.stringify({ messageId, entries }) + "\n");
       return;
@@ -70,16 +77,17 @@ async function main(): Promise<void> {
       const { gmMessageId, publicMessageId, total } = await secretRoll(live, roll!, {
         flavor,
         actorName: arg("--actor"),
+        dedupeKey,
       });
       process.stdout.write(JSON.stringify({ gmMessageId, publicMessageId, total }) + "\n");
       return;
     }
     // Plain roll, or a full chat request ("roll 1d20+5 for Ezren").
     const messageId = roll!.trim().toLowerCase().startsWith("roll")
-      ? await rollForChat(live, roll!)
+      ? await rollForChat(live, roll!, { dedupeKey })
       : await (async () => {
-          const result = await live.rollDice(roll!, { flavor });
-          return postVisibleRoll(live, result, { flavor, actorName: arg("--actor") });
+          const result = await live.rollDice(roll!, { flavor, seed: dedupeKey });
+          return postVisibleRoll(live, result, { flavor, actorName: arg("--actor"), dedupeKey });
         })();
     process.stdout.write(JSON.stringify({ messageId }) + "\n");
   } finally {

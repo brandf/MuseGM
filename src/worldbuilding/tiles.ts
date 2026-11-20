@@ -23,9 +23,10 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import type { FoundryLive } from "../live.js";
-import type { PackManifest, RoomSpec } from "./tiles-layout.js";
-import { ROOM_BACKGROUND_COLOR, TILE_PX, layoutRoom } from "./tiles-layout.js";
+import type { DungeonLayout, DungeonSpec, PackManifest, ResolvedDoorLink, RoomSpec, WallSide } from "./tiles-layout.js";
+import { ROOM_BACKGROUND_COLOR, TILE_PX, layoutDungeon, layoutRoom } from "./tiles-layout.js";
 import { addLights, addWalls } from "./index.js";
+import { deleteToken, placeToken, resolveToken } from "../session/movement.js";
 import { uploadImage } from "./upload.js";
 
 export * from "./tiles-layout.js";
@@ -167,4 +168,95 @@ export async function uploadTilePack(
     await uploadImage(local, dest);
   }
   return dest;
+}
+
+// ---------------------------------------------------------------- dungeon graph (live)
+
+export interface BuiltDungeonRoom extends BuiltTileRoom {
+  id: string;
+}
+
+export interface BuiltDungeon {
+  rooms: BuiltDungeonRoom[];
+  links: ResolvedDoorLink[];
+}
+
+/**
+ * Build a whole dungeon: one scene per room (via buildTileRoom), plus
+ * the resolved door links. Scenes are NOT activated — the GM activates
+ * the entry room when ready. Pure layout/validation happens first in
+ * layoutDungeon, so a bad graph fails before any scene is created.
+ */
+export async function buildDungeon(
+  live: FoundryLive,
+  spec: DungeonSpec,
+  pack: import("./tiles-layout.js").Pack,
+  serverBase: string,
+): Promise<BuiltDungeon> {
+  const dungeon: DungeonLayout = layoutDungeon(spec, pack, serverBase);
+  const rooms: BuiltDungeonRoom[] = [];
+  for (const room of spec.rooms) {
+    const built = await buildTileRoom(live, room, pack, serverBase);
+    rooms.push({ id: room.id, ...built });
+  }
+  return { rooms, links: dungeon.links };
+}
+
+export interface DoorWalkResult {
+  fromRoom: string;
+  toRoom: string;
+  toSceneId: string;
+  /** Old token _id -> new token _id (tokens are re-created on the new
+   *  scene — Foundry has no cross-scene token move). */
+  tokens: { oldId: string; newId: string; name: string }[];
+}
+
+/**
+ * Walk the party through a door: tokens leave the `fromRoom` scene and
+ * appear in the linked room, just inside the matching door. Tokens are
+ * deleted on the old scene and re-placed on the new one (actorLink, so
+ * HP and conditions live on the actor and survive the move); the new
+ * token _ids are returned because the old ones no longer exist.
+ * Live-verification item: not yet walked on a real table.
+ */
+export async function walkThroughDoor(
+  live: FoundryLive,
+  dungeon: BuiltDungeon,
+  fromRoom: string,
+  wall: WallSide,
+  at: number,
+  tokenIds: string[],
+): Promise<DoorWalkResult> {
+  const key = `${fromRoom}:${wall}:${at}`;
+  let other: ResolvedDoorLink["to"] | null = null;
+  let toRoom = "";
+  for (const link of dungeon.links) {
+    if (`${link.from.room}:${link.from.wall}:${link.from.at}` === key) {
+      other = link.to;
+      toRoom = link.to.room;
+      break;
+    }
+    if (`${link.to.room}:${link.to.wall}:${link.to.at}` === key) {
+      other = link.from;
+      toRoom = link.from.room;
+      break;
+    }
+  }
+  if (!other) {
+    throw new Error(`No door link from ${key} — the door is unlinked or not a door.`);
+  }
+  const fromScene = dungeon.rooms.find((r) => r.id === fromRoom);
+  const toScene = dungeon.rooms.find((r) => r.id === toRoom);
+  if (!fromScene || !toScene) throw new Error(`Dungeon is missing a scene for ${!fromScene ? fromRoom : toRoom}.`);
+  const x = other.enterGx * TILE_PX + TILE_PX / 2;
+  const y = other.enterGy * TILE_PX + TILE_PX / 2;
+  const moved: DoorWalkResult["tokens"] = [];
+  for (const tokenId of tokenIds) {
+    const token = resolveToken(live, fromScene.sceneId, tokenId);
+    if (!token.actorId) throw new Error(`Token ${token.name} has no actor — cannot re-place it in ${toRoom}.`);
+    await deleteToken(live, fromScene.sceneId, token._id);
+    const newId = await placeToken(live, toScene.sceneId, token.actorId, x, y, { name: token.name });
+    moved.push({ oldId: token._id, newId, name: token.name });
+  }
+  return { fromRoom, toRoom, toSceneId: toScene.sceneId, tokens: moved };
 }

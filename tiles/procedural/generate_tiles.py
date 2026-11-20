@@ -5,7 +5,8 @@ Code over AI where code wins: fog wisps, floor tiles, walls, doors and
 most dressing are drawn procedurally — exact, tileable by construction,
 seamless, and consistent by definition, with real alpha. AI images are
 only used where they earn it (organic dressing: full skeleton, chest,
-altar) — those are recorded as gaps in the manifest, never faked.
+altar) — generated on flat magenta, cut out by cutout.py, and copied
+into the pack by build_pack().
 
 Tile unit: 100px = 1 grid square (Foundry grid size 100). Floors and
 walls are 100x100 full squares; dressing is 200x200 (2x2 squares);
@@ -333,6 +334,32 @@ def sconce(seed=61):
     return t
 
 
+def spear(seed=81):
+    """200x200 transparent tile: a spear lying flat, seen from directly
+    above, pointing up (north) — the tile's up is the prop's facing, so
+    a prop rotated by facingDeg points the spear at its target. Steel
+    leaf head, wood shaft, butt cap; dark outline throughout."""
+    t = Image.new("RGBA", (200, 200), (0, 0, 0, 0))
+    d = ImageDraw.Draw(t)
+    cx = 100
+    steel = (176, 184, 196)
+    steel_dark = (110, 118, 132)
+    wood = (107, 90, 72)
+    wood_dark = (70, 58, 44)
+    # shaft: butt cap at the bottom, wood shaft up to the head socket
+    d.line([cx, 188, cx, 48], fill=wood_dark, width=9)
+    d.line([cx, 188, cx, 48], fill=wood, width=5)
+    d.rectangle([cx - 5, 184, cx + 5, 192], fill=steel_dark, outline=CHARCOAL)
+    # socket collar where the head meets the shaft
+    d.rectangle([cx - 7, 44, cx + 7, 54], fill=steel_dark, outline=CHARCOAL)
+    # leaf head: pointed tip at the top, widening to the socket
+    d.polygon([(cx, 6), (cx + 11, 30), (cx + 8, 48), (cx - 8, 48),
+               (cx - 11, 30)],
+              fill=steel, outline=steel_dark)
+    d.line([cx, 10, cx, 44], fill=(220, 228, 240), width=2)
+    return t
+
+
 def ritual_circle(seed=71):
     """200x200 transparent tile: a ritual circle — concentric thin rings,
     radial ticks and small diamond glyphs, bone-white lines. Geometric,
@@ -391,22 +418,26 @@ PACK = [
      ["dressing", "torch", "sconce"]),
     ("ritual-circle", ritual_circle, 200, "dressing",
      ["dressing", "ritual", "lich"]),
+    ("spear", spear, 200, "dressing",
+     ["dressing", "prop", "spear", "weapon"]),
 ]
 
-# Pieces that genuinely need AI art. Recorded as gaps, never faked.
-GAPS = [
-    {"name": "skeleton",
-     "reason": "A full articulated skeleton lying down needs AI art — "
-               "procedural bones read as a pile, not a body.",
-     "needs": "ai-image"},
-    {"name": "chest",
-     "reason": "A wooden chest from above needs AI art. The openable "
-               "chest token already uses Foundry's built-in chest icon.",
-     "needs": "ai-image"},
-    {"name": "altar",
-     "reason": "A ritual altar from above needs AI art.",
-     "needs": "ai-image"},
+# Pieces that genuinely need AI art. The three gaps (skeleton, chest,
+# altar) were closed Nov 20: art generated on flat magenta, cut out to
+# transparent PNGs by cutout.py (chroma-key + soft edge), canonical cut
+# files in tiles/ai-source/<name>.png. build_pack() copies them into
+# the pack and lists them in the manifest; nothing is faked.
+AI_TILES = [
+    ("skeleton", "ai-source/skeleton.png", 200, "dressing",
+     ["dressing", "skeleton", "bones"]),
+    ("chest", "ai-source/chest.png", 200, "dressing",
+     ["dressing", "chest", "treasure"]),
+    ("altar", "ai-source/altar.png", 200, "dressing",
+     ["dressing", "altar", "ritual", "lich"]),
 ]
+
+# No open gaps left. (Earlier gaps — skeleton, chest, altar — are now AI_TILES.)
+GAPS: list = []
 
 
 def build_pack():
@@ -424,6 +455,23 @@ def build_pack():
             "tags": tags,
         })
         print(f"wrote pack/{fname} ({size}x{size}, {layer})")
+    # AI tiles: pre-cut transparent PNGs (cutout.py) copied in as-is.
+    import shutil
+    for name, src, size, layer, tags in AI_TILES:
+        src_path = os.path.join(TILES_DIR, src)
+        if not os.path.exists(src_path):
+            raise FileNotFoundError(
+                f"AI tile {name} missing: {src_path} — run cutout.py on the "
+                f"generated raw first (see tiles/ai-source/).")
+        shutil.copyfile(src_path, os.path.join(PACK_DIR, f"{name}.png"))
+        entries.append({
+            "name": name,
+            "file": f"pack/{name}.png",
+            "sizePx": size,
+            "layer": layer,
+            "tags": tags,
+        })
+        print(f"copied pack/{name}.png ({size}x{size}, {layer}, AI art)")
     manifest = {
         "version": 1,
         "tilePx": 100,
@@ -443,6 +491,9 @@ def preview():
     as a room; regenerate with `python3 generate_tiles.py --preview`."""
     from PIL import Image as _Image  # local alias to keep the top tidy
     pack = {name: fn() for name, fn, _, _, _ in PACK}
+    # AI tiles are pre-cut files, not builders — load them from the pack dir.
+    for name, src, _, _, _ in AI_TILES:
+        pack[name] = _Image.open(os.path.join(TILES_DIR, "pack", f"{name}.png"))
     W = H = 600
     room = _Image.new("RGBA", (W, H), (5, 5, 8, 255))
     random.seed(3)
@@ -469,9 +520,12 @@ def preview():
                            (corner, 180, 500, 500), (corner, 270, 0, 500)]:
         room.alpha_composite(rot(img, deg), (x, y))
     room.alpha_composite(pack["bones"], (200, 200))
-    room.alpha_composite(pack["rubble"], (400, 100))
-    room.alpha_composite(pack["pillar"], (100, 300))
+    room.alpha_composite(pack["rubble"], (200, 0))
+    room.alpha_composite(pack["pillar"], (0, 200))
     room.alpha_composite(pack["ritual-circle"], (300, 300))
+    room.alpha_composite(pack["skeleton"], (400, 0))
+    room.alpha_composite(pack["chest"], (0, 400))
+    room.alpha_composite(pack["altar"], (400, 400))
     room.alpha_composite(pack["fog-wisp-large"], (100, 100))
     out = os.path.join(TILES_DIR, "pack-preview.png")
     room.save(out)

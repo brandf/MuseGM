@@ -47,21 +47,40 @@ async function main(): Promise<void> {
         break;
       }
       case "next": {
-        out = await pilot.advanceTurn();
+        const expectTurn = arg("--expect-turn");
+        out = await pilot.advanceTurn(
+          expectTurn !== undefined ? { expectTurn: Number(expectTurn) } : {},
+        );
         break;
       }
       case "damage": {
         const actorId = arg("--actor");
         const amount = Number(arg("--amount") ?? "0");
         if (!actorId) throw new Error("damage needs --actor <id> --amount <n>");
-        out = { ...(await pilot.damage(actorId, amount)), actor: actorId };
+        const expectHp = arg("--expect-hp");
+        out = {
+          ...(await pilot.damage(
+            actorId,
+            amount,
+            expectHp !== undefined ? { expectHp: Number(expectHp) } : {},
+          )),
+          actor: actorId,
+        };
         break;
       }
       case "heal": {
         const actorId = arg("--actor");
         const amount = Number(arg("--amount") ?? "0");
         if (!actorId) throw new Error("heal needs --actor <id> --amount <n>");
-        out = { ...(await pilot.heal(actorId, amount)), actor: actorId };
+        const expectHp = arg("--expect-hp");
+        out = {
+          ...(await pilot.heal(
+            actorId,
+            amount,
+            expectHp !== undefined ? { expectHp: Number(expectHp) } : {},
+          )),
+          actor: actorId,
+        };
         break;
       }
       case "condition": {

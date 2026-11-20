@@ -13,6 +13,24 @@ export { moveTokenTo, placeToken, deleteToken, resolveScene, resolveToken, getSc
 export type { SceneToken, MoveResult, TokenRef } from "./session/movement.js";
 export { runSequence } from "./session/sequence.js";
 export type { SequenceStep, StepResult, SequenceResult, RunSequenceOptions } from "./session/sequence.js";
+export { buildEncounter, clearEncounter } from "./session/encounter.js";
+export type { EncounterOptions, PlacedToken, EncounterResult } from "./session/encounter.js";
+export { createSceneFromImage, buildRoom, addChest, findSceneByBuildKey } from "./worldbuilding/index.js";
+export type { SceneSpec, ChestSpec, BuiltChest } from "./worldbuilding/index.js";
+export {
+  FLAG_SCOPE,
+  FLAG_FIELDS,
+  hashStringToSeed,
+  rngFromSeed,
+  dedupeKeyFor,
+  flagValue,
+  docHasFlag,
+  findDocByFlag,
+  messageHasDedupeKey,
+  findMessageByDedupeKey,
+} from "./idempotency.js";
+export type { FlaggedDoc, DedupeMessage } from "./idempotency.js";
+export { buildTileRoom, rebuildTileRoom } from "./worldbuilding/tiles.js";
 export type {
   ChatMessage,
   DiceRollResult,

@@ -58,6 +58,13 @@ export interface SendChatOptions {
   style?: number;
   /** Whisper to these user _ids (empty = public). */
   whisperTo?: string[];
+  /**
+   * Idempotency key for this send. When set, the key is stored in the
+   * message's `flags["foundry-live"].dedupeKey`, and
+   * `sendChatIdempotent` will return the already-posted message instead
+   * of posting twice (crash re-dispatch). No key = no dedupe, as before.
+   */
+  dedupeKey?: string;
 }
 
 /** Options for {@link FoundryLive.waitForChat}. */

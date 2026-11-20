@@ -19,6 +19,7 @@
  * Token update, awaited, so the token never outruns the server.
  */
 import type { FoundryLive } from "../live.js";
+import { FLAG_FIELDS, findDocByFlag, flagValue } from "../idempotency.js";
 
 export interface SceneToken {
   _id: string;
@@ -28,6 +29,8 @@ export interface SceneToken {
   actorId?: string;
   width?: number;
   height?: number;
+  /** Flags, when the world payload carries them (place keys live here). */
+  flags?: Record<string, Record<string, unknown> | undefined> | null;
 }
 
 export interface MoveResult {
@@ -88,14 +91,34 @@ export function resolveToken(
   );
 }
 
-/** Place a token for an actor on a scene. Returns the token _id. */
+/**
+ * Find a token on a scene by its place key (`flags["foundry-live"].placeKey`),
+ * or undefined. Pure read against current scene state.
+ */
+export function findTokenByPlaceKey(
+  live: FoundryLive,
+  sceneId: string,
+  key: string,
+): SceneToken | undefined {
+  return findDocByFlag(getSceneTokens(live, sceneId), FLAG_FIELDS.tokenPlace, key);
+}
+
+/**
+ * Place a token for an actor on a scene. Returns the token _id.
+ *
+ * With `opts.key`, the placement is retry-safe: the key is stored in the
+ * token's flags, and a re-run returns the already-placed token instead of
+ * placing a second one. Without a key, behavior is unchanged (every call
+ * places a new token — two "Kobold Warrior" tokens is legitimate, so a
+ * bare name must never dedupe).
+ */
 export async function placeToken(
   live: FoundryLive,
   sceneId: string,
   actorId: string,
   x: number,
   y: number,
-  opts: { name?: string; actorLink?: boolean; disposition?: number } = {},
+  opts: { name?: string; actorLink?: boolean; disposition?: number; key?: string } = {},
 ): Promise<string> {
   const raw = live.raw() as unknown as {
     getRawActor(id: string): { name?: string; img?: string; prototypeToken?: { texture?: { src?: string } } } | undefined;
@@ -103,35 +126,54 @@ export async function placeToken(
   const actor = raw.getRawActor?.(actorId) ??
     ((await live.getActorDetails(actorId)) as { name?: string; img?: string; prototypeToken?: { texture?: { src?: string } } } | null);
   const name = opts.name ?? actor?.name ?? "Token";
+  const scene = resolveScene(live, sceneId);
+  if (opts.key) {
+    const existing = findDocByFlag(scene.tokens ?? [], FLAG_FIELDS.tokenPlace, opts.key);
+    if (existing) return String(existing._id);
+  }
+  const doc: Record<string, unknown> = {
+    name,
+    actorId,
+    actorLink: opts.actorLink ?? true,
+    x,
+    y,
+    width: 1,
+    height: 1,
+    texture: { src: actor?.prototypeToken?.texture?.src ?? actor?.img ?? "icons/svg/mystery-man.svg" },
+    disposition: opts.disposition ?? 0,
+  };
+  if (opts.key) doc.flags = flagValue(FLAG_FIELDS.tokenPlace, opts.key);
   const created = await live.modifyDocument("Token", "create", {
-    data: [{
-      name,
-      actorId,
-      actorLink: opts.actorLink ?? true,
-      x,
-      y,
-      width: 1,
-      height: 1,
-      texture: { src: actor?.prototypeToken?.texture?.src ?? actor?.img ?? "icons/svg/mystery-man.svg" },
-      disposition: opts.disposition ?? 0,
-    }],
-    parentUuid: `Scene.${resolveScene(live, sceneId)._id}`,
+    data: [doc],
+    parentUuid: `Scene.${scene._id}`,
   });
   const id = String(created[0]?._id ?? "");
   if (!id) throw new Error("Token create returned no _id.");
   return id;
 }
 
-/** Delete a token from a scene. */
+/**
+ * Delete a token from a scene. Tolerant: deleting a token that is already
+ * gone is a success (the goal state — token absent — is already true),
+ * so a crash re-dispatch of a cleanup step does not fail. A delete that
+ * fails while the token is still present still throws.
+ */
 export async function deleteToken(
   live: FoundryLive,
   sceneId: string,
   tokenId: string,
 ): Promise<void> {
-  await live.modifyDocument("Token", "delete", {
-    ids: [tokenId],
-    parentUuid: `Scene.${resolveScene(live, sceneId)._id}`,
-  });
+  const scene = resolveScene(live, sceneId);
+  try {
+    await live.modifyDocument("Token", "delete", {
+      ids: [tokenId],
+      parentUuid: `Scene.${scene._id}`,
+    });
+  } catch (err) {
+    const stillThere = (scene.tokens ?? []).some((t) => t._id === tokenId);
+    if (!stillThere) return;
+    throw err;
+  }
 }
 
 /**

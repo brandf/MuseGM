@@ -4,8 +4,12 @@ export {};
  *
  * Usage:
  *   bun run src/cli/send.ts --content "..." [--alias Meroki] [--style 1]
+ *       [--dedupe-key <key>]
  *
- * Prints {"id": "<created message _id>"} to stdout.
+ * Prints {"id": "<created message _id>"} to stdout — or
+ * {"id": "<existing message _id>", "duplicate": true} when --dedupe-key
+ * matches a message this user already posted (crash re-dispatch: the
+ * re-run returns the original instead of posting twice).
  *
  * LOG_LEVEL is forced to error before the library import so the vendored
  * client's info logs don't corrupt stdout (see wait.ts).
@@ -26,8 +30,18 @@ async function main(): Promise<void> {
   }
   const alias = arg("--alias");
   const style = arg("--style");
+  const dedupeKey = arg("--dedupe-key");
   const live = await FoundryLive.connect();
   try {
+    if (dedupeKey) {
+      const res = await live.sendChatIdempotent(content, {
+        alias: alias ?? "Meroki",
+        style: style !== undefined ? Number(style) : 1,
+        dedupeKey,
+      });
+      process.stdout.write(JSON.stringify({ id: res.id, duplicate: res.duplicate }) + "\n");
+      return;
+    }
     const id = await live.sendChat(content, {
       alias: alias ?? "Meroki",
       style: style !== undefined ? Number(style) : 1,

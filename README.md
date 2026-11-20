@@ -116,10 +116,57 @@ bun run src/cli/dice.ts --roll "1d20+5" [--flavor Perception] [--actor Ezren]
 bun run src/cli/dice.ts --roll "1d20+3" --secret [--flavor "kobold save"]
 bun run src/cli/dice.ts --group "1d20+2" [--flavor Perception] [--actors id1,id2]
 
+# Compendium import: search pack indexes, read + import pack documents
+bun run src/cli/compendium.ts --dracolich                  # no connection needed (homebrew draft)
+bun run src/cli/compendium.ts --list-packs
+bun run src/cli/compendium.ts --search "lich" [--type Actor] [--pack <id>]
+bun run src/cli/compendium.ts --get <packId> <docId> [--type Actor]
+bun run src/cli/compendium.ts --import <packId> <docId> [--name <new>] [--keep-id]
+
+# P2 everyday helpers (loot / reminders / recaps / Q&A)
+bun run src/cli/loot.ts --generate --level 3 [--tier poor|standard|rich] [--seed 7]  # no connection needed
+bun run src/cli/loot.ts --fill --chest <loot-actor-id> --level 3
+bun run src/cli/loot.ts --open --chest <loot-actor-id> --character <actor-id> [--name Ezren]
+bun run src/cli/remind.ts --demo                                # no connection needed
+bun run src/cli/remind.ts --combat <combat-id>                  # whisper the current turn's player
+bun run src/cli/recap.ts --from-json messages.json              # no connection needed
+bun run src/cli/recap.ts --post [--limit 200] [--title "Session recap"]
+bun run src/cli/qa.ts --fixture "what's my ac"                  # no connection needed
+bun run src/cli/qa.ts --actor <id|name> --question "what's my ac"
+
+# Rapid custom encounter generation (FR-11) — story-aware NPCs
+bun run src/cli/encounter-gen.ts --demo                        # no connection needed
+bun run src/cli/encounter-gen.ts --generate --spec encounter.json  # no connection needed
+bun run src/cli/encounter-gen.ts --actors --spec encounter.json
+bun run src/cli/encounter-gen.ts --build --spec encounter.json [--scene <id>]
+
 # Run a timed action sequence from a JSON file, or the demo
 bun run src/cli/sequence.ts --file seq.json
 bun run src/cli/sequence.ts demo
+
+# Generate a seeded maze (FR-12) — no connection needed
+bun run src/cli/maze.ts --cells 10x8 [--seed 7] [--entrance north] [--exit south] [--ascii]
+bun run src/cli/maze.ts --corridor 100m   # unit converter: 100 m -> 66 squares
+
+# Play a cutscene script (FR-5): validate and play, or validate only
+bun run src/cli/cutscene.ts --file examples/ambush.json --validate-only  # no connection needed
+bun run src/cli/cutscene.ts --file examples/ambush.json [--run-key <key>] [--continue-on-error]
+
+# Run the monitor loop: wait for chat, answer rolls + data questions,
+# handle Meroki Pins, announce turn changes, until Ctrl-C
+bun run monitor [--alias Meroki] [--debounce 3] [--timeout 30] [--once] [--dry-run]
 ```
+
+The monitor (`src/cli/monitor.ts`, `src/session/monitor.ts`) is the
+first-class version of the loop the Nov 19 session ran by hand. It
+answers only what it can from live data — roll requests, turn / round /
+HP / AC / initiative / scene questions — plus pins and turn
+announcements; open chat is logged as `needs-agent` on stderr and
+skipped, never improvised. Logs are JSON lines on stderr; `--once`
+prints a summary JSON object on stdout. It starts from the newest chat
+message (never re-answers history) and picks up open pins dropped while
+it was offline. Multi-Muse rules (one chat monitor per session, Builder
+vs Table roles, pin claims) are in [docs/multi-muse.md](./docs/multi-muse.md).
 
 `wait` prints exactly one JSON object:
 `{"timedOut": false, "new": [{id, author, speaker, content, timestamp}...], "lastSeen": "<newest id>"}`.

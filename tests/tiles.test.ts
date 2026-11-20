@@ -10,10 +10,14 @@ import {
   LAYER_SORT,
   TILE_PX,
   cornerRotation,
+  doorEntryCell,
+  layoutDungeon,
   layoutRoom,
   loadPack,
   mulberry32,
+  resolveDoorWalk,
   wallRotation,
+  type DungeonSpec,
   type Pack,
   type RoomSpec,
 } from "../src/worldbuilding/tiles-layout.js";
@@ -207,8 +211,10 @@ describe("layoutRoom — layers, dressing, fog, lights", () => {
 });
 
 describe("layoutRoom — validation", () => {
-  it("rejects rooms smaller than 3x3", () => {
-    expect(() => layoutRoom({ ...baseSpec, gridW: 2 }, pack, BASE)).toThrow(/3x3/);
+  it("rejects rooms smaller than 1x1 — but a 1-wide corridor is a valid room (FR-12)", () => {
+    expect(() => layoutRoom({ ...baseSpec, gridW: 0 }, pack, BASE)).toThrow(/1x1/);
+    expect(() => layoutRoom({ ...baseSpec, gridH: 0 }, pack, BASE)).toThrow(/1x1/);
+    expect(() => layoutRoom({ name: "Corridor", gridW: 1, gridH: 6 }, pack, BASE)).not.toThrow();
   });
 
   it("rejects doors in corners and out of range", () => {
@@ -243,5 +249,164 @@ describe("mulberry32", () => {
     expect(a()).toBe(b());
     const vals = Array.from({ length: 100 }, () => mulberry32(99)());
     expect(vals.every((v) => v >= 0 && v < 1)).toBe(true);
+  });
+});
+
+describe("layoutDungeon — graph", () => {
+  const hall: RoomSpec & { id: string } = {
+    id: "hall",
+    name: "Entry Hall",
+    gridW: 8,
+    gridH: 6,
+    seed: 1,
+    doors: [{ wall: "south", at: 3 }],
+  };
+  const crypt: RoomSpec & { id: string } = {
+    id: "crypt",
+    name: "Crypt",
+    gridW: 6,
+    gridH: 6,
+    seed: 2,
+    doors: [{ wall: "north", at: 2 }],
+  };
+  const twoRoom: DungeonSpec = {
+    rooms: [hall, crypt],
+    links: [{ from: { room: "hall", wall: "south", at: 3 }, to: { room: "crypt", wall: "north", at: 2 } }],
+  };
+
+  it("lays out each room and resolves the link with arrival cells", () => {
+    const d = layoutDungeon(twoRoom, pack, BASE);
+    expect(d.rooms).toHaveLength(2);
+    expect(d.rooms[0].id).toBe("hall");
+    expect(d.rooms[0].layout.width).toBe(800);
+    expect(d.rooms[1].id).toBe("crypt");
+    expect(d.rooms[1].layout.height).toBe(600);
+    expect(d.links).toHaveLength(1);
+    const link = d.links[0];
+    // Hall south door at 3: arrive one cell in from the south wall.
+    expect(link.from).toEqual({ room: "hall", wall: "south", at: 3, enterGx: 3, enterGy: 4 });
+    // Crypt north door at 2: arrive one cell in from the north wall.
+    expect(link.to).toEqual({ room: "crypt", wall: "north", at: 2, enterGx: 2, enterGy: 1 });
+  });
+
+  it("doorEntryCell is one cell in from each wall", () => {
+    expect(doorEntryCell("north", 2, 8, 6)).toEqual({ gx: 2, gy: 1 });
+    expect(doorEntryCell("south", 2, 8, 6)).toEqual({ gx: 2, gy: 4 });
+    expect(doorEntryCell("west", 3, 8, 6)).toEqual({ gx: 1, gy: 3 });
+    expect(doorEntryCell("east", 3, 8, 6)).toEqual({ gx: 6, gy: 3 });
+  });
+
+  it("resolveDoorWalk returns the other end, or null for an unlinked door", () => {
+    const d = layoutDungeon(twoRoom, pack, BASE);
+    const intoCrypt = resolveDoorWalk(d, "hall", "south", 3);
+    expect(intoCrypt).toEqual({ room: "crypt", wall: "north", at: 2, enterGx: 2, enterGy: 1 });
+    const intoHall = resolveDoorWalk(d, "crypt", "north", 2);
+    expect(intoHall).toEqual({ room: "hall", wall: "south", at: 3, enterGx: 3, enterGy: 4 });
+    expect(resolveDoorWalk(d, "hall", "north", 2)).toBeNull();
+  });
+
+  it("links a chain of three rooms", () => {
+    const lair: RoomSpec & { id: string } = {
+      id: "lair",
+      name: "Lich's Lair",
+      gridW: 6,
+      gridH: 6,
+      seed: 3,
+      floorStyle: "dark",
+      doors: [{ wall: "west", at: 2 }],
+    };
+    const cryptEast: RoomSpec & { id: string } = {
+      ...crypt,
+      doors: [{ wall: "north", at: 2 }, { wall: "east", at: 3 }],
+    };
+    const d = layoutDungeon(
+      {
+        rooms: [hall, cryptEast, lair],
+        links: [
+          { from: { room: "hall", wall: "south", at: 3 }, to: { room: "crypt", wall: "north", at: 2 } },
+          { from: { room: "crypt", wall: "east", at: 3 }, to: { room: "lair", wall: "west", at: 2 } },
+        ],
+      },
+      pack,
+      BASE,
+    );
+    expect(d.rooms).toHaveLength(3);
+    expect(d.links).toHaveLength(2);
+  });
+
+  it("rejects links to unknown rooms and to cells that are not doors", () => {
+    expect(() =>
+      layoutDungeon(
+        { ...twoRoom, links: [{ from: { room: "hall", wall: "south", at: 3 }, to: { room: "vault", wall: "north", at: 2 } }] },
+        pack,
+        BASE,
+      ),
+    ).toThrow(/unknown room "vault"/);
+    expect(() =>
+      layoutDungeon(
+        { ...twoRoom, links: [{ from: { room: "hall", wall: "south", at: 3 }, to: { room: "crypt", wall: "north", at: 4 } }] },
+        pack,
+        BASE,
+      ),
+    ).toThrow(/not a declared door/);
+  });
+
+  it("rejects a door used in two links, a self-link, and a duplicated link", () => {
+    const extra: RoomSpec & { id: string } = {
+      id: "extra",
+      name: "Extra",
+      gridW: 5,
+      gridH: 5,
+      doors: [{ wall: "north", at: 2 }],
+    };
+    expect(() =>
+      layoutDungeon(
+        {
+          rooms: [hall, crypt, extra],
+          links: [
+            { from: { room: "hall", wall: "south", at: 3 }, to: { room: "crypt", wall: "north", at: 2 } },
+            { from: { room: "hall", wall: "south", at: 3 }, to: { room: "extra", wall: "north", at: 2 } },
+          ],
+        },
+        pack,
+        BASE,
+      ),
+    ).toThrow(/two links/);
+    expect(() =>
+      layoutDungeon(
+        { ...twoRoom, links: [{ from: { room: "hall", wall: "south", at: 3 }, to: { room: "hall", wall: "south", at: 3 } }] },
+        pack,
+        BASE,
+      ),
+    ).toThrow(/itself/);
+    expect(() =>
+      layoutDungeon(
+        {
+          ...twoRoom,
+          links: [
+            { from: { room: "hall", wall: "south", at: 3 }, to: { room: "crypt", wall: "north", at: 2 } },
+            { from: { room: "crypt", wall: "north", at: 2 }, to: { room: "hall", wall: "south", at: 3 } },
+          ],
+        },
+        pack,
+        BASE,
+      ),
+    ).toThrow(/Duplicate link/);
+  });
+
+  it("rejects duplicate room ids and disconnected rooms", () => {
+    expect(() =>
+      layoutDungeon({ rooms: [hall, { ...crypt, id: "hall" }], links: twoRoom.links }, pack, BASE),
+    ).toThrow(/Duplicate room id/);
+    const stranded: RoomSpec & { id: string } = {
+      id: "stranded",
+      name: "Stranded",
+      gridW: 5,
+      gridH: 5,
+      doors: [{ wall: "north", at: 2 }],
+    };
+    expect(() =>
+      layoutDungeon({ rooms: [hall, crypt, stranded], links: twoRoom.links }, pack, BASE),
+    ).toThrow(/not connected.*stranded/);
   });
 });
