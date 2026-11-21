@@ -19,9 +19,11 @@
  * - `parseBuildRequest` — chat line -> BuildOp (or a clarification
  *   question, or "can't do that yet", or null when it isn't a build
  *   request at all). Only the intents the composer already supports:
- *   room create, widen, door add/move (incl. secret doors), dressing
- *   add, fog add, regional overlay, corridor. Anything else is
- *   "unsupported", never a hallucinated build. `parseBuildRequests`
+ *   room create, widen, door add/move (incl. secret doors), door
+ *   verbs (open/close/lock/unlock/listen — BRA-234, the state lives
+ *   on the door object in the spec), dressing add, fog add, regional
+ *   overlay, corridor. Anything else is "unsupported", never a
+ *   hallucinated build. `parseBuildRequests`
  *   is the compound form: "add a door here and widen the room" is
  *   two ops, applied in order, one confirmation line each.
  * - `applyOp` / `BuildSession` — the edit history. Layout ops are
@@ -86,6 +88,11 @@ export type BuildOp =
   | { type: "add-fog"; target?: string }
   | { type: "overlay"; region: OverlayRegion; variants: Record<string, string>; target?: string }
   | { type: "add-corridor"; direction: WallSide; length: number; unit: LengthUnit; target?: string }
+  | { type: "open-door"; wall: WallSide; at: number; target?: string }
+  | { type: "close-door"; wall: WallSide; at: number; target?: string }
+  | { type: "lock-door"; wall: WallSide; at: number; key?: string; target?: string }
+  | { type: "unlock-door"; wall: WallSide; at: number; key?: string; target?: string }
+  | { type: "listen-door"; wall: WallSide; at: number; target?: string }
   | { type: "undo" }
   | { type: "redo" };
 
@@ -137,6 +144,59 @@ export interface BuildHistoryEntry {
   said: string;
   op: BuildOp;
   summary: string;
+}
+
+// ---------------------------------------------------------------- door verbs (BRA-234)
+
+/**
+ * A door's verb state — open, closed, or locked. Stored ON the door
+ * object in the build session's spec (extra fields on the DoorSpec),
+ * so it survives snapshots, `planSync` sees it (canonical() includes
+ * it), and a rebuild re-emits the room. The composer (layoutRoom)
+ * ignores the extra fields — it still emits a door:1/door:2 wall —
+ * so the live Wall doc's `ds` (door state) update is a follow-up for
+ * the executor/composer, not this layer. Absent `state` means closed:
+ * a door the composer built is a closed door until a verb says
+ * otherwise, and only open/locked are stored, so specs written
+ * before door verbs stay byte-identical.
+ *
+ * `key` is the key or method that opens a locked door, as the GM
+ * named it ("the brass key", "the rusted key") — recorded when the
+ * GM locks with one, kept on the door when it is unlocked (the door's
+ * key doesn't change unless the GM names a new one). A lock with no
+ * named key keeps any previously recorded key, else is keyless.
+ */
+export type DoorState = "open" | "closed" | "locked";
+
+/** A door carrying its verb state. */
+export interface DoorWithState extends DoorSpec {
+  state?: DoorState;
+  key?: string;
+}
+
+/** The door's state, defaulting to closed when nothing is recorded. */
+export function doorStateOf(d: DoorSpec): DoorState {
+  return (d as DoorWithState).state ?? "closed";
+}
+
+/** The key that opens this door, when the GM named one. */
+export function doorKeyOf(d: DoorSpec): string | undefined {
+  return (d as DoorWithState).key;
+}
+
+/** A copy of the door with the given state (and key, when the caller
+ *  passes one — otherwise the recorded key is kept). */
+export function withDoorState(d: DoorSpec, state: DoorState, key?: string): DoorWithState {
+  const next: DoorWithState = { ...d, state: state === "closed" ? undefined : state };
+  const kept = key !== undefined ? key : doorKeyOf(d);
+  if (kept !== undefined) next.key = kept;
+  return next;
+}
+
+/** "the south door" / "the secret north door" — the door's name in
+ *  chat lines and error messages. */
+export function doorLabel(d: DoorSpec): string {
+  return `the ${d.secret ? "secret " : ""}${d.wall} door`;
 }
 
 // ---------------------------------------------------------------- parser
@@ -257,6 +317,89 @@ function parseRoomName(text: string): string {
 function parseCell(text: string): number | null {
   const m = /\b(?:cell|at)\s+(\d+)\b/i.exec(text);
   return m ? Number(m[1]) : null;
+}
+
+/** What a lock/unlock line names: a key ("with the brass key") or a
+ *  method ("pick the lock", "force it"). A bare "the" is stripped;
+ *  the phrase is kept whole ("brass key", not "brass") so an unlock
+ *  naming a different key is a plain mismatch, never a guess. */
+export function parseKeyOrMethod(
+  text: string,
+): { key?: string; method?: string } {
+  if (/\bpick(?:ing)?\s+the\s+lock\b/i.test(text)) return { method: "pick the lock" };
+  if (/\bforce\s+(?:it|the\s+door)\b/i.test(text)) return { method: "force it" };
+  const m = /\b(?:with|using)\s+(?:the\s+)?([A-Za-z][A-Za-z'’ -]*?)(?:\s*,|\s+and\b|\s*$|\s*\.)/i.exec(text);
+  if (!m) return {};
+  const key = m[1].replace(/\s+/g, " ").trim().replace(/^(?:a|an)\s+/i, "");
+  return key ? { key } : {};
+}
+
+/** Which door a verb line addresses, or a question. Never guesses:
+ *  a wall with no door says so (an open archway on that wall says
+ *  "look through", not "no door"); two doors on one wall, or a bare
+ *  "the door" in a multi-door room, list the doors that exist. */
+export type DoorTarget =
+  | { door: DoorSpec }
+  | { clarify: string };
+
+export function resolveDoor(
+  s: string,
+  room: RoomSpec,
+  ctx?: BuildParseContext,
+): DoorTarget {
+  const doors = room.doors ?? [];
+  const openings = room.openings ?? [];
+  const listDoors = (ds: DoorSpec[]): string =>
+    ds.map((d) => `${d.secret ? "secret " : ""}${d.wall} door at cell ${d.at}`).join(", ");
+  const secret = /\b(secret|hidden)\b/i.test(s);
+  const wall = parseWall(s);
+  const cell = parseCell(s);
+  // "here" is the ping: the wall nearest it (a named wall or cell
+  // wins over the ping).
+  let hereWall: WallSide | null = null;
+  if (!wall && !secret && /\bhere\b/i.test(s) && ctx?.here) {
+    hereWall = resolveHere(ctx.here.x, ctx.here.y, room).wall;
+  }
+  const effWall = wall ?? hereWall;
+  let pool = doors;
+  if (secret) pool = pool.filter((d) => d.secret);
+  if (effWall) pool = pool.filter((d) => d.wall === effWall);
+  if (cell !== null) pool = pool.filter((d) => d.at === cell);
+  if (pool.length === 1) return { door: pool[0] };
+  if (pool.length > 1) {
+    return {
+      clarify: `Which door — ${listDoors(pool)}?`,
+    };
+  }
+  if (secret) {
+    return {
+      clarify: doors.some((d) => d.secret)
+        ? `Which secret door — ${listDoors(doors.filter((d) => d.secret))}?`
+        : "There's no secret door in this room yet — add one first, or name a plain door.",
+    };
+  }
+  if (effWall) {
+    const opening = openings.find((o) => o.wall === effWall);
+    if (opening) {
+      return {
+        clarify: `There's no door on the ${effWall} wall — it's an open archway, you can just look through.`,
+      };
+    }
+    return {
+      clarify: `There's no door on the ${effWall} wall yet — which door did you mean?`,
+    };
+  }
+  if (cell !== null) {
+    return { clarify: `There's no door at cell ${cell} in this room — which door did you mean?` };
+  }
+  if (doors.length === 0) {
+    return {
+      clarify: "There's no door in this room yet — build a room with a door first, or add one.",
+    };
+  }
+  return {
+    clarify: `Which door — ${listDoors(doors)}?`,
+  };
 }
 
 // ---------------------------------------------------------------- resolving rooms + "here"
@@ -426,6 +569,12 @@ export function resolveHereRegion(x: number, y: number, room: RoomSpec): Overlay
 
 const BUILD_VERBS =
   /\b(build|make|create|add|put|place|move|widen|carve|dig|undo|redo)\b/i;
+
+/** Leading fluff a door-verb command may carry ("please lock the
+ *  door", "Meroki, open the south door") — the light-commands rule:
+ *  strip it, then the verb must lead. */
+const DOOR_FLUFF_LEAD =
+  /^(?:please[,\s]+|(?:can|could)\s+you[,\s]+|hey\s+meroki[,\s]+|meroki[,\s]+)+/i;
 const BUILD_NOUNS =
   /\b(room|door|wall|corridor|hall|chamber|dungeon|fog|torch|torches|chest|maze|tile|floor|overlay|passage|hallway|secret|darker|darkness|theme|gothic|crypt|tavern|lair|vault|temple)\b/i;
 
@@ -443,6 +592,10 @@ const BUILD_NOUNS =
  *   "add a door [on the north wall]" / "put a secret door in the north wall"
  *   "add a door here" (the ping: nearest wall + cell, when ctx.here is set)
  *   "move that door left" / "move the south door to cell 5"
+ *   "open/close/lock/unlock the south door" / "lock the door with the brass key" /
+ *   "unlock the door by picking the lock" / "listen at the door" (BRA-234 — door
+ *   verbs; "the door" with one door in the room is that door, otherwise a
+ *   question listing the doors; a secret door is "the secret door")
  *   "add some bones / rubble / a pillar / a chest [in the corner / in the middle / near the door]"
  *   "add some bones here" (the pinged cell, when ctx.here is set)
  *   "add torches" / "add fog" / "more fog"
@@ -569,6 +722,68 @@ export function parseBuildRequest(
         fog: /\bfog\b/i.test(s),
       },
     };
+  }
+
+  // Door verbs (BRA-234) — open/close/lock/unlock/listen at a door.
+  // The line must name a door ("the south door", "the secret door",
+  // "that door"); a bare "lock it" has no door to resolve, so it falls
+  // through to chat — in a compound, name the door in the verb
+  // segment ("add a south door and lock the south door"). The verb
+  // must LEAD the line (after "please" / "can you" / "meroki", the
+  // light-commands rule): "three puzzles to unlock a door" is a floor
+  // brief, not a command, and an anywhere-match would steal it from
+  // the co-design brief detector. Runs before add-door: "put your ear
+  // to the door" contains "put" + "door" and would otherwise parse
+  // as adding a door — the same parser-ordering class as the Nov 20
+  // widen/create fix.
+  {
+    const stripped = s.replace(DOOR_FLUFF_LEAD, "").trim();
+    const leadsWithVerb = /^(open|close|shut|lock|bar|unlock|unbar|listen)\b/i.test(stripped);
+    const leadsWithEar = /^(?:put|press|place)\b[^.]{0,25}\bear\s+(?:to|against)\b/i.test(stripped);
+    if ((leadsWithVerb || leadsWithEar) && /\bdoor\b/i.test(s)) {
+      // The key/method tail ("with the Brass Key") is not a room name —
+      // resolve the room target on the line without it.
+      const targetLine = stripped.replace(/\s+\b(?:with|using)\b\s+.*$/i, "");
+      const target = resolveRoomTarget(targetLine, ctx);
+      if (target && "clarify" in target) {
+        return { kind: "clarify", question: target.clarify };
+      }
+      const room = roomForTarget(ctx, target?.id);
+      if (!room) {
+        return {
+          kind: "clarify",
+          question: "There's no door in this room yet — build a room first, or add one.",
+        };
+      }
+      const resolved = resolveDoor(stripped, room, ctx);
+      if ("clarify" in resolved) {
+        return { kind: "clarify", question: resolved.clarify };
+      }
+      const door = resolved.door;
+      const base = { wall: door.wall, at: door.at, ...(target ? { target: target.id } : {}) };
+      if (/\blisten\b/i.test(stripped) || /\bear\s+(?:to|against)\b/i.test(stripped)) {
+        return { kind: "build", op: { type: "listen-door", ...base } };
+      }
+      if (/\b(open)\b/i.test(stripped)) {
+        return { kind: "build", op: { type: "open-door", ...base } };
+      }
+      if (/\b(close|shut)\b/i.test(stripped)) {
+        return { kind: "build", op: { type: "close-door", ...base } };
+      }
+      if (/\b(unlock|unbar)\b/i.test(stripped)) {
+        const { key, method } = parseKeyOrMethod(stripped);
+        return {
+          kind: "build",
+          op: { type: "unlock-door", ...base, ...(key ? { key } : {}), ...(method ? { key: method } : {}) },
+        };
+      }
+      // lock / bar — the last verb standing.
+      const { key, method } = parseKeyOrMethod(stripped);
+      return {
+        kind: "build",
+        op: { type: "lock-door", ...base, ...(key ? { key } : {}), ...(method ? { key: method } : {}) },
+      };
+    }
   }
 
   // Add a door. "Here" is the ping: the nearest wall and the cell
@@ -917,6 +1132,110 @@ function replaceRoom(state: BuildState, room: DungeonRoomSpec): BuildState {
   };
 }
 
+/** Replace one door in a room, keeping the rest of the spec. */
+function replaceDoor(
+  state: BuildState,
+  room: DungeonRoomSpec,
+  door: DoorSpec,
+  next: DoorSpec,
+): BuildState {
+  return replaceRoom(state, {
+    ...room,
+    doors: (room.doors ?? []).map((d) => (d === door ? next : d)),
+  });
+}
+
+/**
+ * The GM's report from listening at a door: atmosphere from the far
+ * side, never the far room's name or contents. The far room is the
+ * other end of the dungeon link; an unlinked door has no far side to
+ * hear. Fragments come from atmosphere only — light leaking under the
+ * door, damp air, the room's theme — never dressing: a prop's sound
+ * would give the contents away.
+ */
+export function listenSummary(
+  dungeon: DungeonSpec,
+  room: DungeonRoomSpec,
+  door: DoorSpec,
+): string {
+  const label = doorLabel(door);
+  const press = `You press your ear to ${label}`;
+  const link = dungeon.links.find(
+    (l) =>
+      (l.from.room === room.id && l.from.wall === door.wall && l.from.at === door.at) ||
+      (l.to.room === room.id && l.to.wall === door.wall && l.to.at === door.at),
+  );
+  if (!link) {
+    return `${press} and hear nothing — the door doesn't lead anywhere yet.`;
+  }
+  const farEnd =
+    link.from.room === room.id && link.from.wall === door.wall && link.from.at === door.at
+      ? link.to
+      : link.from;
+  const far = dungeon.rooms.find((r) => r.id === farEnd.room);
+  if (!far) {
+    return `${press} and hear nothing — the room beyond isn't in this build.`;
+  }
+  const fragments: string[] = [];
+  if ((far.torches ?? []).length > 0 || (far.lights ?? []).length > 0) {
+    fragments.push("a faint warm glow leaks under the door");
+  }
+  if ((far.fog ?? []).length > 0) {
+    fragments.push("damp air curls under the door");
+  }
+  if (far.theme === "western") {
+    fragments.push("dry dust on the air");
+  } else if (far.floorStyle === "dark") {
+    fragments.push("cold, still dark air");
+  } else {
+    fragments.push("cold stone air");
+  }
+  const muffled = doorStateOf(door) === "locked" ? "Through the locked door, muffled: " : "";
+  return `${press} — ${muffled}${fragments.join("; ")}.`;
+}
+
+/**
+ * Does this door block passage right now? A locked door blocks
+ * movement until unlocked; an open or closed door doesn't — a closed
+ * door opens when the party walks through (the GM's call at the
+ * table, the move itself isn't gated). An unlinked door has nowhere
+ * to go, so it blocks too. An opening (no door at all) never blocks.
+ * The enforcement point for walkThroughDoor and the monitor's
+ * door-walk wiring — the gate is pure, the walk is the live half.
+ */
+export function canWalkThroughDoor(
+  dungeon: DungeonSpec,
+  roomId: string,
+  wall: WallSide,
+  at: number,
+): { ok: boolean; reason?: string } {
+  const room = dungeon.rooms.find((r) => r.id === roomId);
+  if (!room) return { ok: false, reason: `No room "${roomId}" in this build.` };
+  if ((room.openings ?? []).some((o) => o.wall === wall && o.at === at)) {
+    return { ok: true };
+  }
+  const door = (room.doors ?? []).find((d) => d.wall === wall && d.at === at);
+  if (!door) {
+    return { ok: false, reason: `There's no door on the ${wall} wall at cell ${at} in the ${room.name}.` };
+  }
+  if (doorStateOf(door) === "locked") {
+    const key = doorKeyOf(door);
+    return {
+      ok: false,
+      reason: `${doorLabel(door).charAt(0).toUpperCase() + doorLabel(door).slice(1)} is locked${key ? ` (with the ${key})` : ""} — unlock it first.`,
+    };
+  }
+  const linked = dungeon.links.some(
+    (l) =>
+      (l.from.room === roomId && l.from.wall === wall && l.from.at === at) ||
+      (l.to.room === roomId && l.to.wall === wall && l.to.at === at),
+  );
+  if (!linked) {
+    return { ok: false, reason: `${doorLabel(door).charAt(0).toUpperCase() + doorLabel(door).slice(1)} isn't linked to another room yet.` };
+  }
+  return { ok: true };
+}
+
 /** Tile size in cells, from the pack when given, else the pack's known
  *  defaults (dressing is 2x2; fog wisps are 2x2, large fog and pools
  *  are 4x4). The pack is the authority — the defaults only cover the
@@ -1006,7 +1325,10 @@ function overlayRect(region: OverlayRegion, gridW: number, gridH: number): { gx:
 }
 
 function describeRoomShort(room: RoomSpec): string {
-  const doors = (room.doors ?? []).map((d) => `${d.secret ? "secret " : ""}${d.wall}@${d.at}`).join(", ");
+  const doors = (room.doors ?? []).map((d) => {
+    const st = doorStateOf(d);
+    return `${d.secret ? "secret " : ""}${d.wall}@${d.at}${st === "closed" ? "" : ` (${st})`}`;
+  }).join(", ");
   const bits = [`${room.gridW}×${room.gridH}`];
   if (doors) bits.push(`door${(room.doors ?? []).length > 1 ? "s" : ""} ${doors}`);
   if ((room.dressing ?? []).length > 0) bits.push(`${room.dressing!.length} dressing`);
@@ -1136,6 +1458,102 @@ export function applyOp(
       return {
         state: withFocus(replaceRoom(state, next), op),
         summary: `Moved the ${op.wall} door from cell ${op.fromAt} to cell ${op.toAt}.`,
+        changed: true,
+      };
+    }
+    case "open-door":
+    case "close-door":
+    case "lock-door":
+    case "unlock-door":
+    case "listen-door": {
+      const room = targetRoom(state, op, "No room with a door to work yet — build a room first.");
+      const door = (room.doors ?? []).find((d) => d.wall === op.wall && d.at === op.at);
+      if (!door) {
+        throw new Error(`There's no door on the ${op.wall} wall at cell ${op.at} in the ${room.name}.`);
+      }
+      const label = doorLabel(door);
+      const doorState = doorStateOf(door);
+      const key = doorKeyOf(door);
+      if (op.type === "listen-door") {
+        return {
+          state,
+          summary: listenSummary(state.dungeon, room, door),
+          changed: false,
+        };
+      }
+      if (op.type === "open-door") {
+        if (doorState === "locked") {
+          throw new Error(
+            `${label.charAt(0).toUpperCase() + label.slice(1)} is locked — unlock it first${key ? ` (with the ${key})` : ""}.`,
+          );
+        }
+        if (doorState === "open") {
+          return { state, summary: `${label.charAt(0).toUpperCase() + label.slice(1)} is already open.`, changed: false };
+        }
+        const next = replaceDoor(state, room, door, withDoorState(door, "open"));
+        return {
+          state: withFocus(next, op),
+          summary: `Opened ${label}.`,
+          changed: true,
+        };
+      }
+      if (op.type === "close-door") {
+        if (doorState === "locked") {
+          return { state, summary: `${label.charAt(0).toUpperCase() + label.slice(1)} is already closed (and locked).`, changed: false };
+        }
+        if (doorState === "closed") {
+          return { state, summary: `${label.charAt(0).toUpperCase() + label.slice(1)} is already closed.`, changed: false };
+        }
+        const next = replaceDoor(state, room, door, withDoorState(door, "closed"));
+        return {
+          state: withFocus(next, op),
+          summary: `Closed ${label}.`,
+          changed: true,
+        };
+      }
+      if (op.type === "lock-door") {
+        if (doorState === "open") {
+          throw new Error(
+            `Close ${label} first — you can't lock an open door.`,
+          );
+        }
+        if (doorState === "locked") {
+          return {
+            state,
+            summary: `${label.charAt(0).toUpperCase() + label.slice(1)} is already locked${key ? ` (with the ${key})` : ""}.`,
+            changed: false,
+          };
+        }
+        const next = replaceDoor(state, room, door, withDoorState(door, "locked", op.key));
+        const newKey = doorKeyOf(withDoorState(door, "locked", op.key));
+        return {
+          state: withFocus(next, op),
+          summary: `Locked ${label}${newKey ? ` with the ${newKey}` : ""}.`,
+          changed: true,
+        };
+      }
+      // unlock-door
+      if (doorState !== "locked") {
+        return {
+          state,
+          summary: `${label.charAt(0).toUpperCase() + label.slice(1)} isn't locked${doorState === "open" ? " — it's open" : ""}.`,
+          changed: false,
+        };
+      }
+      if (op.key && key && op.key !== key && op.key !== "pick the lock" && op.key !== "force it") {
+        throw new Error(
+          `${label.charAt(0).toUpperCase() + label.slice(1)} is locked with the ${key}, not the ${op.key}.`,
+        );
+      }
+      const next = replaceDoor(state, room, door, withDoorState(door, "closed"));
+      let summary: string;
+      if (op.key === "pick the lock") summary = `Picked the lock on ${label}.`;
+      else if (op.key === "force it") summary = `Forced ${label}.`;
+      else if (op.key) summary = `Unlocked ${label} with the ${op.key}.`;
+      else summary = `Unlocked ${label}${key ? ` (the ${key})` : ""}.`;
+      return {
+        state: withFocus(next, op),
+        summary,
         changed: true,
       };
     }
@@ -1520,14 +1938,23 @@ export function diffSummary(before: DungeonSpec, after: DungeonSpec): string[] {
     if (old.gridW !== room.gridW || old.gridH !== room.gridH) {
       lines.push(`${room.name}: ${old.gridW}×${old.gridH} → ${room.gridW}×${room.gridH}`);
     }
-    const doorKey = (d: DoorSpec) => `${d.wall}:${d.at}${d.secret ? ":secret" : ""}`;
+    const doorKey = (d: DoorSpec) => {
+      const st = doorStateOf(d);
+      const key = doorKeyOf(d);
+      return `${d.wall}:${d.at}${d.secret ? ":secret" : ""}${st !== "closed" ? `:${st}` : ""}${key ? `:${key}` : ""}`;
+    };
+    const doorDesc = (d: DoorSpec) => {
+      const st = doorStateOf(d);
+      const key = doorKeyOf(d);
+      return `${d.secret ? "secret " : ""}door ${d.wall}@${d.at}${st !== "closed" ? ` (${st}${key ? `, ${key}` : ""})` : ""}`;
+    };
     const oldDoors = new Set((old.doors ?? []).map(doorKey));
     const newDoors = new Set((room.doors ?? []).map(doorKey));
     for (const d of room.doors ?? []) {
-      if (!oldDoors.has(doorKey(d))) lines.push(`+ ${d.secret ? "secret " : ""}door ${d.wall}@${d.at} in ${room.name}`);
+      if (!oldDoors.has(doorKey(d))) lines.push(`+ ${doorDesc(d)} in ${room.name}`);
     }
     for (const d of old.doors ?? []) {
-      if (!newDoors.has(doorKey(d))) lines.push(`- door ${d.wall}@${d.at} in ${room.name}`);
+      if (!newDoors.has(doorKey(d))) lines.push(`- ${doorDesc(d)} in ${room.name}`);
     }
     const count = (label: string, a?: unknown[], b?: unknown[]) => {
       if ((a?.length ?? 0) !== (b?.length ?? 0)) {
@@ -1555,7 +1982,10 @@ export function formatBuildLine(summary: string, op: BuildOp): string {
   const icon =
     op.type === "create-room" ? "🏰"
     : op.type === "widen" ? "↔️"
-    : op.type === "add-door" || op.type === "move-door" ? "🚪"
+    : op.type === "add-door" || op.type === "move-door" ||
+      op.type === "open-door" || op.type === "close-door" ||
+      op.type === "lock-door" || op.type === "unlock-door" ? "🚪"
+    : op.type === "listen-door" ? "👂"
     : op.type === "add-dressing" ? "✨"
     : op.type === "add-torches" ? "🕯️"
     : op.type === "add-fog" ? "🌫️"

@@ -127,6 +127,50 @@ def floor_tile(variant="plain", seed=7, pal=None):
     return fl
 
 
+# Shallow-water palette (FR-13, BRA-226): cold deep-blue water over
+# stone. The tint is uniform (tiling-safe); sheen pools and ripple
+# rings stay inset from the edges so tiles butt seamlessly.
+WATER_TINT = (36, 60, 78)
+WATER_SHEEN = (150, 182, 200)
+WATER_RIPPLE = (172, 202, 216)
+
+
+def wet_tile(variant="plain", dry_seed=7, water_seed=207, pal=None):
+    """100x100 wet floor tile: the same stone floor under shallow
+    water. The dry base is drawn with `dry_seed` — the same seed the
+    shipped dry tile uses, so the cracks/rubble sit in the same
+    places and the swap reads as the same floor, now wet — then water
+    is laid over it: a translucent deep-blue tint, soft sheen pools
+    and 1-2 ripple rings. `pal` selects the theme palette (default:
+    the dungeon palette)."""
+    pal = pal or DUNGEON_FLOOR_PAL
+    base = floor_tile(variant, dry_seed, pal).convert("RGBA")
+    # Uniform water tint: darkens and cools the stone evenly, so the
+    # tile still butts seamlessly with its neighbours.
+    tint = Image.new("RGBA", (100, 100), WATER_TINT + (96,))
+    wet = Image.alpha_composite(base, tint)
+    # Soft sheen pools: pale reflections, blurred, inset from the
+    # edges (nothing crosses a tile boundary).
+    random.seed(water_seed)
+    sheen = Image.new("RGBA", (100, 100), (0, 0, 0, 0))
+    sd = ImageDraw.Draw(sheen)
+    for _ in range(3):
+        cx, cy = random.randint(24, 76), random.randint(24, 76)
+        rx, ry = random.randint(10, 20), random.randint(6, 12)
+        sd.ellipse([cx - rx, cy - ry, cx + rx, cy + ry],
+                   fill=WATER_SHEEN + (52,))
+    sheen = sheen.filter(ImageFilter.GaussianBlur(5))
+    wet = Image.alpha_composite(wet, sheen)
+    # Ripple rings: 1-2 thin pale arcs, also inset.
+    rd = ImageDraw.Draw(wet)
+    for _ in range(random.randint(1, 2)):
+        cx, cy = random.randint(26, 74), random.randint(26, 74)
+        rx, ry = random.randint(8, 16), random.randint(5, 10)
+        rd.ellipse([cx - rx, cy - ry, cx + rx, cy + ry],
+                   outline=WATER_RIPPLE + (85,), width=2)
+    return wet.convert("RGB")
+
+
 # ---------------------------------------------------------------- walls
 
 def _wall_band(d, x0, y0, x1, y1, seed):
@@ -554,6 +598,25 @@ WESTERN_PACK = [
      ["dust", "atmosphere", "dense", "western"]),
 ]
 
+# Wet-variant floor tiles (FR-13, BRA-226): the dungeon floors under
+# shallow water, for regional overlays ("make this part of the maze
+# partially underwater"). Each wet tile is built on its dry twin's
+# seed, so the swap reads as the same floor, flooded. Same sizes and
+# layers as the dry floors, so the composer treats them identically.
+# No western wet tiles yet: floor-sand has no wet variant, and the
+# wetOverlay helper (tiles-layout.ts) fails loudly on it rather than
+# mapping sand to dungeon wet stone.
+WET_PACK = [
+    ("floor-wet", lambda: wet_tile("plain", 7, 207), 100, "floor",
+     ["floor", "stone", "wet"]),
+    ("floor-wet-cracked", lambda: wet_tile("cracked", 8, 208), 100, "floor",
+     ["floor", "stone", "cracked", "wet"]),
+    ("floor-wet-rubble", lambda: wet_tile("rubble", 9, 209), 100, "floor",
+     ["floor", "stone", "rubble", "wet"]),
+    ("floor-wet-dark", lambda: wet_tile("dark", 10, 210), 100, "floor",
+     ["floor", "stone", "dark", "deep", "wet"]),
+]
+
 # Pieces that genuinely need AI art. The three gaps (skeleton, chest,
 # altar) were closed Nov 20: art generated on flat magenta, cut out to
 # transparent PNGs by cutout.py (chroma-key + soft edge), canonical cut
@@ -616,6 +679,18 @@ def build_pack():
             "tags": tags,
         })
         print(f"wrote pack/{fname} ({size}x{size}, {layer}, western)")
+    for name, fn, size, layer, tags in WET_PACK:
+        img = fn()
+        fname = f"{name}.png"
+        img.save(os.path.join(PACK_DIR, fname))
+        entries.append({
+            "name": name,
+            "file": f"pack/{fname}",
+            "sizePx": size,
+            "layer": layer,
+            "tags": tags,
+        })
+        print(f"wrote pack/{fname} ({size}x{size}, {layer}, wet)")
     manifest = {
         "version": 1,
         "tilePx": 100,
@@ -715,11 +790,37 @@ def preview_western():
     print(f"wrote pack-preview-western.png (6x6 western sample room)")
 
 
+def preview_wet():
+    """A 6x6 sample room split dry/wet: the left 3 columns are the dry
+    dungeon floors, the right 3 the same variants under water — the
+    exact before/after an FR-13 wet overlay produces. A visual check
+    that the wet tiles read as the same floor, flooded."""
+    from PIL import Image as _Image
+    pack = {name: fn() for name, fn, _, _, _ in PACK}
+    wet = {name: fn() for name, fn, _, _, _ in WET_PACK}
+    W = H = 600
+    room = _Image.new("RGBA", (W, H), (5, 5, 8, 255))
+    random.seed(3)
+    variants = ["plain"] * 5 + ["cracked"] * 2 + ["rubble"] + ["dark"] * 2
+    for gy in range(6):
+        for gx in range(3):
+            v = random.choice(variants)
+            dry_key = "floor-plain" if v == "plain" else f"floor-{v}"
+            wet_key = "floor-wet" if v == "plain" else f"floor-wet-{v}"
+            room.paste(pack[dry_key].convert("RGBA"), (gx * 100, gy * 100))
+            room.paste(wet[wet_key].convert("RGBA"),
+                       ((gx + 3) * 100, gy * 100))
+    out = os.path.join(TILES_DIR, "pack-preview-wet.png")
+    room.save(out)
+    print(f"wrote pack-preview-wet.png (6x6 dry/wet sample room)")
+
+
 if __name__ == "__main__":
     import sys
     if "--preview" in sys.argv:
         build_pack()
         preview()
         preview_western()
+        preview_wet()
     else:
         build_pack()

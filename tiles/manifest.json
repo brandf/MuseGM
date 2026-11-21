@@ -326,6 +326,54 @@
         "dense",
         "western"
       ]
+    },
+    {
+      "name": "floor-wet",
+      "file": "pack/floor-wet.png",
+      "sizePx": 100,
+      "layer": "floor",
+      "tags": [
+        "floor",
+        "stone",
+        "wet"
+      ]
+    },
+    {
+      "name": "floor-wet-cracked",
+      "file": "pack/floor-wet-cracked.png",
+      "sizePx": 100,
+      "layer": "floor",
+      "tags": [
+        "floor",
+        "stone",
+        "cracked",
+        "wet"
+      ]
+    },
+    {
+      "name": "floor-wet-rubble",
+      "file": "pack/floor-wet-rubble.png",
+      "sizePx": 100,
+      "layer": "floor",
+      "tags": [
+        "floor",
+        "stone",
+        "rubble",
+        "wet"
+      ]
+    },
+    {
+      "name": "floor-wet-dark",
+      "file": "pack/floor-wet-dark.png",
+      "sizePx": 100,
+      "layer": "floor",
+      "tags": [
+        "floor",
+        "stone",
+        "dark",
+        "deep",
+        "wet"
+      ]
     }
   ],
   "gaps": []

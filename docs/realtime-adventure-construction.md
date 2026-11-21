@@ -384,11 +384,7 @@ _id / cell, non-empty target) + timeline-player execution (updates
 (`tests/cutscene.test.ts`, `tile-ops.ts`). The overlay half is built
 too: `applyOverlay` in `tiles-layout.ts` (pure spec edit; the composer
 remaps floor tiles inside the region only, later overlays win) +
-`tests/maze.test.ts` (region-only, 1:1 variants, later-wins). The
-variant set today is the existing floor tiles (plain -> dark reads as
-waterlogged); real wet-variant tiles (floor-wet) are a later pack
-addition. Note: a cell address only resolves when the connection's tile
-cache carries tiles — the vendored client does not track Tile documents,
+`tests/maze.test.ts` (region-only, 1:1 variants, later-wins). Wet-variant tiles are built (BRA-226, Nov 20): floor-wet + cracked/rubble/dark variants in the pack, `wetOverlay`/`applyWetOverlay` in tiles-layout.ts; live test pending. Note: a cell address only resolves when the connection's tile cache carries tiles — the vendored client does not track Tile documents,
 so the _id path is the reliable one (buildTileRoom returns the tile ids).
 
 ### FR-14 — Value-budgeted treasure with stories (not generic loot)

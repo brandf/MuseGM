@@ -389,7 +389,10 @@ describe("applyOverlay (FR-13)", () => {
     expect(() => applyOverlay(hallSpec, { gx: 1, gy: 1, w: 2, h: 2, variants: {} })).toThrow();
   });
   it("rejects unknown variant tiles at layout time (applyOverlay is pack-agnostic)", () => {
-    const spec = applyOverlay(hallSpec, { gx: 1, gy: 1, w: 2, h: 2, variants: { "floor-plain": "floor-wet" } });
+    // floor-wet used to be the unknown name here; BRA-226 added it to
+    // the pack, so the unknown tile is now floor-lava. The wet case is
+    // covered in tests/floor-wet.test.ts.
+    const spec = applyOverlay(hallSpec, { gx: 1, gy: 1, w: 2, h: 2, variants: { "floor-plain": "floor-lava" } });
     expect(() => layoutRoom(spec, pack, BASE)).toThrow(/not in the pack/);
   });
   it("does not mutate the input spec", () => {

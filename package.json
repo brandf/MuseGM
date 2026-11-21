@@ -37,7 +37,8 @@
     "questlog": "bun run src/cli/questlog.ts",
     "chronicle": "bun run src/cli/chronicle.ts",
     "clocks": "bun run src/cli/clocks.ts",
-    "scoreboard": "bun run src/cli/scoreboard.ts"
+    "scoreboard": "bun run src/cli/scoreboard.ts",
+    "vehicles": "bun run src/cli/vehicles.ts"
   },
   "type": "module",
   "version": "0.1.0",

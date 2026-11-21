@@ -1369,6 +1369,64 @@ export function applyOverlay(spec: RoomSpec, overlay: FloorOverlay): RoomSpec {
   return { ...spec, overlays: [...(spec.overlays ?? []), overlay] };
 }
 
+/**
+ * The canonical wet-variant map (FR-13, BRA-226): every dungeon floor
+ * tile and the wet tile that replaces it when a region goes
+ * underwater. Wet tiles are real pack tiles
+ * (tiles/procedural/generate_tiles.py, WET_PACK) — the wet variant of
+ * a floor is the same stone under shallow water, so a wet region reads
+ * as the same room, flooded, not a different floor.
+ */
+export const WET_VARIANTS: Record<string, string> = {
+  "floor-plain": "floor-wet",
+  "floor-cracked": "floor-wet-cracked",
+  "floor-rubble": "floor-wet-rubble",
+  "floor-dark": "floor-wet-dark",
+};
+
+/**
+ * Build a wet-region overlay (FR-13): the given rectangular region
+ * goes underwater. `bases` defaults to every dungeon floor — a cell
+ * whose floor is not a listed base keeps its tile. An unknown base
+ * throws, listing the bases that have wet variants: a western room
+ * (floor-sand) has no wet tiles yet, and wetting it must fail loudly
+ * instead of mapping sand to dungeon wet stone or silently leaving
+ * it dry.
+ */
+export function wetOverlay(gx: number, gy: number, w: number, h: number, bases?: string[]): FloorOverlay {
+  const wanted = bases ?? Object.keys(WET_VARIANTS);
+  if (wanted.length === 0) {
+    throw new Error("wetOverlay needs at least one base floor tile.");
+  }
+  const variants: Record<string, string> = {};
+  for (const base of wanted) {
+    const wet = WET_VARIANTS[base];
+    if (!wet) {
+      throw new Error(
+        `No wet variant for "${base}" — wet variants exist for: ${Object.keys(WET_VARIANTS).join(", ")}.`,
+      );
+    }
+    variants[base] = wet;
+  }
+  return { gx, gy, w, h, variants };
+}
+
+/**
+ * Apply a wet-region overlay to a room spec (FR-13): the region goes
+ * underwater, the rest of the room is untouched. Pure spec edit — the
+ * composer applies it at layout time; later overlays win.
+ */
+export function applyWetOverlay(
+  spec: RoomSpec,
+  gx: number,
+  gy: number,
+  w: number,
+  h: number,
+  bases?: string[],
+): RoomSpec {
+  return applyOverlay(spec, wetOverlay(gx, gy, w, h, bases));
+}
+
 // ---------------------------------------------------------------------------
 // Props (FR-6): the room's dressing placements, as addressable data.
 // ---------------------------------------------------------------------------

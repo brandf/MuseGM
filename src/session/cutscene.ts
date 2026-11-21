@@ -12,8 +12,9 @@
  *
  * A cutscene script is a versioned JSON object:
  *   { version: 1, name, sceneId?, steps: [...] }
- * Steps are SequenceSteps plus one intent step, `formation`, which
- * expands at play time into concrete place/move/face/prop steps.
+ * Steps are SequenceSteps plus intent steps (`formation`, `rush`,
+ * `emerge`, `move-vehicle`), which expand at play time into
+ * concrete place/move/face/prop steps.
  * `sceneId` at the top level is the default for steps that omit it.
  *
  * Validation is strict and loud: an unknown step kind, a missing
@@ -29,6 +30,8 @@ import { ringPositions, linePositions, wedgePositions } from "./formations.js";
 import type { Point } from "./formations.js";
 import { resolveToken } from "./movement.js";
 import { validateReveal } from "./reveal.js";
+import type { Vehicle } from "./vehicles.js";
+import { advanceVehicle, vehicleTokenPositions, CELL_PX } from "./vehicles.js";
 
 export interface FormationStep {
   kind: "formation";
@@ -105,7 +108,18 @@ export interface EmergeStep {
   sceneId?: string;
 }
 
-export type CutsceneStep = SequenceStep | FormationStep | RushStep | EmergeStep;
+export interface VehicleMoveStep {
+  kind: "move-vehicle";
+  /** Vehicle id — resolved from the vehicles passed to expandCutscene. */
+  vehicle: string;
+  /** Rounds to advance. Default 1. */
+  rounds?: number;
+  /** Glide speed (px/s) for the emitted move steps. */
+  speed?: number;
+  sceneId?: string;
+}
+
+export type CutsceneStep = SequenceStep | FormationStep | RushStep | EmergeStep | VehicleMoveStep;
 
 export interface CutsceneScript {
   version: 1;
@@ -127,7 +141,7 @@ const SEQUENCE_KINDS = new Set([
  * their positions are coordinates; a token-resolved position needs
  * the `centerOf` resolver (playCutscene supplies it).
  */
-const INTENT_KINDS = new Set(["formation", "rush", "emerge"]);
+const INTENT_KINDS = new Set(["formation", "rush", "emerge", "move-vehicle"]);
 
 const STEP_FIELDS: Record<string, Set<string>> = {
   place: new Set(["kind", "sceneId", "actor", "x", "y", "name", "key", "note"]),
@@ -154,6 +168,7 @@ const STEP_FIELDS: Record<string, Set<string>> = {
   lightsOut: new Set(["kind", "sceneId", "durationMs", "steps", "note"]),
   breakWall: new Set(["kind", "wallId", "at", "rubble", "sceneId", "note"]),
   emerge: new Set(["kind", "fromToken", "actor", "name", "at", "sceneId", "note"]),
+  "move-vehicle": new Set(["kind", "vehicle", "rounds", "speed", "sceneId", "note"]),
 };
 
 function isRecord(v: unknown): v is Record<string, unknown> {
@@ -491,6 +506,11 @@ export function validateCutscene(
           errors.push(`Step ${i} (emerge): "at" must be {x, y}.`);
         }
         break;
+      case "move-vehicle":
+        strField(errors, raw, i, "vehicle", true);
+        numField(errors, raw, i, "rounds", { min: 1, integer: true });
+        numField(errors, raw, i, "speed", { min: 1 });
+        break;
     }
   }
   if (errors.length > 0) return { ok: false, errors };
@@ -504,6 +524,11 @@ export interface ExpandOptions {
    * without one, token centers are an error at expansion time.
    */
   centerOf?: (token: string, sceneId: string) => Point;
+  /**
+   * Vehicle snapshots by id, for move-vehicle steps. Without one,
+   * a move-vehicle step is an error at expansion time.
+   */
+  vehicles?: Record<string, Vehicle>;
 }
 
 /**
@@ -533,6 +558,10 @@ export function expandCutscene(
     }
     if (step.kind === "emerge") {
       out.push(...expandEmerge(script, step, i, opts.centerOf));
+      continue;
+    }
+    if (step.kind === "move-vehicle") {
+      out.push(...expandVehicleMove(script, step, i, opts.vehicles).steps);
       continue;
     }
     const s = { ...step } as Record<string, unknown>;
@@ -638,6 +667,82 @@ function expandEmerge(
       key: `cutscene:${script.name}:emerge-${index}-from-${slug}`,
     },
   ];
+}
+
+export interface ExpandVehicleMoveResult {
+  steps: SequenceStep[];
+  /**
+   * The vehicle after the advance. Expansion moves the tokens — it
+   * does NOT persist the new state. The caller (monitor/autopilot)
+   * must save this vehicle, or the next expansion will advance the
+   * same snapshot again.
+   */
+  vehicle: Vehicle;
+}
+
+/**
+ * Expand a move-vehicle intent: advance the vehicle by `rounds`
+ * rounds, then emit one `move` step per token the advance shifted
+ * (the lead token, riders, escorts) plus a `chat` step for a
+ * deadline that fired or an arrival. Pure — it works off the
+ * vehicle snapshot passed in, so --validate-only expands it.
+ */
+export function expandVehicleMove(
+  script: CutsceneScript,
+  step: VehicleMoveStep,
+  index: number,
+  vehicles?: Record<string, Vehicle>,
+): ExpandVehicleMoveResult {
+  const sceneId = step.sceneId ?? script.sceneId;
+  if (!sceneId) {
+    throw new Error(`Move-vehicle step ${index}: no sceneId (set it on the step or the script).`);
+  }
+  if (!vehicles) {
+    throw new Error(
+      `Move-vehicle step ${index}: no vehicles passed to expandCutscene — pass a {id: vehicle} snapshot.`,
+    );
+  }
+  const vehicle = vehicles[step.vehicle];
+  if (!vehicle) {
+    const known = Object.keys(vehicles);
+    throw new Error(
+      `Move-vehicle step ${index}: unknown vehicle ${JSON.stringify(step.vehicle)}` +
+        (known.length > 0 ? ` (known: ${known.join(", ")})` : " (no vehicles passed)") +
+        `.`,
+    );
+  }
+  const before = vehicleTokenPositions(vehicle);
+  const advanced = advanceVehicle(vehicle, {
+    rounds: step.rounds ?? 1,
+    source: `cutscene:${script.name}:move-vehicle-${index}`,
+  });
+  const out: SequenceStep[] = [];
+  for (const pos of vehicleTokenPositions(advanced.vehicle)) {
+    const prev = before.find((b) => b.tokenId === pos.tokenId);
+    if (prev && Math.abs(prev.x - pos.x) < 0.01 && Math.abs(prev.y - pos.y) < 0.01) continue;
+    out.push({
+      kind: "move",
+      sceneId,
+      token: pos.tokenId,
+      x: Math.round(pos.x * CELL_PX),
+      y: Math.round(pos.y * CELL_PX),
+      speed: step.speed,
+    });
+  }
+  for (const event of advanced.events) {
+    if (event.type === "deadline") {
+      out.push({
+        kind: "chat",
+        content: `🚂 ${advanced.vehicle.name} reaches ${event.name} — ${event.consequence}`,
+      });
+    } else if (event.type === "arrived") {
+      out.push({
+        kind: "chat",
+        content: `🚂 ${advanced.vehicle.name} has reached the end of the line.`,
+      });
+    }
+  }
+  return { steps: out, vehicle: advanced.vehicle };
 }
 
 function expandFormation(

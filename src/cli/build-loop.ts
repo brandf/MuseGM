@@ -83,6 +83,14 @@ const DEMO_LINES = [
   "add some bones",
   "undo that",
   "redo that",
+  // Door verbs (BRA-234): lock the secret north door with a key, listen
+  // at the unlinked south door, fail to open the locked door, unlock it
+  // with the key, open it.
+  "lock the secret north door with the brass key",
+  "listen at the south door",
+  "open the secret north door",
+  "unlock the secret north door with the brass key",
+  "open the secret north door",
 ];
 
 const SERVER_BASE = "worlds/testbed";

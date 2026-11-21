@@ -31,6 +31,13 @@
  *   or cursor. The session persists to a state file after each build,
  *   so a restart keeps the dungeon and the rooms already built. The
  *   loop never guesses a position and never hallucinates a build.
+ *   Door verbs (BRA-234) ride the same branch — open/close/lock/
+ *   unlock/listen are build ops, so "lock the south door" parses as
+ *   a build, executes through the executor, and posts one line; a
+ *   listen is a read (changed: false), so it posts its hint and
+ *   touches nothing. No separate message class: classifyMessage
+ *   returns "build" for a door verb, "clarify" when the door is
+ *   ambiguous, exactly like any other build request.
  * - GM whispers (BRA-185, FR-18): a whisper from the GM to Meroki is
  *   an instruction, not table chatter. An embedded cutscene script or
  *   a named sequence ("mice and the ogre") is validated with the
