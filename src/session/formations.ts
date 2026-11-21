@@ -42,6 +42,22 @@ export function angleToFace(from: Point, to: Point): number {
 }
 
 /**
+ * The screen angle from `from` toward `to`: 0 = east, clockwise in
+ * screen coordinates (y down), raw atan2 range (-180, 180]. This is
+ * the encounter-gen `Placement` convention — NOT Foundry token
+ * rotation (see angleToFace). It lives here so both formation users
+ * share one angle implementation instead of each keeping a local
+ * copy; the formula is the raw atan2 (not a conversion from
+ * angleToFace) because encounter-gen's demo output pins these numbers
+ * exactly, and a round-trip through the north convention would change
+ * the last bits. The live rotation convention is still unverified
+ * either way — see the Placement doc in encounter-gen.ts.
+ */
+export function angleToEast(from: Point, to: Point): number {
+  return (Math.atan2(to.y - from.y, to.x - from.x) * 180) / Math.PI;
+}
+
+/**
  * N positions evenly spaced on a circle of `radius` around `center`,
  * each facing the center. Position 0 is at the top (north) by default;
  * `startAngleDeg` rotates the whole ring (degrees, same convention).
@@ -103,13 +119,16 @@ export function linePositions(
  * between the two arms and `spacing` px between ranks. Rank 0 is the
  * apex; each later rank adds one position per arm, so a wedge of
  * count N fills ranks until N positions exist. Every position faces
- * `directionDeg` (the wedge advances that way).
+ * `directionDeg` (the wedge advances that way). `armOrder` picks
+ * which arm fills first within a rank — "left-first" (default) is
+ * the cutscene convention; "right-first" is the encounter-gen legacy
+ * wedge, which filled the +perpendicular arm first.
  */
 export function wedgePositions(
   count: number,
   apex: Point,
   directionDeg: number,
-  opts: { spreadDeg?: number; spacing?: number } = {},
+  opts: { spreadDeg?: number; spacing?: number; armOrder?: "left-first" | "right-first" } = {},
 ): FormationPosition[] {
   if (!Number.isInteger(count) || count < 1) {
     throw new Error(`wedge: count must be an integer >= 1, got ${count}`);
@@ -121,6 +140,9 @@ export function wedgePositions(
   }
   if (!(spacing > 0) || !Number.isFinite(spacing)) {
     throw new Error(`wedge: spacing must be a positive number, got ${spacing}`);
+  }
+  if (opts.armOrder !== undefined && opts.armOrder !== "left-first" && opts.armOrder !== "right-first") {
+    throw new Error(`wedge: armOrder must be "left-first" or "right-first", got ${opts.armOrder}`);
   }
   const dir = (directionDeg * Math.PI) / 180;
   const half = (spread / 2) * (Math.PI / 180);
@@ -135,9 +157,10 @@ export function wedgePositions(
   const right = arm(1);
   const facingDeg = normalizeAngle(directionDeg);
   const out: FormationPosition[] = [{ x: apex.x, y: apex.y, facingDeg }];
+  const arms = opts.armOrder === "right-first" ? [right, left] : [left, right];
   let rank = 1;
   while (out.length < count) {
-    for (const vec of [left, right]) {
+    for (const vec of arms) {
       if (out.length >= count) break;
       out.push({
         x: Math.round(apex.x + vec.x * spacing * rank),

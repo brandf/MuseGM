@@ -35,16 +35,24 @@
  * contains no proper nouns at all. It never invents plot facts. With no
  * context it is explicitly labeled generic.
  *
- * FORMATIONS: the ring/line/wedge helpers here are local and small. The
- * cutscene builder (FR-5) is writing formation helpers of its own in
- * src/session/cutscene.ts — when it lands, these two should merge into
- * one shared module. Do not "fix" the duplication by importing a file
- * that does not exist yet.
+ * FORMATIONS: the ring/line/wedge geometry lives in the shared module
+ * src/session/formations.ts (BRA-201 merged the local copies into it).
+ * formationPositions below is a thin adapter: shared positions plus
+ * this module's own facing convention (screen angle, 0 = east — see
+ * angleToEast in formations.ts), preserved exactly because the demo
+ * output pins those numbers.
  */
 import type { FoundryLive } from "../live.js";
 import { rngFromSeed } from "./loot.js";
 import { buildEncounter } from "./encounter.js";
 import { moveTokenTo } from "./movement.js";
+import {
+  ringPositions,
+  linePositions,
+  wedgePositions,
+  angleToFace,
+  angleToEast,
+} from "./formations.js";
 
 // ---------------------------------------------------------------- types
 
@@ -518,57 +526,84 @@ export function buildBackstory(
   return { text: sentences.join(" "), personality, generic: true };
 }
 
-// ---------------------------------------------------------------- formations (local — merge with cutscene.ts helpers when they land)
-
-/** Angle in degrees from (x, y) toward (tx, ty). 0 = east, clockwise in screen coordinates (y down). Convention to verify live. */
-export function angleTo(x: number, y: number, tx: number, ty: number): number {
-  return (Math.atan2(ty - y, tx - x) * 180) / Math.PI;
-}
+// ---------------------------------------------------------------- formations (shared — src/session/formations.ts)
 
 /**
- * Positions for a formation. Ring: evenly spaced around the center, all
- * facing it. Line: a row starting at the center, facing the focus.
- * Wedge: a V opening toward the focus, point at the center.
+ * Positions for a formation, via the shared geometry in
+ * src/session/formations.ts (BRA-201 merged the local copies into it).
+ *
+ * The POSITIONS come from the shared helpers; the FACING stays in this
+ * module's own convention — screen angle, 0 = east, clockwise, raw
+ * atan2 range (-180, 180] (angleToEast) — because the demo output and
+ * tests pin those numbers exactly, and Foundry token rotation (0 =
+ * north, angleToFace) is a different convention that is still
+ * unverified live. Do not "fix" the facing by switching conventions;
+ * that changes every generated encounter's JSON.
+ *
+ * Shape notes (all preserved exactly from the old locals):
+ * - Ring: shared ringPositions (same start angle, same rounding).
+ * - Line: a horizontal row centered on `center`; shared linePositions
+ *   over the row's endpoints reproduces it exactly (the endpoints are
+ *   the same rounded values the old code started from).
+ * - Wedge: point at the center, arms opening away from the focus at
+ *   ±45° (spread 90°), one rank per `spacing` along the diagonal —
+ *   which is `spacing * √2` along each arm in wedgePositions terms —
+ *   right arm first, every member facing the focus. With no focus the
+ *   old code collapsed every position onto the center (facing 0);
+ *   that degenerate case is preserved, not "fixed".
+ *
+ * One intentional divergence: the old wedge silently mirrored itself
+ * for a negative spacing and produced NaN positions for a NaN one.
+ * wedgePositions validates its spacing now, so those inputs throw a
+ * clear error instead. Spacing 0 still collapses onto the center,
+ * exactly as before.
  */
 export function formationPositions(formation: FormationSpec, count: number): Placement[] {
   const { center } = formation;
   const focus = formation.focus ?? center;
-  const out: Placement[] = [];
   if (formation.type === "ring") {
     const radius = formation.radius ?? 300;
-    for (let i = 0; i < count; i++) {
-      const a = -Math.PI / 2 + (i * 2 * Math.PI) / count;
-      const x = Math.round(center.x + radius * Math.cos(a));
-      const y = Math.round(center.y + radius * Math.sin(a));
-      out.push({ name: "", x, y, facing: angleTo(x, y, center.x, center.y) });
-    }
-    return out;
+    return ringPositions(count, center, radius).map((p) => ({
+      name: "",
+      x: p.x,
+      y: p.y,
+      facing: angleToEast(p, center),
+    }));
   }
   const spacing = formation.spacing ?? 100;
   if (formation.type === "line") {
-    const startX = Math.round(center.x - ((count - 1) * spacing) / 2);
-    for (let i = 0; i < count; i++) {
-      const x = startX + i * spacing;
-      out.push({ name: "", x, y: center.y, facing: angleTo(x, center.y, focus.x, focus.y) });
-    }
-    return out;
+    const half = ((count - 1) * spacing) / 2;
+    const from = { x: Math.round(center.x - half), y: center.y };
+    const to = { x: Math.round(center.x + half), y: center.y };
+    return linePositions(count, from, to).map((p) => ({
+      name: "",
+      x: p.x,
+      y: p.y,
+      facing: angleToEast(p, focus),
+    }));
   }
-  // Wedge: point at the center, arms opening away from the focus.
-  const dx = center.x - focus.x;
-  const dy = center.y - focus.y;
-  const len = Math.hypot(dx, dy) || 1;
-  const ux = dx / len;
-  const uy = dy / len;
-  const px = -uy;
-  const py = ux;
-  for (let i = 0; i < count; i++) {
-    const rank = Math.ceil(i / 2);
-    const side = i % 2 === 0 ? -1 : 1;
-    const x = Math.round(center.x + ux * rank * spacing + px * side * rank * spacing);
-    const y = Math.round(center.y + uy * rank * spacing + py * side * rank * spacing);
-    out.push({ name: "", x, y, facing: angleTo(x, y, focus.x, focus.y) });
+  // Wedge.
+  if (focus.x === center.x && focus.y === center.y) {
+    // Legacy degenerate case: no focus means no direction — every
+    // position collapses onto the center, facing 0 (atan2(0, 0)).
+    return Array.from({ length: count }, () => ({ name: "", x: center.x, y: center.y, facing: 0 }));
   }
-  return out;
+  if (spacing === 0) {
+    // Legacy: zero spacing collapses the wedge onto the center.
+    const facing = angleToEast(center, focus);
+    return Array.from({ length: count }, () => ({ name: "", x: center.x, y: center.y, facing }));
+  }
+  const directionDeg = angleToFace(focus, center);
+  return wedgePositions(count, center, directionDeg, {
+    spreadDeg: 90,
+    spacing: spacing * Math.SQRT2,
+    armOrder: "right-first",
+  }).map((p) => ({
+    name: "",
+    x: p.x,
+    y: p.y,
+    facing: angleToEast(p, focus),
+  }));
 }
 
 // ---------------------------------------------------------------- generation (pure)

@@ -89,10 +89,7 @@ seconds. A room spec references a theme; re-skin is a pack swap.
 **Acceptance:** a built room re-skinned in under 10 seconds of
 execution; the layout (walls, doors, links) is unchanged, only the look.
 
-**Status:** not built. Needs themed packs (gothic, crypt, tavern,
-forest…) and a `theme` parameter on the room spec + composer. The base
-pack is the template; each theme is a pack variant in the same STYLE.md
-language.
+**Status:** [~] built + unit-tested offline Nov 20 — `src/worldbuilding/themes.ts` (ThemeSpec + DUNGEON_THEME + WESTERN_THEME) with a `theme` parameter threaded through the room spec, the composer, and the builders; pack now 29 tiles (10 western: sandstone floors, wood-plank walls, dust). Live test pending: upload the western tiles, build a western room, re-skin a dungeon room live. More themes (gothic, crypt, tavern, forest…) are one ThemeSpec + a generator variant each.
 
 ### FR-3 — Multi-floor + gated reveal
 
@@ -129,8 +126,7 @@ trigger system) and fires the linked script once, on entry.
 **Acceptance:** a zone defined in one message; fires exactly once on
 first entry; the creator can arm/disarm it.
 
-**Status:** trap & zone triggers built (step on it and it fires live).
-The zone→cutscene-script link is not yet built.
+**Status:** trap & zone triggers built (step on it and it fires live). [~] The zone→cutscene-script link is built + unit-tested offline Nov 20 — `src/session/zone-cutscene.ts` (strict zone-set validation, sceneId inheritance, `LinkArming` dedupe) + `TrapWatcher` plays the cutscene on entry + `bun run trap --zones <file> --plan` prints the trigger plan with no connection. Live test pending (trapdoor demo on TestBed). Deliberately NOT wired into the monitor — the trap CLI's watch is the live executor, and a second watcher would double-fire.
 
 ### FR-5 — Cutscene scripting + playback (the ambush)
 

@@ -1,24 +1,33 @@
 /**
  * trap CLI — watch zones and fire traps, or run a self-contained live demo.
  *
- * Watch zones from a JSON file (see src/session/traps.ts for the format):
+ * Watch zones from a JSON file (see src/session/traps.ts for the format;
+ * cutscene actions may name a script file — resolved and validated
+ * before watching, see src/session/zone-cutscene.ts):
  *   bun run src/cli/trap.ts --zones zones.json [--seconds 120]
  *   -> {"fires": [{zone, tokenId, tokenName, actorId, at}]}
+ *
+ * Validate a zones file offline — no connection, prints the trigger
+ * plan (one entry per cutscene-linked zone) and exits non-zero on any
+ * error:
+ *   bun run src/cli/trap.ts --zones zones.json --plan
  *
  * Live demo (creates a test token, moves it into a trap zone, verifies the
  * fire, then cleans up):
  *   bun run src/cli/trap.ts --demo
  *   -> {"fired": true, "token": "<id>", "hpBefore": 16, "hpAfter": 11, "chatId": "<id>"}
  *
- * LOG_LEVEL is forced to error before the library import so the vendored
- * client's info logs don't corrupt stdout (see wait.ts).
+ * Args are parsed (and --help / --plan handled) BEFORE the library is
+ * imported — importing live.js validates FOUNDRY_URL at import time,
+ * so the offline paths must never import it. LOG_LEVEL is forced to
+ * error before the library import so the vendored client's info logs
+ * don't corrupt stdout (see wait.ts).
  */
 export {};
 process.env.LOG_LEVEL ??= "error";
 import type { FoundryLive } from "../live.js";
-const { FoundryLive: LiveClient } = await import("../live.js");
-const { TrapWatcher } = await import("../session/traps.js");
 import * as fs from "node:fs";
+import * as nodePath from "node:path";
 
 function arg(name: string): string | undefined {
   const i = process.argv.indexOf(name);
@@ -28,7 +37,47 @@ function has(name: string): boolean {
   return process.argv.includes(name);
 }
 
+const USAGE =
+  "usage: trap --zones zones.json [--seconds 120] [--plan]\n" +
+  "       trap --demo\n" +
+  "       trap --help";
+
+/**
+ * Read + resolve + plan a zones file. Cutscene paths resolve against
+ * the zones file's own directory. Throws with every error listed.
+ */
+async function resolveZonesFile(zonesFile: string): Promise<{
+  zoneSet: import("../session/traps.js").ZoneSet;
+  plan: import("../session/zone-cutscene.js").ZoneCutscenePlanSet;
+}> {
+  const { resolveZoneSet, planZoneCutsceneSet } = await import("../session/zone-cutscene.js");
+  const parsed: unknown = JSON.parse(fs.readFileSync(zonesFile, "utf-8"));
+  const dir = nodePath.dirname(nodePath.resolve(zonesFile));
+  const resolved = resolveZoneSet(parsed, (p) => fs.readFileSync(nodePath.resolve(dir, p), "utf-8"));
+  if (!resolved.ok) {
+    throw new Error(`invalid zones file ${zonesFile}:\n- ${resolved.errors.join("\n- ")}`);
+  }
+  const planned = planZoneCutsceneSet(resolved.zoneSet);
+  if (!planned.ok) {
+    throw new Error(`cannot plan zones file ${zonesFile}:\n- ${planned.errors.join("\n- ")}`);
+  }
+  return { zoneSet: resolved.zoneSet, plan: planned.plan };
+}
+
 async function main(): Promise<void> {
+  if (has("--help")) {
+    process.stdout.write(USAGE + "\n");
+    return;
+  }
+  const zonesFile = arg("--zones");
+  if (has("--plan")) {
+    if (!zonesFile) throw new Error(USAGE);
+    const { plan } = await resolveZonesFile(zonesFile);
+    process.stdout.write(JSON.stringify({ ok: true, ...plan }, null, 2) + "\n");
+    return;
+  }
+  const { FoundryLive: LiveClient } = await import("../live.js");
+  const { TrapWatcher } = await import("../session/traps.js");
   const live = await LiveClient.connect();
   try {
     if (has("--demo")) {
@@ -36,9 +85,15 @@ async function main(): Promise<void> {
       process.stdout.write(JSON.stringify(out) + "\n");
       return;
     }
-    const zonesFile = arg("--zones");
-    if (!zonesFile) throw new Error("usage: --zones zones.json [--seconds 120] or --demo");
-    const zoneSet = JSON.parse(fs.readFileSync(zonesFile, "utf-8"));
+    if (!zonesFile) throw new Error(USAGE);
+    const { zoneSet, plan } = await resolveZonesFile(zonesFile);
+    const cutsceneLinks = plan.links.length;
+    process.stderr.write(
+      `trap: armed ${zoneSet.zones.length} zone(s) on scene ${zoneSet.sceneId}` +
+        (cutsceneLinks > 0
+          ? ` — ${cutsceneLinks} cutscene link(s): ${plan.links.map((l) => `${l.zone} -> ${l.cutsceneName} (${l.mode})`).join(", ")}\n`
+          : "\n"),
+    );
     const watcher = new TrapWatcher(live, zoneSet);
     const fires = await watcher.watch({ seconds: Number(arg("--seconds") ?? "120") });
     process.stdout.write(JSON.stringify({ fires }) + "\n");

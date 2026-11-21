@@ -12,6 +12,10 @@ export {};
  *   (turn / round / HP / AC / initiative / scene), pins, turn
  *   announcements. See src/session/monitor.ts for the rules — the
  *   monitor never invents stats or rolls.
+ * - A GM whisper to Meroki is an instruction, not chatter: an embedded
+ *   cutscene script or a named sequence ("mice and the ogre") is
+ *   validated and played; a whispered build or question is answered
+ *   back as a whisper. Anything else gets a whispered clarification.
  * - Open chat / requests / roleplay are logged as "needs-agent" on
  *   stderr and skipped. A human Muse can answer those from the log.
  *
@@ -54,7 +58,10 @@ if (has("--help") || has("-h")) {
       `history) and picks up open Meroki Pins dropped while it was offline.\n` +
       `Build requests in chat ("build an 8x6 room", "add a door", "undo\n` +
       `that") route to the build loop; ambiguous ones get a clarifying\n` +
-      `question in chat, out-of-scope ones get "I can't do that yet".\n`,
+      `question in chat, out-of-scope ones get "I can't do that yet".\n` +
+      `A GM whisper to Meroki is an instruction: paste a cutscene script\n` +
+      `or name a sequence ("mice and the ogre") and it plays; a whispered\n` +
+      `build or question is answered back as a whisper to the GM.\n`,
   );
   process.exit(0);
 }

@@ -13,9 +13,9 @@ import {
   livingKit,
   buildBackstory,
   formationPositions,
-  angleTo,
   NPC_ROLES,
 } from "../src/session/encounter-gen.js";
+import { angleToEast } from "../src/session/formations.js";
 import type { EncounterSpec, NpcRole, StoryContext } from "../src/session/encounter-gen.js";
 import { rngFromSeed } from "../src/session/loot.js";
 
@@ -237,7 +237,7 @@ describe("formations", () => {
       const dist = Math.hypot(p.x - 800, p.y - 800);
       expect(dist).toBeGreaterThanOrEqual(299);
       expect(dist).toBeLessThanOrEqual(301);
-      const expectedFacing = angleTo(p.x, p.y, 800, 800);
+      const expectedFacing = angleToEast({ x: p.x, y: p.y }, { x: 800, y: 800 });
       expect(Math.abs(p.facing - expectedFacing)).toBeLessThan(1);
     }
     const angles = positions.map((p) => Math.atan2(p.y - 800, p.x - 800)).sort((a, b) => a - b);
@@ -264,6 +264,60 @@ describe("formations", () => {
     expect(positions[0].y).toBe(800);
     // The arms go away from the focus (downward, y > 800) and spread sideways.
     for (const p of positions.slice(1)) expect(p.y).toBeGreaterThanOrEqual(800);
+  });
+
+  it("wedge matches the legacy positions and facings exactly (BRA-201 merge)", () => {
+    // Hardcoded from the pre-merge implementation — the merge must not
+    // move a single pixel or change a single facing number. This is
+    // the demo encounter's formation (wedge, 6 NPCs).
+    const positions = formationPositions(
+      { type: "wedge", center: { x: 800, y: 800 }, focus: { x: 800, y: 400 }, spacing: 100 },
+      6,
+    );
+    expect(positions).toEqual([
+      { name: "", x: 800, y: 800, facing: -90 },
+      { name: "", x: 700, y: 900, facing: -78.69006752597979 },
+      { name: "", x: 900, y: 900, facing: -101.30993247402021 },
+      { name: "", x: 600, y: 1000, facing: -71.56505117707799 },
+      { name: "", x: 1000, y: 1000, facing: -108.43494882292202 },
+      { name: "", x: 500, y: 1100, facing: -66.80140948635182 },
+    ]);
+  });
+
+  it("wedge with a diagonal focus matches the legacy geometry exactly", () => {
+    const positions = formationPositions(
+      { type: "wedge", center: { x: 800, y: 800 }, focus: { x: 900, y: 700 }, spacing: 100 },
+      5,
+    );
+    expect(positions).toEqual([
+      { name: "", x: 800, y: 800, facing: -45 },
+      { name: "", x: 659, y: 800, facing: -22.53540778705149 },
+      { name: "", x: 800, y: 941, facing: -67.46459221294852 },
+      { name: "", x: 517, y: 800, facing: -14.633052919155656 },
+      { name: "", x: 800, y: 1083, facing: -75.36694708084435 },
+    ]);
+  });
+
+  it("wedge with no focus collapses onto the center (legacy behavior, preserved)", () => {
+    const positions = formationPositions({ type: "wedge", center: { x: 800, y: 800 }, spacing: 100 }, 3);
+    expect(positions).toEqual([
+      { name: "", x: 800, y: 800, facing: 0 },
+      { name: "", x: 800, y: 800, facing: 0 },
+      { name: "", x: 800, y: 800, facing: 0 },
+    ]);
+  });
+
+  it("line with a focus faces each member at the focus", () => {
+    const positions = formationPositions(
+      { type: "line", center: { x: 800, y: 800 }, spacing: 100, focus: { x: 800, y: 400 } },
+      4,
+    );
+    expect(positions).toEqual([
+      { name: "", x: 650, y: 800, facing: -69.44395478041653 },
+      { name: "", x: 750, y: 800, facing: -82.87498365109819 },
+      { name: "", x: 850, y: 800, facing: -97.12501634890181 },
+      { name: "", x: 950, y: 800, facing: -110.55604521958347 },
+    ]);
   });
 });
 

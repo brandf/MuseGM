@@ -8,9 +8,11 @@
  * Scene shape for a tile room: the scene has NO background image — the
  * tiles ARE the map. The Level still exists (a scene with no Level will
  * not load at all — the Lich's Lair bug, Nov 19) and carries a plain
- * dark background colour, `background: { color: "#050508", src: null }`.
- * That colour-only background is a live-verification item: it is what an
- * empty scene's level looks like, but it has not been seen on screen yet.
+ * dark background colour from the room's theme
+ * (`background: { color: theme.backgroundColor, src: null }` — "#050508"
+ * for the dungeon baseline). That colour-only background is a
+ * live-verification item: it is what an empty scene's level looks like,
+ * but it has not been seen on screen yet.
  *
  * Caveats (all live-verification items, see BACKLOG.md):
  * - The vendored client's world cache does not track Tile documents
@@ -24,7 +26,8 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import type { FoundryLive } from "../live.js";
 import type { DungeonLayout, DungeonSpec, PackManifest, ResolvedDoorLink, RoomSpec, WallSide } from "./tiles-layout.js";
-import { ROOM_BACKGROUND_COLOR, TILE_PX, layoutDungeon, layoutRoom } from "./tiles-layout.js";
+import { TILE_PX, layoutDungeon, layoutRoom } from "./tiles-layout.js";
+import { resolveTheme, type ThemeSpec } from "./themes.js";
 import { addLights, addWalls } from "./index.js";
 import { deleteToken, placeToken, resolveToken } from "../session/movement.js";
 import { uploadImage } from "./upload.js";
@@ -44,14 +47,21 @@ export interface BuiltTileRoom {
  * The scene is NOT activated (the GM activates it when ready).
  * GM users are added as owners (role 4) so the DM can edit the scene —
  * the ownership gap that bit Lich's Lair (BACKLOG.md).
+ *
+ * @param theme an explicit theme (one-word name or ThemeSpec) — it
+ *   overrides `spec.theme`; with neither, the dungeon baseline.
+ *   The theme picks the floor/wall tiles, the fog remap, the torch
+ *   palette, and the Level background colour (FR-2).
  */
 export async function buildTileRoom(
   live: FoundryLive,
   spec: RoomSpec,
   pack: import("./tiles-layout.js").Pack,
   serverBase: string,
+  theme?: string | ThemeSpec,
 ): Promise<BuiltTileRoom> {
-  const layout = layoutRoom(spec, pack, serverBase);
+  const resolved = resolveTheme(theme ?? spec.theme);
+  const layout = layoutRoom(spec, pack, serverBase, resolved);
   const gms = live.getUsers().filter((u) => u.role === 4);
   const ownership: Record<string, number> = { default: 0 };
   for (const gm of gms) ownership[gm._id] = 3;
@@ -71,11 +81,12 @@ export async function buildTileRoom(
   if (!sceneId) throw new Error("Scene create returned no _id.");
 
   // v14: the map lives on a Level. A tile room has no background image,
-  // so the Level carries a plain dark colour instead of a src.
+  // so the Level carries a plain dark colour from the theme instead of
+  // a src.
   const levels = await live.modifyDocument("Level", "create", {
     data: [{
       name: spec.name,
-      background: { color: ROOM_BACKGROUND_COLOR, src: null, tint: "#ffffff", alphaThreshold: 0.75 },
+      background: { color: resolved.backgroundColor, src: null, tint: "#ffffff", alphaThreshold: 0.75 },
       foreground: { src: null, tint: "#ffffff", alphaThreshold: 0.75 },
       elevation: { top: 20, bottom: 0 },
       fog: { src: null },
@@ -113,6 +124,8 @@ export async function buildTileRoom(
  * lights (by the ids buildTileRoom returned — the caller keeps them, the
  * client's cache cannot re-derive them) and apply the new layout.
  * Changing gridW/gridH is all it takes; no new images are involved.
+ * A `theme` here re-skins the room at the same time (FR-2) — same
+ * layout, new look.
  */
 export async function rebuildTileRoom(
   live: FoundryLive,
@@ -121,7 +134,9 @@ export async function rebuildTileRoom(
   pack: import("./tiles-layout.js").Pack,
   serverBase: string,
   previous: { tileIds: string[]; wallIds: string[]; lightIds: string[] },
+  theme?: string | ThemeSpec,
 ): Promise<BuiltTileRoom> {
+  const resolved = resolveTheme(theme ?? spec.theme);
   const parentUuid = `Scene.${sceneId}`;
   if (previous.tileIds.length > 0) {
     await live.modifyDocument("Tile", "delete", { ids: previous.tileIds, parentUuid });
@@ -132,7 +147,7 @@ export async function rebuildTileRoom(
   if (previous.lightIds.length > 0) {
     await live.modifyDocument("AmbientLight", "delete", { ids: previous.lightIds, parentUuid });
   }
-  const layout = layoutRoom(spec, pack, serverBase);
+  const layout = layoutRoom(spec, pack, serverBase, resolved);
   await live.modifyDocument("Scene", "update", {
     updates: [{ _id: sceneId, width: layout.width, height: layout.height }],
   });
@@ -186,17 +201,20 @@ export interface BuiltDungeon {
  * the resolved door links. Scenes are NOT activated — the GM activates
  * the entry room when ready. Pure layout/validation happens first in
  * layoutDungeon, so a bad graph fails before any scene is created.
+ * A `theme` here re-skins every room that does not set its own
+ * (FR-2) — one call, whole dungeon, new look.
  */
 export async function buildDungeon(
   live: FoundryLive,
   spec: DungeonSpec,
   pack: import("./tiles-layout.js").Pack,
   serverBase: string,
+  theme?: string | ThemeSpec,
 ): Promise<BuiltDungeon> {
-  const dungeon: DungeonLayout = layoutDungeon(spec, pack, serverBase);
+  const dungeon: DungeonLayout = layoutDungeon(spec, pack, serverBase, theme);
   const rooms: BuiltDungeonRoom[] = [];
   for (const room of spec.rooms) {
-    const built = await buildTileRoom(live, room, pack, serverBase);
+    const built = await buildTileRoom(live, room, pack, serverBase, theme);
     rooms.push({ id: room.id, ...built });
   }
   return { rooms, links: dungeon.links };

@@ -33,7 +33,8 @@
     "maze": "bun run src/cli/maze.ts",
     "floor-plan": "bun run src/cli/floor-plan.ts",
     "dressing": "bun run src/cli/dressing.ts",
-    "build-loop": "bun run src/cli/build-loop.ts"
+    "build-loop": "bun run src/cli/build-loop.ts",
+    "questlog": "bun run src/cli/questlog.ts"
   },
   "type": "module",
   "version": "0.1.0",

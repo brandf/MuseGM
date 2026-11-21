@@ -1,7 +1,7 @@
 {
   "version": 1,
   "tilePx": 100,
-  "generated": "2026-11-19",
+  "generated": "2026-11-20",
   "tiles": [
     {
       "name": "floor-plain",
@@ -208,6 +208,123 @@
         "altar",
         "ritual",
         "lich"
+      ]
+    },
+    {
+      "name": "floor-sand",
+      "file": "pack/floor-sand.png",
+      "sizePx": 100,
+      "layer": "floor",
+      "tags": [
+        "floor",
+        "sand",
+        "western"
+      ]
+    },
+    {
+      "name": "floor-sand-cracked",
+      "file": "pack/floor-sand-cracked.png",
+      "sizePx": 100,
+      "layer": "floor",
+      "tags": [
+        "floor",
+        "sand",
+        "cracked",
+        "western"
+      ]
+    },
+    {
+      "name": "floor-sand-rubble",
+      "file": "pack/floor-sand-rubble.png",
+      "sizePx": 100,
+      "layer": "floor",
+      "tags": [
+        "floor",
+        "sand",
+        "rubble",
+        "western"
+      ]
+    },
+    {
+      "name": "floor-sand-dark",
+      "file": "pack/floor-sand-dark.png",
+      "sizePx": 100,
+      "layer": "floor",
+      "tags": [
+        "floor",
+        "sand",
+        "dark",
+        "western"
+      ]
+    },
+    {
+      "name": "wall-wood-straight",
+      "file": "pack/wall-wood-straight.png",
+      "sizePx": 100,
+      "layer": "floor",
+      "tags": [
+        "wall",
+        "wood",
+        "straight",
+        "western"
+      ]
+    },
+    {
+      "name": "wall-wood-corner",
+      "file": "pack/wall-wood-corner.png",
+      "sizePx": 100,
+      "layer": "floor",
+      "tags": [
+        "wall",
+        "wood",
+        "corner",
+        "western"
+      ]
+    },
+    {
+      "name": "wall-wood-door",
+      "file": "pack/wall-wood-door.png",
+      "sizePx": 100,
+      "layer": "floor",
+      "tags": [
+        "wall",
+        "wood",
+        "door",
+        "western"
+      ]
+    },
+    {
+      "name": "dust-wisp-small",
+      "file": "pack/dust-wisp-small.png",
+      "sizePx": 200,
+      "layer": "atmosphere",
+      "tags": [
+        "dust",
+        "atmosphere",
+        "western"
+      ]
+    },
+    {
+      "name": "dust-wisp-large",
+      "file": "pack/dust-wisp-large.png",
+      "sizePx": 400,
+      "layer": "atmosphere",
+      "tags": [
+        "dust",
+        "atmosphere",
+        "western"
+      ]
+    },
+    {
+      "name": "dust-pool",
+      "file": "pack/dust-pool.png",
+      "sizePx": 400,
+      "layer": "atmosphere",
+      "tags": [
+        "dust",
+        "atmosphere",
+        "dense",
+        "western"
       ]
     }
   ],

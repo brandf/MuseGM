@@ -27,6 +27,15 @@
  *   per build; ambiguous requests get a clarifying question in chat;
  *   out-of-scope requests get "I can't do that yet". The loop never
  *   guesses a position and never hallucinates a build.
+ * - GM whispers (BRA-185, FR-18): a whisper from the GM to Meroki is
+ *   an instruction, not table chatter. An embedded cutscene script or
+ *   a named sequence ("mice and the ogre") is validated with the
+ *   cutscene engine and played — acknowledged instantly, then played
+ *   in the background so the loop never goes deaf mid-fight (a
+ *   sequence can span combat rounds). A whispered build or question
+ *   routes through the normal paths with replies whispered back to
+ *   the GM. Anything else gets a whispered clarification. Rolls are
+ *   out of scope for the whisper channel — they live in public chat.
  * - Everything else (open chat, requests, roleplay): logged as
  *   "needs-agent" and skipped. A human Muse can answer those from the
  *   log; the CLI does not improvise.
@@ -36,7 +45,7 @@
  */
 import type { FoundryLive } from "../live.js";
 import type { ChatMessage } from "../types.js";
-import { rollForChat, parseRollRequest } from "./dice.js";
+import { rollForChat, parseRollRequest, resolveGamemasterId } from "./dice.js";
 import { CombatAutopilot } from "./autopilot.js";
 import type { CombatStatus } from "./autopilot.js";
 import { extractPin, handlePin, findOpenPins, PinProcessor } from "./pins.js";
@@ -47,6 +56,14 @@ import {
 } from "./build-loop.js";
 import { loadPack, type Pack } from "../worldbuilding/tiles-layout.js";
 import type { BuiltTileRoom } from "../worldbuilding/tiles.js";
+import {
+  isGmWhisper,
+  classifyWhisper,
+  loadNamedSequence,
+  NAMED_SEQUENCES,
+} from "./whisper.js";
+import type { NamedSequenceKey } from "./whisper.js";
+import { validateCutscene, playCutscene } from "./cutscene.js";
 
 /** What the monitor does with one chat message. */
 export type MessageClass =
@@ -200,12 +217,16 @@ async function findActorByName(
 /**
  * Answer one parsed question from live data. Returns the posted message
  * _id. A missing actor / field / combat is reported in chat as "couldn't
- * find it" — never invented.
+ * find it" — never invented. With `whisperTo`, the answer goes back as
+ * a whisper to that user (the GM-whisper path) instead of public chat.
  */
 export async function answerQuestion(
   live: FoundryLive,
   intent: QuestionIntent,
+  whisperTo?: string,
 ): Promise<string> {
+  const say = (text: string): Promise<string> =>
+    whisperTo ? live.sendChat(text, { whisperTo: [whisperTo] }) : live.sendChat(text);
   switch (intent.kind) {
     case "turn":
     case "round": {
@@ -214,63 +235,193 @@ export async function answerQuestion(
         round: number;
         turn: number | null;
       } | null;
-      if (!combat) return live.sendChat("No combat is running right now.");
+      if (!combat) return say("No combat is running right now.");
       try {
         const pilot = new CombatAutopilot(live, combat._id);
         const st = pilot.status();
         const cur = st.current;
         if (intent.kind === "round") {
-          return live.sendChat(`We're on round ${st.round}.`);
+          return say(`We're on round ${st.round}.`);
         }
-        if (!cur) return live.sendChat(`Round ${st.round} — no one's turn yet.`);
-        return live.sendChat(
+        if (!cur) return say(`Round ${st.round} — no one's turn yet.`);
+        return say(
           `It's **${cur.name}**'s turn — round ${st.round}, turn ${(st.turn ?? 0) + 1}/${st.combatants.length} (HP ${cur.hp}/${cur.hpMax}).`,
         );
       } catch {
-        return live.sendChat("I couldn't read the combat tracker right now.");
+        return say("I couldn't read the combat tracker right now.");
       }
     }
     case "hp":
     case "ac": {
       const actor = await findActorByName(live, intent.name);
-      if (!actor) return live.sendChat(`I couldn't find anyone named **${intent.name}**.`);
+      if (!actor) return say(`I couldn't find anyone named **${intent.name}**.`);
       if (intent.kind === "hp") {
         const hp = actor.system?.attributes?.hp;
         if (hp?.value === undefined) {
-          return live.sendChat(`**${actor.name}** has no HP on their sheet that I can read.`);
+          return say(`**${actor.name}** has no HP on their sheet that I can read.`);
         }
-        return live.sendChat(`**${actor.name}** is at ${hp.value}/${hp.max ?? "?"} HP.`);
+        return say(`**${actor.name}** is at ${hp.value}/${hp.max ?? "?"} HP.`);
       }
       const ac = actor.system?.attributes?.ac?.value;
       if (ac === undefined) {
-        return live.sendChat(`**${actor.name}** has no AC on their sheet that I can read.`);
+        return say(`**${actor.name}** has no AC on their sheet that I can read.`);
       }
-      return live.sendChat(`**${actor.name}**'s AC is ${ac}.`);
+      return say(`**${actor.name}**'s AC is ${ac}.`);
     }
     case "initiative": {
       const combat = live.getCombatState() as { _id: string } | null;
-      if (!combat) return live.sendChat("No combat is running right now.");
+      if (!combat) return say("No combat is running right now.");
       try {
         const pilot = new CombatAutopilot(live, combat._id);
         const st = pilot.status();
         const c = st.combatants.find(
           (x) => x.name.toLowerCase() === intent.name.toLowerCase(),
         );
-        if (!c) return live.sendChat(`**${intent.name}** isn't in this combat.`);
+        if (!c) return say(`**${intent.name}** isn't in this combat.`);
         if (c.initiative === null) {
-          return live.sendChat(`**${c.name}** hasn't rolled initiative yet.`);
+          return say(`**${c.name}** hasn't rolled initiative yet.`);
         }
-        return live.sendChat(`**${c.name}**'s initiative is ${c.initiative}.`);
+        return say(`**${c.name}**'s initiative is ${c.initiative}.`);
       } catch {
-        return live.sendChat("I couldn't read the combat tracker right now.");
+        return say("I couldn't read the combat tracker right now.");
       }
     }
     case "scene": {
       const scene = (await live.getSceneInfo()) as { name?: string } | null;
-      if (!scene?.name) return live.sendChat("I couldn't tell which scene is active.");
-      return live.sendChat(`We're on **${scene.name}**.`);
+      if (!scene?.name) return say("I couldn't tell which scene is active.");
+      return say(`We're on **${scene.name}**.`);
     }
   }
+}
+
+// ---------------------------------------------------------------- GM whispers
+
+/**
+ * What the whisper channel can do, told to the GM when a whisper asks
+ * for something else. Kept short — it is a private nudge, not a manual.
+ */
+export const WHISPER_CLARIFY =
+  `Whisper received — from here I can play a sequence (paste the cutscene script JSON, or name one like "mice and the ogre"), build something, or answer a question from live data. What do you need?`;
+export const WHISPER_ROLL_CLARIFY =
+  `Rolls live in public chat — post the roll there and I'll answer it. From a whisper I can play a sequence, build, or answer a question.`;
+
+/** What playing (or refusing) a whispered sequence resolved to. */
+export type WhisperSequenceOutcome =
+  | { state: "started"; name: string }
+  | { state: "rejected"; name: string | null; reason: string };
+
+/**
+ * Play (or refuse) a sequence the GM whispered: an embedded script, a
+ * named sequence, or a JSON block that failed to parse.
+ *
+ * Latency budget (FR-18): whisper → first visible effect in 1–2
+ * minutes, or the moment is gone. So this acknowledges instantly
+ * ("On it — playing …") and starts the timeline in the background:
+ * a sequence can span combat rounds, and awaiting it here would make
+ * the monitor deaf for the rest of the fight. The returned promise
+ * resolves at "started" (ack sent, timeline running); completion and
+ * failure are reported back to the GM by the background continuation
+ * and in the log. The run key (`whisper:<message id>`) makes the play
+ * itself retry-safe — a re-dispatch reproduces the run instead of
+ * placing the tokens twice.
+ *
+ * Every reply here is a whisper to the GM: the players never see the
+ * setup. A rejected script is refused with its validation errors, so
+ * the GM can fix it and paste it again — never a silent skip, never
+ * a half-broken start.
+ */
+export async function handleWhisperSequence(
+  live: FoundryLive,
+  msg: ChatMessage,
+  gmId: string,
+  w:
+    | { kind: "script"; script: unknown }
+    | { kind: "named"; key: NamedSequenceKey }
+    | { kind: "script-invalid"; error: string },
+  opts: { onLog?: (log: MonitorLog) => void } = {},
+): Promise<WhisperSequenceOutcome> {
+  const log = opts.onLog ?? (() => {});
+  const whisperTo = (text: string): Promise<string> =>
+    live.sendChat(text, { whisperTo: [gmId] });
+  if (w.kind === "script-invalid") {
+    await whisperTo(
+      `I couldn't read that script — ${w.error}. Paste the full cutscene JSON and I'll play it.`,
+    );
+    log({ event: "whisper-rejected", id: msg.id, reason: "unparseable script" });
+    return { state: "rejected", name: null, reason: w.error };
+  }
+  let script: unknown;
+  let name: string;
+  if (w.kind === "named") {
+    const seq = NAMED_SEQUENCES.find((s) => s.key === w.key)!;
+    name = seq.title;
+    try {
+      script = loadNamedSequence(w.key);
+    } catch (err) {
+      const reason = err instanceof Error ? err.message : String(err);
+      await whisperTo(`I couldn't load "${name}" — ${reason}`);
+      log({ event: "whisper-rejected", id: msg.id, name, reason });
+      return { state: "rejected", name, reason };
+    }
+  } else {
+    script = w.script;
+    const rawName = (script as { name?: unknown }).name;
+    name = typeof rawName === "string" && rawName.length > 0 ? rawName : "that sequence";
+  }
+  const validated = validateCutscene(script);
+  if (!validated.ok) {
+    const shown = validated.errors.slice(0, 5);
+    const more =
+      validated.errors.length > 5 ? `\n…and ${validated.errors.length - 5} more.` : "";
+    await whisperTo(
+      `That script doesn't validate:\n- ${shown.join("\n- ")}${more}\nFix those and paste it again — I won't start a half-broken script.`,
+    );
+    log({ event: "whisper-rejected", id: msg.id, name, errors: validated.errors });
+    return { state: "rejected", name, reason: validated.errors.join("; ") };
+  }
+  name = validated.script.name;
+  await whisperTo(`On it — playing "${name}"…`);
+  const runKey = `whisper:${msg.id}`;
+  void playCutscene(live, validated.script, {
+    runKey,
+    onStep: (r) =>
+      log({ event: "whisper-step", id: msg.id, name, index: r.index, kind: r.kind, ok: r.ok }),
+  })
+    .then(async (res) => {
+      // The run resolves (never rejects) for a step failure, so check
+      // `ok` before claiming it finished: a run that stopped mid-way
+      // whispers "stopped" with the failing step, never "finished".
+      // Only a throw (bad expansion, missing scene) reaches .catch.
+      if (!res.ok) {
+        const failed = res.steps.find((s) => !s.ok);
+        const reason = failed
+          ? `step ${failed.index} (${failed.kind}) failed: ${failed.error ?? "unknown error"}`
+          : "a step failed";
+        log({ event: "whisper-failed", id: msg.id, name, error: reason });
+        try {
+          await whisperTo(`"${name}" stopped: ${reason}`);
+        } catch {
+          // The table is unreachable; the log line above is the record.
+        }
+        return;
+      }
+      log({ event: "whisper-done", id: msg.id, name });
+      try {
+        await whisperTo(`"${name}" finished.`);
+      } catch {
+        // The table is unreachable; the log line above is the record.
+      }
+    })
+    .catch(async (err) => {
+      const reason = err instanceof Error ? err.message : String(err);
+      log({ event: "whisper-failed", id: msg.id, name, error: reason });
+      try {
+        await whisperTo(`"${name}" stopped: ${reason}`);
+      } catch {
+        // As above.
+      }
+    });
+  return { state: "started", name };
 }
 
 // ---------------------------------------------------------------- the loop
@@ -313,6 +464,8 @@ export interface MonitorSummary {
   combatAnnouncements: number;
   buildsHandled: number;
   clarifications: number;
+  /** GM whispers acted on as instructions (sequences, builds, questions, clarifications). */
+  whispersHandled: number;
   skipped: number;
 }
 
@@ -341,6 +494,7 @@ export async function runMonitor(
     combatAnnouncements: 0,
     buildsHandled: 0,
     clarifications: 0,
+    whispersHandled: 0,
     skipped: 0,
   };
   const pins = new PinProcessor();
@@ -363,7 +517,23 @@ export async function runMonitor(
     lastSeen = recent.length > 0 ? recent[recent.length - 1].id : null;
   }
   let prevCombat: CombatStatus | null = null;
-  log({ event: "started", alias, debounce, timeout, dryRun: !!opts.dryRun });
+  // The GM's user id, for whisper detection. Unresolvable (no role-4
+  // user, no user named Gamemaster) disables whisper handling — the
+  // loop keeps running; only whispers stop being instructions.
+  let gmId: string | null = null;
+  try {
+    gmId = resolveGamemasterId(live);
+  } catch {
+    log({ event: "whisper-disabled", reason: "no gamemaster user found" });
+  }
+  log({
+    event: "started",
+    alias,
+    debounce,
+    timeout,
+    dryRun: !!opts.dryRun,
+    gmId,
+  });
 
   try {
     for (;;) {
@@ -373,6 +543,28 @@ export async function runMonitor(
       lastSeen = result.lastSeen;
       for (const msg of result.newMessages) {
         summary.messagesSeen += 1;
+        const text = stripHtml(msg.content);
+        // A GM whisper is an instruction, not table chatter (BRA-185 /
+        // FR-18). Checked first: a whispered roll or question must not
+        // leak into the public branches below.
+        const whisper = gmId !== null && isGmWhisper(msg, live.userId, gmId);
+        if (whisper && gmId && text) {
+          const w = classifyWhisper(text);
+          if (w.kind !== "other") {
+            if (opts.dryRun) {
+              log({ event: "whisper", id: msg.id, class: w.kind, dryRun: true });
+            } else {
+              summary.whispersHandled += 1;
+              summary.answered += 1;
+              void handleWhisperSequence(live, msg, gmId, w, { onLog: log }).catch((err) => {
+                log({ event: "error", class: "whisper", id: msg.id, error: String(err) });
+              });
+            }
+            continue;
+          }
+          // Not a sequence — fall through to the ordinary routing
+          // below, but every reply goes back as a whisper to the GM.
+        }
         const cls = classifyMessage(msg, live.userId, alias, {
           room: buildSession.activeRoomSpec() ?? undefined,
         });
@@ -381,12 +573,33 @@ export async function runMonitor(
           log({ event: "skip", class: cls, id: msg.id });
           continue;
         }
+        // Reply channel: a GM whisper is answered privately, everything
+        // else in public chat. `say` is the build branch's sender.
+        const replyWhisperTo = whisper ? gmId : null;
+        const say = (line: string): Promise<string> =>
+          replyWhisperTo
+            ? live.sendChat(line, { whisperTo: [replyWhisperTo] })
+            : live.sendChat(line);
         if (cls === "roll") {
+          if (whisper) {
+            // Rolls live in public chat — the whisper channel is for
+            // sequences, builds, and questions.
+            if (opts.dryRun) {
+              log({ event: "whisper-clarify", id: msg.id, reason: "roll", dryRun: true });
+            } else {
+              await say(WHISPER_ROLL_CLARIFY);
+              summary.whispersHandled += 1;
+              summary.answered += 1;
+              summary.clarifications += 1;
+              log({ event: "whisper-clarify", id: msg.id, reason: "roll" });
+            }
+            continue;
+          }
           if (opts.dryRun) {
             log({ event: "roll", id: msg.id, dryRun: true });
           } else {
             try {
-              const id = await rollForChat(live, stripHtml(msg.content));
+              const id = await rollForChat(live, text);
               if (id) {
                 summary.rollsHandled += 1;
                 summary.answered += 1;
@@ -402,7 +615,7 @@ export async function runMonitor(
           continue;
         }
         if (cls === "question") {
-          const intent = parseQuestion(stripHtml(msg.content));
+          const intent = parseQuestion(text);
           if (!intent) {
             summary.skipped += 1;
             continue;
@@ -411,8 +624,9 @@ export async function runMonitor(
             log({ event: "question", id: msg.id, intent, dryRun: true });
           } else {
             try {
-              const id = await answerQuestion(live, intent);
+              const id = await answerQuestion(live, intent, replyWhisperTo ?? undefined);
               summary.answered += 1;
+              if (whisper) summary.whispersHandled += 1;
               log({ event: "question", id: msg.id, intent, posted: id });
             } catch (err) {
               log({ event: "error", class: "question", id: msg.id, error: String(err) });
@@ -425,7 +639,6 @@ export async function runMonitor(
         // session's room, so "that door" resolves against the room
         // being built.
         if (cls === "build" || cls === "clarify" || cls === "unsupported") {
-          const text = stripHtml(msg.content);
           const parsed = parseBuildRequest(text, {
             room: buildSession.activeRoomSpec() ?? undefined,
           });
@@ -440,9 +653,10 @@ export async function runMonitor(
             if (opts.dryRun) {
               log({ event: "build-clarify", id: msg.id, question: parsed.question, dryRun: true });
             } else {
-              await live.sendChat(parsed.question);
+              await say(parsed.question);
               summary.clarifications += 1;
               summary.answered += 1;
+              if (whisper) summary.whispersHandled += 1;
               log({ event: "build-clarify", id: msg.id, question: parsed.question });
             }
             continue;
@@ -452,9 +666,10 @@ export async function runMonitor(
             if (opts.dryRun) {
               log({ event: "build-unsupported", id: msg.id, reason: parsed.reason, dryRun: true });
             } else {
-              await live.sendChat(line);
+              await say(line);
               summary.clarifications += 1;
               summary.answered += 1;
+              if (whisper) summary.whispersHandled += 1;
               log({ event: "build-unsupported", id: msg.id, reason: parsed.reason });
             }
             continue;
@@ -474,16 +689,17 @@ export async function runMonitor(
               serverBase: opts.serverBase ?? serverBaseForWorld(world.title),
               built: builtRooms,
             });
-            await live.sendChat(line);
+            await say(line);
             summary.buildsHandled += 1;
             summary.answered += 1;
+            if (whisper) summary.whispersHandled += 1;
             log({ event: "build", id: msg.id, op: parsed.op, line });
           } catch (err) {
             // A failed build never commits: the session is unchanged,
             // so the GM can rephrase and try again.
             const line = `I couldn't build that — ${err instanceof Error ? err.message : String(err)}`;
             try {
-              await live.sendChat(line);
+              await say(line);
             } catch {
               // The table is unreachable; the log line below is the record.
             }
@@ -491,9 +707,22 @@ export async function runMonitor(
           }
           continue;
         }
-        // "chat" — needs a Muse's judgment. Log it, don't improvise.
+        // "chat" — a GM whisper gets a clarification (privately);
+        // anything else needs a Muse's judgment. Log it, don't improvise.
+        if (whisper) {
+          if (opts.dryRun) {
+            log({ event: "whisper-clarify", id: msg.id, reason: "other", dryRun: true });
+          } else {
+            await say(WHISPER_CLARIFY);
+            summary.whispersHandled += 1;
+            summary.answered += 1;
+            summary.clarifications += 1;
+            log({ event: "whisper-clarify", id: msg.id, reason: "other" });
+          }
+          continue;
+        }
         summary.skipped += 1;
-        log({ event: "needs-agent", id: msg.id, text: stripHtml(msg.content).slice(0, 200) });
+        log({ event: "needs-agent", id: msg.id, text: text.slice(0, 200) });
       }
 
       // Pins: drain the document-event queue, then (first cycle only) scan

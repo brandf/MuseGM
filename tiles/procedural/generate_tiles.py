@@ -46,6 +46,30 @@ AMBER = (255, 154, 60)
 FOG = (190, 220, 190)
 CHARCOAL = (26, 28, 32)
 
+# Western palette (FR-2): sun-baked sandstone, wood planks, warm dust.
+SAND = (196, 168, 124)
+SAND_DARK = (148, 122, 86)
+GROUT_SAND = (138, 112, 78)
+GROUT_SAND_DARK = (104, 82, 56)
+CRACK_SAND = (118, 94, 62)
+DUST = (214, 190, 150)
+WOOD = (122, 90, 58)
+WOOD_DARK = (88, 64, 40)
+WOOD_GRAIN = (100, 74, 48)
+WOOD_SHADOW = (30, 22, 14)
+
+# Floor palettes, by theme. `floor_tile` takes `pal` — the default is the
+# dungeon palette, so the existing 19 tiles render byte-identical.
+DUNGEON_FLOOR_PAL = {
+    "base": FLOOR, "dark": FLOOR_DARK, "grout": GROUT,
+    "grout_dark": GROUT_DARK, "crack": CRACK, "speckle_dark": (30, 34, 40),
+}
+WESTERN_FLOOR_PAL = {
+    "base": SAND, "dark": SAND_DARK, "grout": GROUT_SAND,
+    "grout_dark": GROUT_SAND_DARK, "crack": CRACK_SAND,
+    "speckle_dark": (96, 76, 52),
+}
+
 
 def _shade(rgb, dv):
     return tuple(max(0, min(255, c + dv)) for c in rgb)
@@ -73,12 +97,14 @@ def _crack(d, x0, y0, length, color, seed):
 
 # ---------------------------------------------------------------- floors
 
-def floor_tile(variant="plain", seed=7):
+def floor_tile(variant="plain", seed=7, pal=None):
     """100x100 stone floor tile. Grout runs to the outer edge so tiles butt
-    together seamlessly (a 4px grout line where two tiles meet)."""
+    together seamlessly (a 4px grout line where two tiles meet).
+    `pal` selects the theme palette (default: the dungeon palette)."""
+    pal = pal or DUNGEON_FLOOR_PAL
     random.seed(seed)
-    base = FLOOR_DARK if variant == "dark" else FLOOR
-    grout = GROUT_DARK if variant == "dark" else GROUT
+    base = pal["dark"] if variant == "dark" else pal["base"]
+    grout = pal["grout_dark"] if variant == "dark" else pal["grout"]
     fl = Image.new("RGB", (100, 100), grout)
     d = ImageDraw.Draw(fl)
     v = random.randint(-8, 8)
@@ -88,8 +114,8 @@ def floor_tile(variant="plain", seed=7):
     d.line([52, 2, 52, 52], fill=_shade(base, v - 14), width=2)
     _speckle(d, 100, 60, _shade(base, v - 22), seed + 1)
     if variant in ("cracked", "rubble"):
-        _crack(d, random.randint(20, 80), random.randint(20, 80), 5, CRACK, seed + 2)
-        _crack(d, random.randint(20, 80), random.randint(20, 80), 4, CRACK, seed + 3)
+        _crack(d, random.randint(20, 80), random.randint(20, 80), 5, pal["crack"], seed + 2)
+        _crack(d, random.randint(20, 80), random.randint(20, 80), 4, pal["crack"], seed + 3)
     if variant == "rubble":
         for i in range(5):
             cx, cy = random.randint(15, 85), random.randint(15, 85)
@@ -97,7 +123,7 @@ def floor_tile(variant="plain", seed=7):
             d.ellipse([cx - r, cy - r, cx + r, cy + r],
                       fill=_shade(base, -26), outline=_shade(base, -40))
     if variant == "dark":
-        _speckle(d, 100, 40, (30, 34, 40), seed + 4)
+        _speckle(d, 100, 40, pal["speckle_dark"], seed + 4)
     return fl
 
 
@@ -183,11 +209,89 @@ def wall_door(seed=13):
     return t
 
 
+# ---------------------------------------------------------------- western walls (FR-2)
+
+def _wood_band(d, x0, y0, x1, y1, seed):
+    """Wood-plank band in the rectangle (x0,y0)-(x1,y1): two rows of
+    horizontal planks with grain lines, butt seams and nail dots, and a
+    shadow line at the bottom edge. Same geometry as _wall_band (band
+    at the top, rest transparent) so the composer rotates it the same
+    way — only the material changes."""
+    random.seed(seed)
+    d.rectangle([x0, y0, x1, y1], fill=WOOD_DARK)
+    rows = 2
+    rh = (y1 - y0) // rows
+    for r in range(rows):
+        ry0, ry1 = y0 + r * rh, y0 + (r + 1) * rh
+        off = 22 if r % 2 else 0
+        x = x0 - off
+        while x < x1:
+            bw = random.randint(30, 44)
+            v = random.randint(-8, 8)
+            d.rectangle([x + 1, ry0 + 1, min(x + bw - 1, x1), ry1 - 1],
+                        fill=_shade(WOOD, v))
+            # grain: one wavy line down the plank's middle
+            gy = (ry0 + ry1) // 2 + random.randint(-3, 3)
+            d.line([x + 3, gy, min(x + bw - 3, x1), gy + random.randint(-2, 2)],
+                   fill=_shade(WOOD_GRAIN, v), width=1)
+            # nail dot near the plank's left end
+            nx = min(x + 6, x1 - 3)
+            d.ellipse([nx - 2, (ry0 + ry1) // 2 - 2, nx + 2, (ry0 + ry1) // 2 + 2],
+                      fill=(40, 30, 20))
+            x += bw
+        d.line([x0, ry1, x1, ry1], fill=WOOD_DARK, width=2)
+    d.line([x0, y1, x1, y1], fill=WOOD_SHADOW, width=3)
+
+
+def wall_wood_straight(seed=111):
+    """100x100 transparent tile: a wood-plank wall band across the top."""
+    t = Image.new("RGBA", (100, 100), (0, 0, 0, 0))
+    _wood_band(ImageDraw.Draw(t), 0, 0, 100, 48, seed)
+    return t
+
+
+def wall_wood_corner(seed=112):
+    """100x100 transparent tile: wood-plank bands across the top AND the
+    left (the north-west corner; the composer rotates it for others)."""
+    t = Image.new("RGBA", (100, 100), (0, 0, 0, 0))
+    d = ImageDraw.Draw(t)
+    _wood_band(d, 0, 0, 100, 48, seed)
+    _wood_band(d, 0, 0, 48, 100, seed + 1)
+    return t
+
+
+def wall_wood_door(seed=113):
+    """100x100 transparent tile: wood-plank band with a gap in the middle,
+    the door leaf flat from above (hinged at the left of the gap, ajar),
+    plus the dashed quarter-circle swing arc. Same geometry as the
+    stone door tile — only the material changes."""
+    t = Image.new("RGBA", (100, 100), (0, 0, 0, 0))
+    d = ImageDraw.Draw(t)
+    _wood_band(d, 0, 0, 32, 48, seed)
+    _wood_band(d, 68, 0, 100, 48, seed + 1)
+    hx, hy = 32, 48
+    ang = math.radians(35)
+    lx, ly = 34, 6
+    dx, dy = math.cos(ang), math.sin(ang)
+    px, py = -dy, dx
+    leaf = [
+        (hx + px * ly / 2, hy + py * ly / 2),
+        (hx + dx * lx + px * ly / 2, hy + dy * lx + py * ly / 2),
+        (hx + dx * lx - px * ly / 2, hy + dy * lx - py * ly / 2),
+        (hx - px * ly / 2, hy - py * ly / 2),
+    ]
+    d.polygon(leaf, fill=(150, 116, 76), outline=(70, 52, 32))
+    _dashed_arc(d, hx, hy, lx, 0, math.radians(35), (220, 200, 170, 180))
+    return t
+
+
 # ---------------------------------------------------------------- fog
 
-def fog_wisp(size=400, seed=7, density=1.0):
-    """Soft green eerie fog on a transparent background. Blobs plus thin
-    tendrils, blurred. `density` scales the alpha (pool is denser)."""
+def fog_wisp(size=400, seed=7, density=1.0, color=None):
+    """Soft eerie fog on a transparent background. Blobs plus thin
+    tendrils, blurred. `density` scales the alpha (pool is denser).
+    `color` selects the theme tint (default: the dungeon's green)."""
+    color = color or FOG
     random.seed(seed)
     fog = Image.new("RGBA", (size, size), (0, 0, 0, 0))
     d = ImageDraw.Draw(fog)
@@ -199,7 +303,7 @@ def fog_wisp(size=400, seed=7, density=1.0):
         ry = size * random.uniform(0.08, 0.2)
         a = int(random.randint(55, 95) * density)
         d.ellipse([cx - rx, cy - ry, cx + rx, cy + ry],
-                  fill=FOG + (min(255, a),))
+                  fill=color + (min(255, a),))
     fog = fog.filter(ImageFilter.GaussianBlur(max(8, size // 18)))
     t = Image.new("RGBA", (size, size), (0, 0, 0, 0))
     dt = ImageDraw.Draw(t)
@@ -208,21 +312,22 @@ def fog_wisp(size=400, seed=7, density=1.0):
         x1, y1 = random.uniform(0, size), random.uniform(0, size)
         w = max(6, size // 16)
         a = int(random.randint(45, 65) * density)
-        dt.line([x0, y0, x1, y1], fill=FOG + (min(255, a),), width=w)
+        dt.line([x0, y0, x1, y1], fill=color + (min(255, a),), width=w)
     t = t.filter(ImageFilter.GaussianBlur(max(6, size // 28)))
     return Image.alpha_composite(fog, t)
 
 
-def fog_pool(size=400, seed=21):
+def fog_pool(size=400, seed=21, color=None):
     """Denser fog that pools: same wisp, plus a heavy center mass."""
-    base = fog_wisp(size, seed, density=1.0)
+    color = color or FOG
+    base = fog_wisp(size, seed, density=1.0, color=color)
     pool = Image.new("RGBA", (size, size), (0, 0, 0, 0))
     d = ImageDraw.Draw(pool)
     c = size // 2
     for (rx, ry, a) in [(size * 0.32, size * 0.22, 110),
                         (size * 0.22, size * 0.16, 90),
                         (size * 0.16, size * 0.12, 80)]:
-        d.ellipse([c - rx, c - ry, c + rx, c + ry], fill=FOG + (a,))
+        d.ellipse([c - rx, c - ry, c + rx, c + ry], fill=color + (a,))
     pool = pool.filter(ImageFilter.GaussianBlur(size // 10))
     return Image.alpha_composite(base, pool)
 
@@ -422,6 +527,33 @@ PACK = [
      ["dressing", "prop", "spear", "weapon"]),
 ]
 
+# Western pack (FR-2): the same tile shapes in frontier materials —
+# sandstone floors, wood-plank walls, warm dust instead of green fog.
+# Same sizes and layers as the dungeon pack, so the composer treats
+# them identically; only the theme's tile names differ.
+WESTERN_PACK = [
+    ("floor-sand", lambda: floor_tile("plain", 107, WESTERN_FLOOR_PAL), 100, "floor",
+     ["floor", "sand", "western"]),
+    ("floor-sand-cracked", lambda: floor_tile("cracked", 108, WESTERN_FLOOR_PAL), 100, "floor",
+     ["floor", "sand", "cracked", "western"]),
+    ("floor-sand-rubble", lambda: floor_tile("rubble", 109, WESTERN_FLOOR_PAL), 100, "floor",
+     ["floor", "sand", "rubble", "western"]),
+    ("floor-sand-dark", lambda: floor_tile("dark", 110, WESTERN_FLOOR_PAL), 100, "floor",
+     ["floor", "sand", "dark", "western"]),
+    ("wall-wood-straight", wall_wood_straight, 100, "floor",
+     ["wall", "wood", "straight", "western"]),
+    ("wall-wood-corner", wall_wood_corner, 100, "floor",
+     ["wall", "wood", "corner", "western"]),
+    ("wall-wood-door", wall_wood_door, 100, "floor",
+     ["wall", "wood", "door", "western"]),
+    ("dust-wisp-small", lambda: fog_wisp(200, 107, 1.0, DUST), 200, "atmosphere",
+     ["dust", "atmosphere", "western"]),
+    ("dust-wisp-large", lambda: fog_wisp(400, 107, 1.0, DUST), 400, "atmosphere",
+     ["dust", "atmosphere", "western"]),
+    ("dust-pool", lambda: fog_pool(400, 121, DUST), 400, "atmosphere",
+     ["dust", "atmosphere", "dense", "western"]),
+]
+
 # Pieces that genuinely need AI art. The three gaps (skeleton, chest,
 # altar) were closed Nov 20: art generated on flat magenta, cut out to
 # transparent PNGs by cutout.py (chroma-key + soft edge), canonical cut
@@ -472,10 +604,22 @@ def build_pack():
             "tags": tags,
         })
         print(f"copied pack/{name}.png ({size}x{size}, {layer}, AI art)")
+    for name, fn, size, layer, tags in WESTERN_PACK:
+        img = fn()
+        fname = f"{name}.png"
+        img.save(os.path.join(PACK_DIR, fname))
+        entries.append({
+            "name": name,
+            "file": f"pack/{fname}",
+            "sizePx": size,
+            "layer": layer,
+            "tags": tags,
+        })
+        print(f"wrote pack/{fname} ({size}x{size}, {layer}, western)")
     manifest = {
         "version": 1,
         "tilePx": 100,
-        "generated": "2026-11-19",
+        "generated": "2026-11-20",
         "tiles": entries,
         "gaps": GAPS,
     }
@@ -532,10 +676,50 @@ def preview():
     print(f"wrote pack-preview.png (6x6 sample room)")
 
 
+def preview_western():
+    """Same 6x6 sample room, western theme: sandstone floors, wood
+    walls, dust. A visual check that the western tiles read as a room
+    of the same shape — the re-skin changes the look, not the layout."""
+    from PIL import Image as _Image
+    pack = {name: fn() for name, fn, _, _, _ in WESTERN_PACK}
+    W = H = 600
+    room = _Image.new("RGBA", (W, H), (13, 10, 7, 255))
+    # Plain/cracked/rubble chosen per cell with the same seed order as
+    # the dungeon preview, so the two rooms are directly comparable.
+    random.seed(3)
+    variants = ["plain"] * 6 + ["cracked"] * 3 + ["rubble"]
+    for gy in range(6):
+        for gx in range(6):
+            v = random.choice(variants)
+            key = "floor-sand" if v == "plain" else f"floor-sand-{v}"
+            room.paste(pack[key].convert("RGBA"), (gx * 100, gy * 100))
+
+    def rot(img, deg):
+        return img.rotate(-deg, expand=False)
+
+    straight, corner, door = (pack["wall-wood-straight"],
+                              pack["wall-wood-corner"], pack["wall-wood-door"])
+    for gx in range(6):
+        room.alpha_composite(rot(straight, 0), (gx * 100, 0))
+        room.alpha_composite(
+            rot(door if gx == 3 else straight, 180), (gx * 100, 500))
+    for gy in range(6):
+        room.alpha_composite(rot(straight, 270), (0, gy * 100))
+        room.alpha_composite(rot(straight, 90), (500, gy * 100))
+    for img, deg, x, y in [(corner, 0, 0, 0), (corner, 90, 500, 0),
+                           (corner, 180, 500, 500), (corner, 270, 0, 500)]:
+        room.alpha_composite(rot(img, deg), (x, y))
+    room.alpha_composite(pack["dust-wisp-large"], (100, 100))
+    out = os.path.join(TILES_DIR, "pack-preview-western.png")
+    room.save(out)
+    print(f"wrote pack-preview-western.png (6x6 western sample room)")
+
+
 if __name__ == "__main__":
     import sys
     if "--preview" in sys.argv:
         build_pack()
         preview()
+        preview_western()
     else:
         build_pack()

@@ -40,6 +40,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import type { LightSpec, WallSpec } from "./index.js";
+import { resolveTheme, themeTileGaps, type ThemeSpec } from "./themes.js";
 import {
   generateMaze,
   mulberry32,
@@ -58,7 +59,9 @@ export const LAYER_SORT = { floor: 0, wall: 10, dressing: 20 } as const;
 /** Fog floats above the tokens. */
 export const FOG_ELEVATION = 1;
 
-/** Warm torchlight defaults (STYLE.md / the Lich's Lair lighting fix). */
+/** Warm torchlight defaults (STYLE.md / the Lich's Lair lighting fix).
+ *  Kept for callers that need the dungeon default directly; the theme
+ *  system carries the same values in DUNGEON_THEME.torch. */
 export const TORCH = { dim: 300, bright: 120, color: "#ff9a3c" } as const;
 /** The plain dark colour a tile room's Level background is painted. */
 export const ROOM_BACKGROUND_COLOR = "#050508";
@@ -193,6 +196,11 @@ export interface RoomSpec {
   /** Floor style: "mixed" (plain/cracked/rubble at random) or "dark"
    *  (the colder, darker floor for deeper rooms). Default "mixed". */
   floorStyle?: "mixed" | "dark";
+  /** One-word theme id, e.g. "dungeon" (the default look) or
+   *  "western" (FR-2) — the room's look: floor/wall tiles, fog and
+   *  dressing remaps, torch palette. An explicit theme argument to
+   *  layoutRoom / buildTileRoom overrides this. */
+  theme?: string;
   doors?: DoorSpec[];
   /**
    * Openings: perimeter cells with no wall at all — no wall tile, no
@@ -564,9 +572,27 @@ function mazeCollisionWalls(
  *
  * @param serverBase server folder the pack was uploaded to,
  *   e.g. "worlds/testbed" — tile srcs are `${serverBase}/<file>`.
+ * @param theme an explicit theme (one-word name or ThemeSpec) — it
+ *   overrides `spec.theme`; with neither, the room builds in the
+ *   dungeon baseline, exactly as before themes existed (FR-2).
  */
-export function layoutRoom(spec: RoomSpec, pack: Pack, serverBase: string): RoomLayout {
+export function layoutRoom(
+  spec: RoomSpec,
+  pack: Pack,
+  serverBase: string,
+  theme?: string | ThemeSpec,
+): RoomLayout {
   validateSpec(spec, pack);
+  const resolved = resolveTheme(theme ?? spec.theme);
+  // A theme is a pack variant, not a rebuild: every tile it names must
+  // exist. Fail loudly here, naming the theme + the missing tile, so a
+  // re-skin never silently builds the wrong look (or a half look).
+  const gaps = themeTileGaps(resolved, pack);
+  if (gaps.length > 0) {
+    throw new Error(
+      `Theme "${resolved.id}" needs tile${gaps.length > 1 ? "s" : ""} not in the pack: ${gaps.join(", ")} — generate the pack first, or pick another theme.`,
+    );
+  }
   const { gridW, gridH } = spec;
   const width = gridW * TILE_PX;
   const height = gridH * TILE_PX;
@@ -575,11 +601,17 @@ export function layoutRoom(spec: RoomSpec, pack: Pack, serverBase: string): Room
   const grids = mazeGridsFor(spec);
 
   // Floor: one tile per cell. "mixed" rolls plain/cracked/rubble;
-  // "dark" uses the cold dark floor for the whole room. Maze wall cells
-  // get no floor tile (a wall tile goes there instead). Overlays remap
-  // the rolled tile name inside their region, in order (later wins).
+  // "dark" uses the theme's dark floor for the whole room. Maze wall
+  // cells get no floor tile (a wall tile goes there instead). Overlays
+  // remap the rolled tile name inside their region, in order (later
+  // wins). Overlay variants name pack tiles directly — a themed room
+  // needs the theme's tile names there (e.g. "floor-sand" under
+  // western), because the roll already picked the themed tile.
+  const f = resolved.floor;
   const floorNames =
-    spec.floorStyle === "dark" ? ["floor-dark"] : ["floor-plain", "floor-plain", "floor-plain", "floor-plain", "floor-plain", "floor-plain", "floor-cracked", "floor-cracked", "floor-cracked", "floor-rubble"];
+    spec.floorStyle === "dark"
+      ? [f.dark]
+      : [f.plain, f.plain, f.plain, f.plain, f.plain, f.plain, f.cracked, f.cracked, f.cracked, f.rubble];
   for (let gy = 0; gy < gridH; gy++) {
     for (let gx = 0; gx < gridW; gx++) {
       if (isMazeWallCell(grids, gx, gy)) continue;
@@ -610,11 +642,13 @@ export function layoutRoom(spec: RoomSpec, pack: Pack, serverBase: string): Room
     ["se", gridW - 1, gridH - 1],
     ["sw", 0, gridH - 1],
   ];
-  const cornerEntry = pack.get("wall-corner");
-  const straightEntry = pack.get("wall-straight");
-  const doorEntry = pack.get("wall-door");
+  const cornerEntry = pack.get(resolved.wall.corner);
+  const straightEntry = pack.get(resolved.wall.straight);
+  const doorEntry = pack.get(resolved.wall.door);
   if (!cornerEntry || !straightEntry || !doorEntry) {
-    throw new Error('Pack is missing a wall tile ("wall-corner", "wall-straight" or "wall-door").');
+    throw new Error(
+      `Theme "${resolved.id}" is missing a wall tile ("${resolved.wall.corner}", "${resolved.wall.straight}" or "${resolved.wall.door}").`,
+    );
   }
   const placedCorners = new Set<string>();
   for (const [corner, gx, gy] of corners) {
@@ -647,9 +681,9 @@ export function layoutRoom(spec: RoomSpec, pack: Pack, serverBase: string): Room
 
   // Maze walls: a wall-straight tile facing the first open neighbour
   // (the band faces the walkable floor, like the ring's wall tiles), or
-  // floor-dark for a wall cell enclosed on all sides.
-  const darkEntry = pack.get("floor-dark");
-  if (!darkEntry) throw new Error('Pack is missing floor tile "floor-dark".');
+  // the theme's dark floor for a wall cell enclosed on all sides.
+  const darkEntry = pack.get(resolved.floor.dark);
+  if (!darkEntry) throw new Error(`Theme "${resolved.id}" is missing floor tile "${resolved.floor.dark}".`);
   const OPEN_DIRS: { side: WallSide; dx: number; dy: number }[] = [
     { side: "north", dx: 0, dy: -1 },
     { side: "east", dx: 1, dy: 0 },
@@ -681,19 +715,27 @@ export function layoutRoom(spec: RoomSpec, pack: Pack, serverBase: string): Room
   }
 
   // Dressing: bones, rubble, pillars — under the tokens, above the floor.
+  // The theme remaps dressing names (a spec that says "bones" gets the
+  // theme's equivalent when one exists); with no remap the tile is used
+  // as named. The remapped tile was already checked against the pack
+  // by the theme-gap check above.
   for (const p of spec.dressing ?? []) {
-    const entry = pack.get(p.tile);
-    if (!entry) throw new Error(`Unknown dressing tile "${p.tile}".`);
+    const tileName = resolved.dressing[p.tile] ?? p.tile;
+    const entry = pack.get(tileName);
+    if (!entry) throw new Error(`Unknown dressing tile "${tileName}" (theme "${resolved.id}").`);
     tiles.push(tileDoc(entry, serverBase, p.gx, p.gy, {
       elevation: 0, sort: LAYER_SORT.dressing, rotation: p.rotation, alpha: p.alpha, hidden: p.hidden,
     }));
   }
 
   // Atmosphere: fog wisps float above everything (elevation 1), so they
-  // drift over tokens too. Toggleable with `hidden`.
+  // drift over tokens too. Toggleable with `hidden`. The theme remaps
+  // fog names — a spec written with green fog re-skins to dust under
+  // the western theme, with no change to the spec itself.
   for (const p of spec.fog ?? []) {
-    const entry = pack.get(p.tile);
-    if (!entry) throw new Error(`Unknown fog tile "${p.tile}".`);
+    const tileName = resolved.atmosphere[p.tile] ?? p.tile;
+    const entry = pack.get(tileName);
+    if (!entry) throw new Error(`Unknown fog tile "${tileName}" (theme "${resolved.id}").`);
     tiles.push(tileDoc(entry, serverBase, p.gx, p.gy, {
       elevation: FOG_ELEVATION, sort: 0, rotation: p.rotation, alpha: p.alpha, hidden: p.hidden,
     }));
@@ -716,14 +758,16 @@ export function layoutRoom(spec: RoomSpec, pack: Pack, serverBase: string): Room
   }
   walls.push(...mazeCollisionWalls(spec, grids));
 
-  // Lights: torch shorthand (warm amber pools) + explicit light specs.
+  // Lights: torch shorthand (the theme's light palette) + explicit
+  // light specs. A western torch is lantern gold; the dungeon torch is
+  // the warm amber from the Lich's Lair lighting fix.
   const lights: LightSpec[] = [
     ...(spec.torches ?? []).map((t) => ({
       x: t.gx * TILE_PX + TILE_PX / 2,
       y: t.gy * TILE_PX + TILE_PX / 2,
-      dim: TORCH.dim,
-      bright: TORCH.bright,
-      color: TORCH.color,
+      dim: resolved.torch.dim,
+      bright: resolved.torch.bright,
+      color: resolved.torch.color,
     })),
     ...(spec.lights ?? []),
   ];
@@ -806,11 +850,17 @@ function doorKey(end: DoorEnd): string {
  * cell that is not a declared door in that room, a door used in two
  * links, a self-link, a duplicated link, or a room unreachable from the
  * first room (the dungeon must be one connected graph).
+ *
+ * @param theme a dungeon-level theme (one-word name or ThemeSpec) —
+ *   it overrides each room's own `theme`, so one call re-skins the
+ *   whole dungeon (FR-2). With neither, every room builds in its own
+ *   theme (or the dungeon baseline).
  */
 export function layoutDungeon(
   spec: DungeonSpec,
   pack: Pack,
   serverBase: string,
+  theme?: string | ThemeSpec,
 ): DungeonLayout {
   if (spec.rooms.length === 0) throw new Error("A dungeon needs at least one room.");
   const roomById = new Map<string, DungeonRoomSpec>();
@@ -892,7 +942,7 @@ export function layoutDungeon(
     rooms: spec.rooms.map((room) => ({
       id: room.id,
       name: room.name,
-      layout: layoutRoom(room, pack, serverBase),
+      layout: layoutRoom(room, pack, serverBase, theme),
     })),
     links: resolved,
   };

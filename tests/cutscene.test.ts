@@ -15,6 +15,7 @@ import {
   linePositions,
   wedgePositions,
   angleToFace,
+  angleToEast,
 } from "../src/session/formations.js";
 import { lerpLight, parseHexColor } from "../src/session/lights.js";
 import { findTileAtCell } from "../src/session/tile-ops.js";
@@ -139,6 +140,32 @@ describe("angleToFace", () => {
   });
 });
 
+describe("angleToEast", () => {
+  it("is 0 east, 90 south, 180 west, -90 north (screen coords, unnormalized)", () => {
+    expect(angleToEast({ x: 0, y: 0 }, { x: 100, y: 0 })).toBe(0);
+    expect(angleToEast({ x: 0, y: 0 }, { x: 0, y: 100 })).toBe(90);
+    expect(angleToEast({ x: 0, y: 0 }, { x: -100, y: 0 })).toBe(180);
+    expect(angleToEast({ x: 0, y: 0 }, { x: 0, y: -100 })).toBe(-90);
+    expect(angleToEast({ x: 5, y: 5 }, { x: 5, y: 5 })).toBe(0);
+  });
+
+  it("is angleToFace minus 90 for the cardinal directions", () => {
+    const pairs: [{ x: number; y: number }, { x: number; y: number }][] = [
+      [{ x: 0, y: 0 }, { x: 0, y: -100 }],
+      [{ x: 0, y: 0 }, { x: 100, y: 0 }],
+      [{ x: 0, y: 0 }, { x: 0, y: 100 }],
+      [{ x: 0, y: 0 }, { x: -100, y: 0 }],
+    ];
+    for (const [from, to] of pairs) {
+      const north = angleToFace(from, to);
+      const east = angleToEast(from, to);
+      // Same physical direction, different zero: east = north - 90 (mod 360, unnormalized).
+      const diff = (((east - (north - 90)) % 360) + 360) % 360;
+      expect(diff === 0 || diff === 360).toBe(true);
+    }
+  });
+});
+
 describe("ringPositions", () => {
   it("places 9 evenly on a circle, all facing the center", () => {
     const center = { x: 800, y: 800 };
@@ -185,6 +212,26 @@ describe("linePositions and wedgePositions", () => {
     // Rank 1: one on each arm, symmetric in x.
     expect(pts[1].x).toBe(-pts[2].x);
     expect(pts[1].y).toBe(pts[2].y);
+  });
+
+  it("wedge armOrder right-first swaps the arms within each rank (BRA-201)", () => {
+    const opts = { spreadDeg: 60, spacing: 100 };
+    const def = wedgePositions(5, { x: 0, y: 0 }, 180, opts);
+    const rev = wedgePositions(5, { x: 0, y: 0 }, 180, { ...opts, armOrder: "right-first" });
+    expect(rev).toHaveLength(5);
+    expect(rev[0]).toEqual({ x: 0, y: 0, facingDeg: 180 });
+    for (const p of rev) expect(p.facingDeg).toBe(180);
+    // Same five positions, arms swapped within each rank.
+    expect(rev[1]).toEqual(def[2]);
+    expect(rev[2]).toEqual(def[1]);
+    expect(rev[3]).toEqual(def[4]);
+    expect(rev[4]).toEqual(def[3]);
+  });
+
+  it("wedge rejects a bad armOrder", () => {
+    expect(() =>
+      wedgePositions(3, { x: 0, y: 0 }, 180, { armOrder: "middle-first" as never }),
+    ).toThrow(/armOrder/);
   });
 });
 
