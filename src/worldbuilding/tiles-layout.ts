@@ -241,6 +241,12 @@ export interface RoomSpec {
    * behavior is unchanged.
    */
   buildKey?: string;
+  /**
+   * Build the scene with navigation off (FR-3): the room exists but
+   * the players cannot see or navigate to it until a gated reveal
+   * flips it live. Default false — a room is visible when built.
+   */
+  hidden?: boolean;
 }
 
 /** One Tile document, as sent to Foundry. */
@@ -848,6 +854,11 @@ export function layoutRoom(
 export interface DungeonRoomSpec extends RoomSpec {
   /** Unique id within the dungeon — door links address rooms by id. */
   id: string;
+  /** Floor number (FR-3): 0 is the ground floor (the default), 1 the
+   *  floor above, and so on. Stair links connect rooms on different
+   *  floors; the direction ("up"/"down") is derived from the floor
+   *  numbers, never stored. */
+  floor?: number;
 }
 
 /** One end of a door link: a door cell in a room. */
@@ -862,9 +873,39 @@ export interface DoorLink {
   to: DoorEnd;
 }
 
+/**
+ * A gate condition (FR-3): what must be true before a staircase can
+ * be climbed / its floor revealed. The state it reads is a plain
+ * record of facts (see GateState in src/worldbuilding/floors.ts):
+ * which pressure plates are solved, which doors are unlocked, which
+ * levers are pulled. `all` / `any` compose; `always` is the
+ * ungated stair.
+ */
+export type GateCondition =
+  | { kind: "always" }
+  | { kind: "plate-solved"; plate: string }
+  | { kind: "door-unlocked"; door: string }
+  | { kind: "lever-pulled"; lever: string }
+  | { kind: "all"; gates: GateCondition[] }
+  | { kind: "any"; gates: GateCondition[] };
+
+/** A staircase between two rooms on different floors (FR-3). The
+ *  ends are declared doors or openings, like a door link; the
+ *  direction is derived from the rooms' floor numbers. */
+export interface StairLink {
+  from: DoorEnd;
+  to: DoorEnd;
+  /** Gate that must be satisfied before the stair can be climbed and
+   *  its floor revealed. Absent = always open. */
+  gate?: GateCondition;
+}
+
 export interface DungeonSpec {
   rooms: DungeonRoomSpec[];
   links: DoorLink[];
+  /** Staircases between floors (FR-3) — validated like door links,
+   *  plus the two ends must be on different floors. */
+  stairs?: StairLink[];
 }
 
 /** A link end with the arrival cell: the cell just inside the door. */
@@ -872,6 +913,8 @@ export interface ResolvedDoorEnd extends DoorEnd {
   /** Cell just inside the door, where the party arrives. */
   enterGx: number;
   enterGy: number;
+  /** The floor the room is on (FR-3) — 0 when the room sets none. */
+  floor: number;
 }
 
 export interface ResolvedDoorLink {
@@ -879,9 +922,25 @@ export interface ResolvedDoorLink {
   to: ResolvedDoorEnd;
 }
 
+/** A staircase with the arrival cells resolved (FR-3). */
+export interface ResolvedStairLink {
+  from: ResolvedDoorEnd;
+  to: ResolvedDoorEnd;
+  /** Derived from the rooms' floor numbers — never stored. */
+  direction: "up" | "down";
+  gate?: GateCondition;
+}
+
 export interface DungeonLayout {
   rooms: { id: string; name: string; layout: RoomLayout }[];
   links: ResolvedDoorLink[];
+  /** Resolved staircases (FR-3) — empty when the dungeon is single-floor. */
+  stairs: ResolvedStairLink[];
+}
+
+/** "up" when the destination floor is above the source floor. */
+export function stairDirection(fromFloor: number, toFloor: number): "up" | "down" {
+  return toFloor > fromFloor ? "up" : "down";
 }
 
 /** The cell just inside a door: one cell in from the wall. */
@@ -905,10 +964,12 @@ function doorKey(end: DoorEnd): string {
 
 /**
  * Validate + lay out a whole dungeon. Throws on any structural problem:
- * duplicate or empty room ids, a link end naming an unknown room or a
- * cell that is not a declared door in that room, a door used in two
- * links, a self-link, a duplicated link, or a room unreachable from the
- * first room (the dungeon must be one connected graph).
+ * duplicate or empty room ids, a non-integer or negative floor, a link
+ * end naming an unknown room or a cell that is not a declared door in
+ * that room, a door used in two links, a self-link, a duplicated link,
+ * a stair whose ends are on the same floor (or break any link rule),
+ * or a room unreachable from the first room (the dungeon must be one
+ * connected graph — stairs count as edges).
  *
  * @param theme a dungeon-level theme (one-word name or ThemeSpec) —
  *   it overrides each room's own `theme`, so one call re-skins the
@@ -926,6 +987,10 @@ export function layoutDungeon(
   for (const room of spec.rooms) {
     if (!room.id) throw new Error("Every dungeon room needs a non-empty id.");
     if (roomById.has(room.id)) throw new Error(`Duplicate room id "${room.id}".`);
+    const floor = room.floor ?? 0;
+    if (!Number.isInteger(floor) || floor < 0) {
+      throw new Error(`Room "${room.id}": "floor" must be a non-negative integer, got ${JSON.stringify(room.floor)}.`);
+    }
     roomById.set(room.id, room);
   }
   const doorEnds = new Map<string, DungeonRoomSpec>();
@@ -938,6 +1003,10 @@ export function layoutDungeon(
   }
   const usedEnds = new Set<string>();
   const seenLinks = new Set<string>();
+  const resolveEnd = (end: DoorEnd, room: DungeonRoomSpec): ResolvedDoorEnd => {
+    const { gx, gy } = doorEntryCell(end.wall, end.at, room.gridW, room.gridH);
+    return { ...end, enterGx: gx, enterGy: gy, floor: room.floor ?? 0 };
+  };
   const resolved: ResolvedDoorLink[] = [];
   for (const link of spec.links) {
     const fromRoom = roomById.get(link.from.room);
@@ -966,21 +1035,66 @@ export function layoutDungeon(
     usedEnds.add(fromKey);
     usedEnds.add(toKey);
     seenLinks.add(pairKey);
-    const resolveEnd = (end: DoorEnd, room: DungeonRoomSpec): ResolvedDoorEnd => {
-      const { gx, gy } = doorEntryCell(end.wall, end.at, room.gridW, room.gridH);
-      return { ...end, enterGx: gx, enterGy: gy };
-    };
     resolved.push({
       from: resolveEnd(link.from, fromRoom),
       to: resolveEnd(link.to, toRoom),
     });
   }
-  // Connectivity: every room reachable from the first, over the links.
+  // Staircases (FR-3): same end rules as door links — ends must be
+  // declared doors/openings, one door one destination — plus the two
+  // ends must be on different floors. A stair's gate is validated by
+  // validateGate (floors.ts), not here: layout only needs the ends.
+  const seenStairs = new Set<string>();
+  const resolvedStairs: ResolvedStairLink[] = [];
+  for (const stair of spec.stairs ?? []) {
+    const fromRoom = roomById.get(stair.from.room);
+    const toRoom = roomById.get(stair.to.room);
+    if (!fromRoom) throw new Error(`Stair names unknown room "${stair.from.room}".`);
+    if (!toRoom) throw new Error(`Stair names unknown room "${stair.to.room}".`);
+    if (stair.from.room === stair.to.room) {
+      throw new Error(`Stair from room "${stair.from.room}" to itself — a staircase must lead to another room.`);
+    }
+    const fromKey = doorKey(stair.from);
+    const toKey = doorKey(stair.to);
+    if (!doorEnds.has(fromKey)) {
+      throw new Error(`Stair end ${fromKey} is not a declared door or opening in room "${stair.from.room}".`);
+    }
+    if (!doorEnds.has(toKey)) {
+      throw new Error(`Stair end ${toKey} is not a declared door or opening in room "${stair.to.room}".`);
+    }
+    const pairKey = [fromKey, toKey].sort().join("<>");
+    if (seenStairs.has(pairKey)) throw new Error(`Duplicate stair between ${fromKey} and ${toKey}.`);
+    if (usedEnds.has(fromKey) || usedEnds.has(toKey)) {
+      throw new Error(`Door ${usedEnds.has(fromKey) ? fromKey : toKey} is used in two links — one door, one destination.`);
+    }
+    const fromFloor = fromRoom.floor ?? 0;
+    const toFloor = toRoom.floor ?? 0;
+    if (fromFloor === toFloor) {
+      throw new Error(
+        `Stair between ${fromKey} and ${toKey} stays on floor ${fromFloor} — a staircase must connect different floors (rooms "${stair.from.room}" and "${stair.to.room}").`,
+      );
+    }
+    usedEnds.add(fromKey);
+    usedEnds.add(toKey);
+    seenStairs.add(pairKey);
+    resolvedStairs.push({
+      from: resolveEnd(stair.from, fromRoom),
+      to: resolveEnd(stair.to, toRoom),
+      direction: stairDirection(fromFloor, toFloor),
+      ...(stair.gate !== undefined ? { gate: stair.gate } : {}),
+    });
+  }
+  // Connectivity: every room reachable from the first, over the links
+  // and the stairs — a stair is a graph edge like any door.
   const neighbours = new Map<string, Set<string>>();
   for (const room of spec.rooms) neighbours.set(room.id, new Set());
   for (const link of resolved) {
     neighbours.get(link.from.room)!.add(link.to.room);
     neighbours.get(link.to.room)!.add(link.from.room);
+  }
+  for (const stair of resolvedStairs) {
+    neighbours.get(stair.from.room)!.add(stair.to.room);
+    neighbours.get(stair.to.room)!.add(stair.from.room);
   }
   const reached = new Set<string>([spec.rooms[0].id]);
   const queue = [spec.rooms[0].id];
@@ -1004,6 +1118,7 @@ export function layoutDungeon(
       layout: layoutRoom(room, pack, serverBase, theme),
     })),
     links: resolved,
+    stairs: resolvedStairs,
   };
 }
 

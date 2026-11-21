@@ -7,9 +7,17 @@
  *   bun run src/cli/trap.ts --zones zones.json [--seconds 120]
  *   -> {"fires": [{zone, tokenId, tokenName, actorId, at}]}
  *
+ * Staircase reveals (FR-3): a zones file may carry `reveal-floor`
+ * actions; the watcher needs a dungeon to reveal into — pass it as
+ * JSON (see parseBuiltDungeon in src/worldbuilding/floors.ts for the
+ * shape) plus an optional gate-state file:
+ *   bun run src/cli/trap.ts --zones zones.json --dungeon dungeon.json [--gate-state gates.json] [--seconds 120]
+ * With no --dungeon, a reveal-floor zone posts a chat line saying the
+ * reveal is not wired and does nothing.
+ *
  * Validate a zones file offline — no connection, prints the trigger
- * plan (one entry per cutscene-linked zone) and exits non-zero on any
- * error:
+ * plan (one entry per cutscene-linked zone, plus the floor reveals)
+ * and exits non-zero on any error:
  *   bun run src/cli/trap.ts --zones zones.json --plan
  *
  * Live demo (creates a test token, moves it into a trap zone, verifies the
@@ -39,6 +47,7 @@ function has(name: string): boolean {
 
 const USAGE =
   "usage: trap --zones zones.json [--seconds 120] [--plan]\n" +
+  "       trap --zones zones.json --dungeon dungeon.json [--gate-state gates.json] [--seconds 120]\n" +
   "       trap --demo\n" +
   "       trap --help";
 
@@ -49,8 +58,10 @@ const USAGE =
 async function resolveZonesFile(zonesFile: string): Promise<{
   zoneSet: import("../session/traps.js").ZoneSet;
   plan: import("../session/zone-cutscene.js").ZoneCutscenePlanSet;
+  reveals: import("../worldbuilding/floors.js").FloorRevealPlan[];
 }> {
   const { resolveZoneSet, planZoneCutsceneSet } = await import("../session/zone-cutscene.js");
+  const { planFloorReveals } = await import("../worldbuilding/floors.js");
   const parsed: unknown = JSON.parse(fs.readFileSync(zonesFile, "utf-8"));
   const dir = nodePath.dirname(nodePath.resolve(zonesFile));
   const resolved = resolveZoneSet(parsed, (p) => fs.readFileSync(nodePath.resolve(dir, p), "utf-8"));
@@ -61,7 +72,7 @@ async function resolveZonesFile(zonesFile: string): Promise<{
   if (!planned.ok) {
     throw new Error(`cannot plan zones file ${zonesFile}:\n- ${planned.errors.join("\n- ")}`);
   }
-  return { zoneSet: resolved.zoneSet, plan: planned.plan };
+  return { zoneSet: resolved.zoneSet, plan: planned.plan, reveals: planFloorReveals(resolved.zoneSet).reveals };
 }
 
 async function main(): Promise<void> {
@@ -72,8 +83,8 @@ async function main(): Promise<void> {
   const zonesFile = arg("--zones");
   if (has("--plan")) {
     if (!zonesFile) throw new Error(USAGE);
-    const { plan } = await resolveZonesFile(zonesFile);
-    process.stdout.write(JSON.stringify({ ok: true, ...plan }, null, 2) + "\n");
+    const { plan, reveals } = await resolveZonesFile(zonesFile);
+    process.stdout.write(JSON.stringify({ ok: true, ...plan, floorReveals: reveals }, null, 2) + "\n");
     return;
   }
   const { FoundryLive: LiveClient } = await import("../live.js");
@@ -86,7 +97,7 @@ async function main(): Promise<void> {
       return;
     }
     if (!zonesFile) throw new Error(USAGE);
-    const { zoneSet, plan } = await resolveZonesFile(zonesFile);
+    const { zoneSet, plan, reveals } = await resolveZonesFile(zonesFile);
     const cutsceneLinks = plan.links.length;
     process.stderr.write(
       `trap: armed ${zoneSet.zones.length} zone(s) on scene ${zoneSet.sceneId}` +
@@ -94,7 +105,37 @@ async function main(): Promise<void> {
           ? ` — ${cutsceneLinks} cutscene link(s): ${plan.links.map((l) => `${l.zone} -> ${l.cutsceneName} (${l.mode})`).join(", ")}\n`
           : "\n"),
     );
-    const watcher = new TrapWatcher(live, zoneSet);
+    // FR-3: wire a dungeon so reveal-floor zones fire for real.
+    let floorRevealPlayer: import("../session/traps.js").FloorRevealPlayer | undefined;
+    const dungeonFile = arg("--dungeon");
+    if (dungeonFile) {
+      const { FloorSession, parseBuiltDungeon, parseGateState } = await import("../worldbuilding/floors.js");
+      const parsedDungeon = parseBuiltDungeon(JSON.parse(fs.readFileSync(dungeonFile, "utf-8")));
+      if (!parsedDungeon.ok) {
+        throw new Error(`invalid dungeon file ${dungeonFile}:\n- ${parsedDungeon.errors.join("\n- ")}`);
+      }
+      let gateState;
+      const gateFile = arg("--gate-state");
+      if (gateFile) {
+        const parsedGates = parseGateState(JSON.parse(fs.readFileSync(gateFile, "utf-8")));
+        if (!parsedGates.ok) {
+          throw new Error(`invalid gate-state file ${gateFile}:\n- ${parsedGates.errors.join("\n- ")}`);
+        }
+        gateState = parsedGates.state;
+      }
+      const session = new FloorSession(parsedDungeon.dungeon, { gateState });
+      floorRevealPlayer = session.revealPlayer();
+      process.stderr.write(
+        `trap: floor session wired — ${parsedDungeon.dungeon.rooms.length} room(s), ` +
+          `${parsedDungeon.dungeon.stairs.length} staircase(s)` +
+          (reveals.length > 0 ? `, ${reveals.length} reveal zone(s)\n` : "\n"),
+      );
+    } else if (reveals.length > 0) {
+      process.stderr.write(
+        `trap: ${reveals.length} reveal-floor zone(s) with no --dungeon — they will post "not wired" and do nothing\n`,
+      );
+    }
+    const watcher = new TrapWatcher(live, zoneSet, 100, { floorRevealPlayer });
     const fires = await watcher.watch({ seconds: Number(arg("--seconds") ?? "120") });
     process.stdout.write(JSON.stringify({ fires }) + "\n");
   } finally {

@@ -40,6 +40,17 @@
  *   routes through the normal paths with replies whispered back to
  *   the GM. Anything else gets a whispered clarification. Rolls are
  *   out of scope for the whisper channel — they live in public chat.
+ * - Named lights (BRA-240, FR-7): "dim the braziers" routes to
+ *   `animateNamedLights` — the name + target come from the pure
+ *   parser (`src/session/light-commands.ts`), the scene is the
+ *   active one, and the group animates in parallel with one
+ *   confirmation line. Unknown or ambiguous names post the
+ *   resolver's error verbatim as a clarification (it lists the names
+ *   that exist) — never a guess. Checked after roll/question and
+ *   before build, so "make the torches brighter" reaches the lights
+ *   instead of the build parser's "can't do that yet". A light
+ *   command is not GM-gated (same policy as build/question); a
+ *   whispered one is confirmed privately, like any other reply.
  * - Session modes (BRA-233): one session carries a mode — hands-on
  *   (FR-1), co-design (FR-15), improvise (FR-18) — switchable in one
  *   chat message from the GM ("let's go hands-on on this room" /
@@ -106,6 +117,13 @@ import {
   MODE_POLICIES,
   type SessionMode,
 } from "./modes.js";
+import {
+  animateNamedLights,
+} from "./lights.js";
+import {
+  describeLightCommand,
+  parseLightCommand,
+} from "./light-commands.js";
 
 /** What the monitor does with one chat message. */
 export type MessageClass =
@@ -113,6 +131,7 @@ export type MessageClass =
   | "noise" // empty after stripping markup — nothing to answer
   | "roll" // parseRollRequest matched — roll it
   | "question" // parseQuestion matched — answer from live data
+  | "light" // parseLightCommand matched — animate a named light group
   | "build" // a build request parsed cleanly — build it
   | "clarify" // a build request too ambiguous to build — ask in chat
   | "unsupported" // a build request the kit can't do yet — say so
@@ -135,10 +154,11 @@ export function stripHtml(html: string): string {
 /**
  * Route one chat message. Order matters: own first (never self-trigger),
  * then noise, then the deterministic handlers, then "chat". The build
- * parse runs after roll/question so a roll or a data question never
- * gets mistaken for a build request; it needs the build context (the
- * room being built) to resolve "that door" — without it, build
- * requests that need the room fall through to "chat".
+ * parse runs after roll/question/light so a roll, a data question, or a
+ * light command never gets mistaken for a build request — "make the
+ * torches brighter" would otherwise reach the build parser's
+ * "can't do that yet". The light parse needs no build context (the
+ * name resolves against the scene's lights at action time).
  */
 export function classifyMessage(
   msg: ChatMessage,
@@ -156,6 +176,7 @@ export function classifyMessage(
   if (!text) return "noise";
   if (parseRollRequest(text) !== null) return "roll";
   if (parseQuestion(text)) return "question";
+  if (parseLightCommand(text)) return "light";
   if (buildCtx) {
     const build = parseBuildRequest(text, buildCtx);
     if (build) return build.kind;
@@ -556,6 +577,8 @@ export interface MonitorSummary {
   pinsHandled: number;
   combatAnnouncements: number;
   buildsHandled: number;
+  /** Named-light commands animated (BRA-240, FR-7). */
+  lightsHandled: number;
   clarifications: number;
   /** GM whispers acted on as instructions (sequences, builds, questions, clarifications). */
   whispersHandled: number;
@@ -656,6 +679,7 @@ export async function runMonitor(
     pinsHandled: 0,
     combatAnnouncements: 0,
     buildsHandled: 0,
+    lightsHandled: 0,
     clarifications: 0,
     whispersHandled: 0,
     skipped: 0,
@@ -887,6 +911,59 @@ export async function runMonitor(
             } catch (err) {
               log({ event: "error", class: "question", id: msg.id, error: String(err) });
             }
+          }
+          continue;
+        }
+        // Named lights (BRA-240, FR-7): "dim the braziers" animates
+        // the group on the active scene, in parallel, with one
+        // confirmation line. The name resolves at action time, so an
+        // unknown or ambiguous name posts the resolver's error
+        // verbatim as a clarification (it lists the names that
+        // exist) — never a guess. No active scene is a clarification
+        // too. A whispered command is confirmed privately, like any
+        // other reply. The parse runs again here (classify only
+        // returned the class).
+        if (cls === "light") {
+          const cmd = parseLightCommand(text);
+          if (!cmd) {
+            // Classify said light, the parse says otherwise —
+            // defensive; treat as needs-agent rather than acting on
+            // the wrong thing.
+            summary.skipped += 1;
+            log({ event: "needs-agent", id: msg.id, text: text.slice(0, 200) });
+            continue;
+          }
+          if (opts.dryRun) {
+            log({ event: "light", id: msg.id, name: cmd.name, target: cmd.target, dryRun: true });
+            continue;
+          }
+          try {
+            const sceneId = live.getActiveSceneId();
+            if (!sceneId) {
+              await say("I couldn't tell which scene is active.");
+              summary.clarifications += 1;
+              summary.answered += 1;
+              if (whisper) summary.whispersHandled += 1;
+              log({ event: "light-clarify", id: msg.id, reason: "no active scene" });
+              continue;
+            }
+            const { name } = await animateNamedLights(live, sceneId, cmd.name, cmd.target);
+            await say(describeLightCommand(cmd, name));
+            summary.lightsHandled += 1;
+            summary.answered += 1;
+            if (whisper) summary.whispersHandled += 1;
+            log({ event: "light", id: msg.id, name, target: cmd.target });
+          } catch (err) {
+            const reason = err instanceof Error ? err.message : String(err);
+            try {
+              await say(reason);
+            } catch {
+              // The table is unreachable; the log line below is the record.
+            }
+            summary.clarifications += 1;
+            summary.answered += 1;
+            if (whisper) summary.whispersHandled += 1;
+            log({ event: "light-clarify", id: msg.id, error: reason });
           }
           continue;
         }

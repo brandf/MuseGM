@@ -260,7 +260,7 @@ describe("layoutDungeon — themes per room and per dungeon", () => {
     expect(floorTiles(d.rooms[0].layout).every((t) => srcName(t).startsWith("floor-plain") || srcName(t).startsWith("floor-cracked") || srcName(t).startsWith("floor-rubble"))).toBe(true);
     expect(floorTiles(d.rooms[1].layout).every((t) => srcName(t).startsWith("floor-sand"))).toBe(true);
     expect(d.links).toHaveLength(1);
-    expect(d.links[0].from).toEqual({ room: "hall", wall: "south", at: 3, enterGx: 3, enterGy: 4 });
+    expect(d.links[0].from).toEqual({ room: "hall", wall: "south", at: 3, enterGx: 3, enterGy: 4, floor: 0 });
   });
 
   it("a dungeon-level theme re-skins every room at once", () => {

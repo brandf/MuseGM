@@ -284,9 +284,9 @@ describe("layoutDungeon — graph", () => {
     expect(d.links).toHaveLength(1);
     const link = d.links[0];
     // Hall south door at 3: arrive one cell in from the south wall.
-    expect(link.from).toEqual({ room: "hall", wall: "south", at: 3, enterGx: 3, enterGy: 4 });
+    expect(link.from).toEqual({ room: "hall", wall: "south", at: 3, enterGx: 3, enterGy: 4, floor: 0 });
     // Crypt north door at 2: arrive one cell in from the north wall.
-    expect(link.to).toEqual({ room: "crypt", wall: "north", at: 2, enterGx: 2, enterGy: 1 });
+    expect(link.to).toEqual({ room: "crypt", wall: "north", at: 2, enterGx: 2, enterGy: 1, floor: 0 });
   });
 
   it("doorEntryCell is one cell in from each wall", () => {
@@ -299,9 +299,9 @@ describe("layoutDungeon — graph", () => {
   it("resolveDoorWalk returns the other end, or null for an unlinked door", () => {
     const d = layoutDungeon(twoRoom, pack, BASE);
     const intoCrypt = resolveDoorWalk(d, "hall", "south", 3);
-    expect(intoCrypt).toEqual({ room: "crypt", wall: "north", at: 2, enterGx: 2, enterGy: 1 });
+    expect(intoCrypt).toEqual({ room: "crypt", wall: "north", at: 2, enterGx: 2, enterGy: 1, floor: 0 });
     const intoHall = resolveDoorWalk(d, "crypt", "north", 2);
-    expect(intoHall).toEqual({ room: "hall", wall: "south", at: 3, enterGx: 3, enterGy: 4 });
+    expect(intoHall).toEqual({ room: "hall", wall: "south", at: 3, enterGx: 3, enterGy: 4, floor: 0 });
     expect(resolveDoorWalk(d, "hall", "north", 2)).toBeNull();
   });
 

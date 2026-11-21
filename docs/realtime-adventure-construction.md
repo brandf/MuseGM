@@ -108,9 +108,7 @@ fires: scene activates, tokens move up, the floor is shown.
 the climb itself triggers the reveal with no creator action in the
 moment.
 
-**Status:** not built. Needs: a staircase zone type, scene
-visibility/reveal control, and the zone→reveal wiring (extends the
-trigger-zone system, FR-4).
+**Status:** [~] built + unit-tested offline Nov 20 — staircase links in the dungeon graph (floors + derived direction + gates), gated reveal via staircase zones (TrapWatcher reveal-floor action + FloorSession), scene visibility via navigation; live test pending. Monitor routing for stair walks (resolveStairWalk in the monitor loop) is a follow-up.
 
 ### FR-4 — Trigger zones
 
@@ -202,7 +200,7 @@ mage's casting light is a light animation, not a new static light.
 light switch; the creator can name a light ("the center light") and
 change it in one message.
 
-**Status:** [~] built + unit-tested offline Nov 20 — timed transitions (cutscene light step) + named lights (src/session/lights.ts registry, LightSpec.name stamped at build, animateNamedLights); live test pending. Cutscene light-step {name} validation and monitor chat routing ("dim the braziers") are follow-ups.
+**Status:** [~] built + unit-tested offline Nov 20 — timed transitions (cutscene light step) + named lights (src/session/lights.ts registry, LightSpec.name stamped at build, animateNamedLights); live test pending. [~] monitor chat routing built (BRA-240, Nov 20); cutscene light-step {name} is still a follow-up.
 
 ### FR-8 — Undo / tweak
 
@@ -649,8 +647,11 @@ builder grounded in the room + corpse + creature, chat HTML with the
 image inline; popout falls back to chat, honestly). `examples/mice-ogre.json`
 (10 → 38 steps) and `examples/tentacle-twist.json` (7 → 7 steps) both
 validate with `--validate-only`; `tests/emergent.test.ts` (26 checks).
-Still pending: the monitor's GM-whisper handling (a whisper to us is
-an instruction, not chatter), and the live test — which is a real
+Clocks (BRA-228, Nov 20): the round clock now drives visible
+countdown/progress clocks — `parseClockStart`, `advanceClocksToRound`,
+chat rendering; monitor routing and JournalEntry persistence are
+follow-ups. The monitor's GM-whisper handling is built (BRA-185).
+Still pending: the live test — which is a real
 mid-session moment, not a lab case, now with the twist: the reveal
 image landing in chat at the moment of the emergence.
 

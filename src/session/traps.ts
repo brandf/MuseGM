@@ -19,7 +19,14 @@
  *   name), { type: "damage", amount }, { type: "condition", status, rounds },
  *   { type: "cutscene", script } — `script` is a cutscene script object
  *   (a file path is resolved to an object by `resolveZoneSet` before
- *   the watcher is built; see src/session/zone-cutscene.ts).
+ *   the watcher is built; see src/session/zone-cutscene.ts), and
+ *   { type: "reveal-floor", stair, gate? } — a staircase reveal (FR-3):
+ *   the stair is named by its source-scene end, and the reveal is
+ *   executed by an injected FloorRevealPlayer (see
+ *   src/worldbuilding/floors.ts) — the watcher itself knows nothing
+ *   about dungeons. With no player injected, the zone posts a chat
+ *   line saying the reveal is not wired and does nothing (never
+ *   silently pretends a floor was revealed).
  * `triggerFor`: "any" (default), "pcs" (player characters), "npcs".
  * `fireOnce`: true means the zone fires exactly once, then disarms.
  */
@@ -28,6 +35,7 @@ import type { CutsceneScript } from "./cutscene.js";
 import { playCutscene } from "./cutscene.js";
 import { LinkArming } from "./zone-cutscene.js";
 import type { ArmingMode } from "./zone-cutscene.js";
+import type { GateCondition, WallSide } from "../worldbuilding/tiles-layout.js";
 
 export type ZoneShape =
   | { kind: "rect"; x: number; y: number; w: number; h: number }
@@ -45,6 +53,16 @@ export type ZoneAction =
       runKey?: string;
       /** Set by resolveZoneSet when the script inherited the zone's sceneId. */
       sceneIdInherited?: boolean;
+    }
+  | {
+      type: "reveal-floor";
+      /** The staircase, by its source-scene end (the room the zone sits in). */
+      stair: { room: string; wall: WallSide; at: number };
+      /** Gate that must be satisfied before the reveal fires. Absent =
+       *  always open. When both the action and the dungeon carry a
+       *  gate, the action's wins (the zone is the author's latest
+       *  word for this staircase). */
+      gate?: GateCondition;
     };
 
 export interface Zone {
@@ -99,19 +117,34 @@ export type CutscenePlayer = (
   opts?: { runKey?: string },
 ) => Promise<unknown>;
 
+/**
+ * Executes a `reveal-floor` zone action. Injectable so tests can
+ * record the call instead of revealing against a live world; the real
+ * one is `FloorSession.revealPlayer` (src/worldbuilding/floors.ts).
+ * Returns whether the floor was revealed (a gate-blocked reveal
+ * returns false with the reason — the player itself tells the table
+ * what is missing).
+ */
+export type FloorRevealPlayer = (
+  live: FoundryLive,
+  action: Extract<ZoneAction, { type: "reveal-floor" }>,
+  token: { _id: string; name: string },
+) => Promise<{ revealed: boolean; reason?: string }>;
+
 export class TrapWatcher {
   private live: FoundryLive;
   private zoneSet: ZoneSet;
   private gridSize: number;
   private arming = new LinkArming();
   private cutscenePlayer: CutscenePlayer;
+  private floorRevealPlayer: FloorRevealPlayer | null;
   private onFire: ((fire: TrapFire) => void) | null = null;
 
   constructor(
     live: FoundryLive,
     zoneSet: ZoneSet,
     gridSize = 100,
-    opts: { cutscenePlayer?: CutscenePlayer } = {},
+    opts: { cutscenePlayer?: CutscenePlayer; floorRevealPlayer?: FloorRevealPlayer } = {},
   ) {
     this.live = live;
     this.zoneSet = zoneSet;
@@ -119,6 +152,7 @@ export class TrapWatcher {
     this.cutscenePlayer =
       opts.cutscenePlayer ??
       ((liveClient, script, playerOpts) => playCutscene(liveClient, script, playerOpts));
+    this.floorRevealPlayer = opts.floorRevealPlayer ?? null;
   }
 
   /** Called with every firing (in addition to the zone's own actions). */
@@ -219,6 +253,17 @@ export class TrapWatcher {
         );
       } else if (action.type === "cutscene") {
         await this.cutscenePlayer(this.live, action.script, { runKey: action.runKey });
+      } else if (action.type === "reveal-floor") {
+        if (this.floorRevealPlayer) {
+          await this.floorRevealPlayer(this.live, action, token);
+        } else {
+          // No dungeon wired: say so in chat, do nothing. A reveal
+          // that silently did nothing would leave the party staring
+          // at a staircase that never opens.
+          await this.live.sendChat(
+            `🚪 **${token.name}** reaches the stairs, but the way up isn't wired to a dungeon yet — the reveal did nothing (no floor-reveal player on this watcher).`,
+          );
+        }
       }
     }
   }

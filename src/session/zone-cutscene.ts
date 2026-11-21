@@ -28,6 +28,7 @@
 import type { Zone, ZoneAction, ZoneSet } from "./traps.js";
 import type { CutsceneScript } from "./cutscene.js";
 import { validateCutscene, expandCutscene } from "./cutscene.js";
+import { validateGate } from "../worldbuilding/floors.js";
 
 /** How a linked zone re-arms. `once` is the FR-4 default. */
 export type ArmingMode = "once" | "per-token";
@@ -131,6 +132,7 @@ const ACTION_FIELDS: Record<string, Set<string>> = {
   damage: new Set(["type", "amount"]),
   condition: new Set(["type", "status", "rounds"]),
   cutscene: new Set(["type", "script", "runKey"]),
+  "reveal-floor": new Set(["type", "stair", "gate"]),
 };
 
 /**
@@ -254,7 +256,7 @@ export function resolveZoneSet(
         }
         const fields = typeof a.type === "string" ? ACTION_FIELDS[a.type] : undefined;
         if (!fields) {
-          errors.push(`${awhere}: unknown type ${JSON.stringify(a.type)} (known: chat, damage, condition, cutscene).`);
+          errors.push(`${awhere}: unknown type ${JSON.stringify(a.type)} (known: chat, damage, condition, cutscene, reveal-floor).`);
           continue;
         }
         for (const key of Object.keys(a)) {
@@ -295,6 +297,53 @@ export function resolveZoneSet(
                 sceneIdInherited: inherited,
               });
             }
+          }
+        } else if (a.type === "reveal-floor") {
+          // Stair: { room, wall, at } — the staircase's source-scene end.
+          let stair: { room: string; wall: "north" | "south" | "east" | "west"; at: number } | null = null;
+          const rawStair = a.stair;
+          if (!isRecord(rawStair)) {
+            errors.push(`${awhere}: "stair" must be an object {room, wall, at}.`);
+          } else {
+            let bad = false;
+            if (typeof rawStair.room !== "string" || rawStair.room.length === 0) {
+              errors.push(`${awhere}: "stair.room" must be a non-empty string.`);
+              bad = true;
+            }
+            if (
+              typeof rawStair.wall !== "string" ||
+              !["north", "south", "east", "west"].includes(rawStair.wall)
+            ) {
+              errors.push(`${awhere}: "stair.wall" must be north|south|east|west.`);
+              bad = true;
+            }
+            if (typeof rawStair.at !== "number" || !Number.isInteger(rawStair.at) || rawStair.at < 0) {
+              errors.push(`${awhere}: "stair.at" must be a non-negative integer.`);
+              bad = true;
+            }
+            if (!bad) {
+              stair = {
+                room: rawStair.room as string,
+                wall: rawStair.wall as "north" | "south" | "east" | "west",
+                at: rawStair.at as number,
+              };
+            }
+          }
+          let gate: import("../worldbuilding/tiles-layout.js").GateCondition | undefined;
+          if (a.gate !== undefined) {
+            const g = validateGate(a.gate);
+            if (!g.ok) {
+              for (const e of g.errors) errors.push(`${awhere} gate: ${e}`);
+            } else {
+              gate = g.gate;
+            }
+          }
+          if (stair) {
+            actions.push({
+              type: "reveal-floor",
+              stair,
+              ...(gate ? { gate } : {}),
+            });
           }
         }
       }

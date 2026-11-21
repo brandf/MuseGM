@@ -27,9 +27,9 @@
  *
  * What this layer does NOT wire (follow-ups, not this item): the
  * cutscene `light` step still validates `{id} | {at}` only — its
- * validation needs to accept `{name}` and call `animateNamedLights`
- * — and the monitor has no "dim the braziers" chat routing yet.
- * Both are small edits on top of this layer, not part of it.
+ * validation needs to accept `{name}` and call `animateNamedLights`.
+ * The monitor chat routing ("dim the braziers") is built (BRA-240,
+ * Nov 20 — `src/session/light-commands.ts` + the monitor "light" class).
  *
  * Honest limit: resolving a light by proximity, or reading its
  * current state as the animation's `from`, needs the scene's lights

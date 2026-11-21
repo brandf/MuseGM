@@ -35,7 +35,9 @@
     "dressing": "bun run src/cli/dressing.ts",
     "build-loop": "bun run src/cli/build-loop.ts",
     "questlog": "bun run src/cli/questlog.ts",
-    "chronicle": "bun run src/cli/chronicle.ts"
+    "chronicle": "bun run src/cli/chronicle.ts",
+    "clocks": "bun run src/cli/clocks.ts",
+    "scoreboard": "bun run src/cli/scoreboard.ts"
   },
   "type": "module",
   "version": "0.1.0",

@@ -25,7 +25,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import type { FoundryLive } from "../live.js";
-import type { DungeonLayout, DungeonSpec, PackManifest, ResolvedDoorLink, RoomSpec, WallSide } from "./tiles-layout.js";
+import type { DungeonLayout, DungeonSpec, PackManifest, ResolvedDoorLink, ResolvedStairLink, RoomSpec, WallSide } from "./tiles-layout.js";
 import { TILE_PX, layoutDungeon, layoutRoom } from "./tiles-layout.js";
 import { resolveTheme, type ThemeSpec } from "./themes.js";
 import { FLAG_FIELDS, flagValue } from "../idempotency.js";
@@ -292,7 +292,7 @@ export async function buildTileRoom(
     width: layout.width,
     height: layout.height,
     grid: { size: TILE_PX, type: 1, distance: 5, units: "ft" },
-    navigation: true,
+    navigation: spec.hidden !== true,
     ownership,
   };
   if (key) sceneData.flags = flagValue(FLAG_FIELDS.sceneBuild, key);
@@ -476,20 +476,28 @@ export async function uploadTilePack(
 
 export interface BuiltDungeonRoom extends BuiltTileRoom {
   id: string;
+  /** Floor the room is on (FR-3) — 0 when the spec sets none. */
+  floor: number;
 }
 
 export interface BuiltDungeon {
   rooms: BuiltDungeonRoom[];
   links: ResolvedDoorLink[];
+  /** Resolved staircases (FR-3) — empty when the dungeon is single-floor. */
+  stairs: ResolvedStairLink[];
 }
 
 /**
  * Build a whole dungeon: one scene per room (via buildTileRoom), plus
- * the resolved door links. Scenes are NOT activated — the GM activates
- * the entry room when ready. Pure layout/validation happens first in
- * layoutDungeon, so a bad graph fails before any scene is created.
- * A `theme` here re-skins every room that does not set its own
- * (FR-2) — one call, whole dungeon, new look.
+ * the resolved door links and staircases. Scenes are NOT activated —
+ * the GM activates the entry room when ready. Pure layout/validation
+ * happens first in layoutDungeon, so a bad graph fails before any
+ * scene is created. A `theme` here re-skins every room that does not
+ * set its own (FR-2) — one call, whole dungeon, new look.
+ *
+ * With `opts.hideFloors` (FR-3), rooms on those floors build with
+ * navigation off — the floor exists but the players cannot see it
+ * until a gated reveal flips it live (see floors.ts).
  *
  * With `opts.buildKey` (BRA-202), every room is built under
  * `<buildKey>:<room id>` (unless the room's own spec already sets a
@@ -502,19 +510,20 @@ export async function buildDungeon(
   pack: import("./tiles-layout.js").Pack,
   serverBase: string,
   theme?: string | ThemeSpec,
-  opts: { buildKey?: string } = {},
+  opts: { buildKey?: string; hideFloors?: number[] } = {},
 ): Promise<BuiltDungeon> {
   const dungeon: DungeonLayout = layoutDungeon(spec, pack, serverBase, theme);
   const rooms: BuiltDungeonRoom[] = [];
   for (const room of spec.rooms) {
+    const hide = opts.hideFloors?.includes(room.floor ?? 0) === true;
     const keyed: RoomSpec =
       opts.buildKey && !room.buildKey
         ? { ...room, buildKey: `${opts.buildKey}:${room.id}` }
         : room;
-    const built = await buildTileRoom(live, keyed, pack, serverBase, theme);
-    rooms.push({ id: room.id, ...built });
+    const built = await buildTileRoom(live, hide ? { ...keyed, hidden: true } : keyed, pack, serverBase, theme);
+    rooms.push({ id: room.id, floor: room.floor ?? 0, ...built });
   }
-  return { rooms, links: dungeon.links };
+  return { rooms, links: dungeon.links, stairs: dungeon.stairs };
 }
 
 export interface DoorWalkResult {
