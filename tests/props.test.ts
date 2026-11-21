@@ -32,7 +32,7 @@ import { DUNGEON_THEME } from "../src/worldbuilding/themes.js";
 
 const pack: Pack = loadPack(path.resolve(import.meta.dir, "../tiles/manifest.json"));
 const BASE = "worlds/testbed";
-const KNOWN_PROPS = "altar, bones, chest, pillar, ritual-circle, rubble, sconce, skeleton, spear";
+const KNOWN_PROPS = "altar, bones, bones-scattered, bookshelf, chest, chest-open, column-broken, dais-round, pillar, pool-round, ritual-circle, rubble, sconce, skeleton, skeleton-partial, spear, treasure-pile, wall-curved";
 
 /** 8x6 room with one legacy prop (no id — written before ids existed). */
 const baseSpec: RoomSpec = {

@@ -54,10 +54,10 @@ const floorAt = (layout: ReturnType<typeof layoutRoom>, gx: number, gy: number) 
   );
 
 describe("floor-wet tiles in the pack", () => {
-  it("the pack is 33 tiles with 0 gaps (29 shipped + 4 wet)", () => {
-    expect(manifest.tiles).toHaveLength(33);
+  it("the pack is 46 tiles with 0 gaps (28 base + 14 props + 4 macro)", () => {
+    expect(manifest.tiles).toHaveLength(46);
     expect(manifest.gaps).toHaveLength(0);
-    expect(pack.size).toBe(33);
+    expect(pack.size).toBe(46);
   });
 
   it("each wet tile is a 100px floor tile tagged wet, with a real PNG on disk", () => {
