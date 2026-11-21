@@ -223,6 +223,16 @@ export interface RoomSpec {
   overlays?: FloorOverlay[];
   /** Room description posted to chat when the room is built. */
   description?: string;
+  /**
+   * Idempotency key for this room (BRA-202). When set, the key is
+   * stored in the scene's flags (`buildKey`, same field `scene create
+   * --build-key` uses) and every tile/wall/light carries a per-embed
+   * key (`<buildKey>:tile|wall|light:<index>`). A re-run with the same
+   * key returns the existing scene instead of building a duplicate,
+   * and converges a half-built scene to the full layout. Without it,
+   * behavior is unchanged.
+   */
+  buildKey?: string;
 }
 
 /** One Tile document, as sent to Foundry. */
@@ -238,6 +248,9 @@ export interface TileDoc {
   alpha: number;
   hidden: boolean;
   locked: boolean;
+  /** Optional document flags — a keyed build (BRA-202) stamps the
+   *  per-embed key here so a re-run can find this tile again. */
+  flags?: Record<string, unknown>;
 }
 
 export interface RoomLayout {

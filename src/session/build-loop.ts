@@ -21,20 +21,30 @@
  *   request at all). Only the intents the composer already supports:
  *   room create, widen, door add/move (incl. secret doors), dressing
  *   add, fog add, regional overlay, corridor. Anything else is
- *   "unsupported", never a hallucinated build.
+ *   "unsupported", never a hallucinated build. `parseBuildRequests`
+ *   is the compound form: "add a door here and widen the room" is
+ *   two ops, applied in order, one confirmation line each.
  * - `applyOp` / `BuildSession` — the edit history. Layout ops are
  *   pure and non-mutating, so the history is just a list of specs and
  *   undo is the previous one. Every entry records the GM's exact
- *   words + the op, so the history reads in chat.
+ *   words + the op, so the history reads in chat. The session
+ *   snapshots to a state file (`.build-state.json` by default, see
+ *   `saveBuildState` / `loadBuildState`) so a monitor restart keeps
+ *   the dungeon and the rooms already built on the server.
  * - `planSync` — given the dungeon before and after an edit and the
  *   rooms already built on the server, which rooms to build, rebuild,
  *   or delete. The executor runs the plan; this module only plans it.
  *
  * "Here" (FR-1: "add a door here") resolves from the named wall, or
- * the monitor asks which wall — the parser never guesses a position.
- * Resolving "here" from the GM's last ping/cursor is a live follow-up
- * (the monitor doesn't track cursor positions yet); see BACKLOG.md.
+ * from the GM's last ping/cursor when the monitor passes it in
+ * `BuildParseContext.here` (the ping's scene identifies the room, the
+ * point identifies the wall/cell) — or the monitor asks which wall.
+ * The parser never guesses a position. Rooms are targetable by name
+ * ("widen the Entry Hall") via `BuildParseContext.rooms`; a named
+ * room becomes the active room, so the next edit lands there too.
  */
+import * as fs from "node:fs";
+import * as path from "node:path";
 import {
   addCorridor,
   applyOverlay,
@@ -68,23 +78,31 @@ export type BuildOp =
       torches: boolean;
       fog: boolean;
     }
-  | { type: "widen"; side: WallSide; by: number }
-  | { type: "add-door"; wall: WallSide; at: number; secret?: boolean }
-  | { type: "move-door"; wall: WallSide; fromAt: number; toAt: number }
-  | { type: "add-dressing"; tile: string; where: DressingWhere }
-  | { type: "add-torches" }
-  | { type: "add-fog" }
-  | { type: "overlay"; region: OverlayRegion; variants: Record<string, string> }
-  | { type: "add-corridor"; direction: WallSide; length: number; unit: LengthUnit }
+  | { type: "widen"; side: WallSide; by: number; target?: string }
+  | { type: "add-door"; wall: WallSide; at: number; secret?: boolean; target?: string }
+  | { type: "move-door"; wall: WallSide; fromAt: number; toAt: number; target?: string }
+  | { type: "add-dressing"; tile: string; where: DressingWhere; target?: string }
+  | { type: "add-torches"; target?: string }
+  | { type: "add-fog"; target?: string }
+  | { type: "overlay"; region: OverlayRegion; variants: Record<string, string>; target?: string }
+  | { type: "add-corridor"; direction: WallSide; length: number; unit: LengthUnit; target?: string }
   | { type: "undo" }
   | { type: "redo" };
+
+/**
+ * `target` (a room id) is set when the GM named the room ("widen the
+ * Entry Hall") or pinged its scene ("add a door here"). Without it the
+ * op applies to the active room. A targeted op also makes that room
+ * the active one, so the next edit lands there too.
+ */
 
 /** Where a dressing tile goes, in the creator's words — resolved to
  *  cells at apply time, against the room's actual size. */
 export type DressingWhere =
   | { kind: "corner"; corner?: "nw" | "ne" | "sw" | "se" }
   | { kind: "center" }
-  | { kind: "entry" };
+  | { kind: "entry" }
+  | { kind: "cell"; gx: number; gy: number };
 
 export type OverlayRegion = "north-half" | "south-half" | "east-half" | "west-half" | "whole";
 
@@ -94,10 +112,15 @@ export type BuildParseResult =
   | { kind: "clarify"; question: string }
   | { kind: "unsupported"; reason: string };
 
-/** What the parser may need from the session to resolve "that door"
- *  and "this room": the room currently being built. */
+/** What the parser may need from the session to resolve "that door",
+ *  "this room", a room named in the line, and "here": the room
+ *  currently being built, all the rooms in the dungeon, and the GM's
+ *  last ping/cursor point (scene already resolved to a room id by the
+ *  caller — the monitor owns the scene -> room map). */
 export interface BuildParseContext {
   room?: RoomSpec;
+  rooms?: DungeonRoomSpec[];
+  here?: { roomId: string; x: number; y: number };
 }
 
 /** The loop's state: a dungeon (rooms + links) and which room the
@@ -236,6 +259,171 @@ function parseCell(text: string): number | null {
   return m ? Number(m[1]) : null;
 }
 
+// ---------------------------------------------------------------- resolving rooms + "here"
+
+function normalizeName(s: string): string {
+  return s.toLowerCase().replace(/[^a-z0-9]+/g, " ").replace(/\s+/g, " ").trim();
+}
+
+function escapeRegExp(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+const NAME_MENTION_STOP = new Set([
+  "wall", "side", "half", "door", "corner", "middle", "center", "centre",
+  "north", "south", "east", "west", "up", "down", "left", "right",
+]);
+
+/**
+ * A capitalized phrase after "the"/"in"/"to"/"of"/"from"/"into" that
+ * looks like a room name ("the Entry Hall", "the Sunken Chapel", "the
+ * Crypt") — a name the GM typed, not a word the parser invented.
+ * Wall phrases ("the North Wall"), halves ("the North Half"), and
+ * lone non-kind words ("the GM") never count. Returns the phrase in
+ * its original case, or null.
+ */
+function parseNameMention(s: string): string | null {
+  const re = /\b(?:the|in|to|of|from|into)\s+([A-Z][A-Za-z'’-]*(?:\s+[A-Z][A-Za-z'’-]*)*)/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(s)) !== null) {
+    const phrase = m[1].replace(/\s+/g, " ").trim();
+    const words = phrase.toLowerCase().split(" ");
+    if (NAME_MENTION_STOP.has(words[words.length - 1])) continue;
+    const hasKind = words.some((w) => (ROOM_KINDS as readonly string[]).includes(w));
+    if (!hasKind && words.length < 2) continue;
+    return phrase;
+  }
+  return null;
+}
+
+/** The room(s) a line names, by whole-phrase match against the known
+ *  room names ("the Entry Hall" matches "Entry Hall" but not "Hall").
+ *  A longer name that contains a shorter one wins ("Entry Hall" over
+ *  "Hall"); two names neither of which contains the other is a real
+ *  ambiguity. */
+function matchNamedRooms(
+  s: string,
+  rooms: DungeonRoomSpec[],
+): DungeonRoomSpec[] {
+  const norm = ` ${normalizeName(s)} `;
+  const matches = rooms.filter((r) => {
+    const name = normalizeName(r.name);
+    return name !== "" && new RegExp(`\\b${escapeRegExp(name)}\\b`).test(norm);
+  });
+  if (matches.length <= 1) return matches;
+  const sorted = [...matches].sort((a, b) => b.name.length - a.name.length);
+  const longest = sorted[0];
+  if (sorted.slice(1).every((m) => normalizeName(longest.name).includes(normalizeName(m.name)))) {
+    return [longest];
+  }
+  return matches;
+}
+
+export type RoomTarget =
+  | { id: string }
+  | { clarify: string };
+
+/**
+ * Resolve which room a room-scoped line targets: a named room, the
+ * pinged room ("here"), or neither (the active room). A name that
+ * matches nothing is a question, never a guess — the GM typed a name
+ * on purpose. A line that names a room AND pings a different one is a
+ * question too (the ping and the name disagree).
+ */
+export function resolveRoomTarget(
+  s: string,
+  ctx?: BuildParseContext,
+): RoomTarget | null {
+  const rooms = ctx?.rooms ?? [];
+  let named: DungeonRoomSpec | null = null;
+  if (rooms.length > 0) {
+    const matches = matchNamedRooms(s, rooms);
+    if (matches.length > 1) {
+      return {
+        clarify: `You named ${matches.map((r) => `"${r.name}"`).join(" and ")} in one line — which room did you mean?`,
+      };
+    }
+    if (matches.length === 1) named = matches[0];
+    if (!named) {
+      const mention = parseNameMention(s);
+      if (mention) {
+        return {
+          clarify: `I don't have a room called "${mention}" yet — the rooms I have are ${rooms.map((r) => r.name).join(", ")}. Build it first, or name one of those.`,
+        };
+      }
+    }
+  }
+  const here = /\bhere\b/i.test(s) ? ctx?.here : undefined;
+  if (here) {
+    if (named && named.id !== here.roomId) {
+      const pinged = rooms.find((r) => r.id === here.roomId);
+      return {
+        clarify: `You pinged the ${pinged ? pinged.name : "other room"} but named the ${named.name} — which room did you mean?`,
+      };
+    }
+    return { id: here.roomId };
+  }
+  if (named) return { id: named.id };
+  return null;
+}
+
+/** The room a room-scoped op acts on: the target room when the line
+ *  named or pinged one, else the active room. */
+function roomForTarget(ctx: BuildParseContext | undefined, targetId: string | undefined): RoomSpec | undefined {
+  if (targetId && ctx?.rooms) {
+    return ctx.rooms.find((r) => r.id === targetId);
+  }
+  return ctx?.room;
+}
+
+/**
+ * Resolve a ping/cursor point (scene px) against a room: the cell it
+ * lands in, the nearest wall, and the cell along that wall (clamped
+ * to the door range 1..n-2 — doors may not sit in a corner). Ties
+ * break north, then south, then west, then east, so the answer is
+ * deterministic.
+ */
+export function resolveHere(
+  x: number,
+  y: number,
+  room: RoomSpec,
+): { wall: WallSide; at: number; gx: number; gy: number } {
+  const gx = Math.max(0, Math.min(room.gridW - 1, Math.floor(x / TILE_PX)));
+  const gy = Math.max(0, Math.min(room.gridH - 1, Math.floor(y / TILE_PX)));
+  const d: [WallSide, number][] = [
+    ["north", y],
+    ["south", room.gridH * TILE_PX - y],
+    ["west", x],
+    ["east", room.gridW * TILE_PX - x],
+  ];
+  let wall: WallSide = "north";
+  let best = Infinity;
+  for (const [w, dist] of d) {
+    if (dist < best) {
+      best = dist;
+      wall = w;
+    }
+  }
+  const n = wall === "north" || wall === "south" ? room.gridW : room.gridH;
+  const along = wall === "north" || wall === "south" ? gx : gy;
+  const at = Math.max(1, Math.min(Math.max(1, n - 2), along));
+  return { wall, at, gx, gy };
+}
+
+/**
+ * Resolve a ping/cursor point to the overlay half it sits in: the
+ * axis the point is furthest from the centre line on, wins. A point
+ * dead on a centre line takes the north/south half on a tie.
+ */
+export function resolveHereRegion(x: number, y: number, room: RoomSpec): OverlayRegion {
+  const gx = Math.max(0, Math.min(room.gridW - 1, Math.floor(x / TILE_PX)));
+  const gy = Math.max(0, Math.min(room.gridH - 1, Math.floor(y / TILE_PX)));
+  const fx = Math.abs(gx + 0.5 - room.gridW / 2) / room.gridW;
+  const fy = Math.abs(gy + 0.5 - room.gridH / 2) / room.gridH;
+  if (fy >= fx) return gy + 0.5 < room.gridH / 2 ? "north-half" : "south-half";
+  return gx + 0.5 < room.gridW / 2 ? "west-half" : "east-half";
+}
+
 const BUILD_VERBS =
   /\b(build|make|create|add|put|place|move|widen|carve|dig|undo|redo)\b/i;
 const BUILD_NOUNS =
@@ -251,13 +439,19 @@ const BUILD_NOUNS =
  *   "build an 8x6 room / entry hall / crypt [with a south door] [and a chest] [with torches]"
  *   "start with a small entry room"
  *   "make this room 10 units wider" / "a bit wider" / "widen the room west by 5"
+ *   "widen the Entry Hall 10 units east" (a named room, when ctx.rooms lists it)
  *   "add a door [on the north wall]" / "put a secret door in the north wall"
+ *   "add a door here" (the ping: nearest wall + cell, when ctx.here is set)
  *   "move that door left" / "move the south door to cell 5"
  *   "add some bones / rubble / a pillar / a chest [in the corner / in the middle / near the door]"
+ *   "add some bones here" (the pinged cell, when ctx.here is set)
  *   "add torches" / "add fog" / "more fog"
  *   "make the north half underwater" / "make this part underwater" (→ asks which part)
  *   "add a corridor going north for 100 meters"
  *   "undo that" / "redo that"
+ *
+ * Compound requests ("add a door here and widen the room") are
+ * `parseBuildRequests`, below — this function parses one segment.
  */
 export function parseBuildRequest(
   text: string,
@@ -277,8 +471,17 @@ export function parseBuildRequest(
   }
 
   // Corridor — direction first, length in the creator's units.
+  // "Add a corridor here" runs through the wall nearest the ping.
   if (/\bcorridor\b/i.test(s)) {
-    const direction = parseDirection(s);
+    const target = resolveRoomTarget(s, ctx);
+    if (target && "clarify" in target) {
+      return { kind: "clarify", question: target.clarify };
+    }
+    let direction = parseDirection(s);
+    if (!direction && /\bhere\b/i.test(s) && ctx?.here) {
+      const room = roomForTarget(ctx, target?.id);
+      if (room) direction = resolveHere(ctx.here.x, ctx.here.y, room).wall;
+    }
     if (!direction) {
       return {
         kind: "clarify",
@@ -286,17 +489,28 @@ export function parseBuildRequest(
       };
     }
     const len = parseLength(s) ?? { value: 10, unit: "squares" as LengthUnit };
-    return { kind: "build", op: { type: "add-corridor", direction, length: len.value, unit: len.unit } };
+    return { kind: "build", op: { type: "add-corridor", direction, length: len.value, unit: len.unit, ...(target ? { target: target.id } : {}) } };
   }
 
   // Widen — "make this room 10 units wider", "a bit wider". Runs
   // before create-room: "make this room wider" contains "make" + "room"
-  // and would otherwise parse as a create.
+  // and would otherwise parse as a create. "Widen here" widens the
+  // wall nearest the ping; without a ping the named direction (or
+  // east) stands, as before.
   if (isWidenRequest(s)) {
-    const side = parseDirection(s) ?? "east";
+    const target = resolveRoomTarget(s, ctx);
+    if (target && "clarify" in target) {
+      return { kind: "clarify", question: target.clarify };
+    }
+    let side = parseDirection(s);
+    if (!side && /\bhere\b/i.test(s) && ctx?.here) {
+      const room = roomForTarget(ctx, target?.id);
+      if (room) side = resolveHere(ctx.here.x, ctx.here.y, room).wall;
+    }
+    side ??= "east";
     const len = parseLength(s);
     const by = len ? toSquares(len.value, len.unit) : 2;
-    return { kind: "build", op: { type: "widen", side, by: Math.max(1, by) } };
+    return { kind: "build", op: { type: "widen", side, by: Math.max(1, by), ...(target ? { target: target.id } : {}) } };
   }
 
   // Create a room. "Build a 3-room dungeon" has no standalone room
@@ -357,17 +571,30 @@ export function parseBuildRequest(
     };
   }
 
-  // Add a door.
+  // Add a door. "Here" is the ping: the nearest wall and the cell
+  // along it (a named wall or cell wins over the ping).
   if (/\b(add|put|place)\b/i.test(s) && /\bdoor\b/i.test(s)) {
     const secret = /\b(secret|hidden)\b/i.test(s);
-    const wall = parseWall(s);
+    const target = resolveRoomTarget(s, ctx);
+    if (target && "clarify" in target) {
+      return { kind: "clarify", question: target.clarify };
+    }
+    let wall = parseWall(s);
+    let at = parseCell(s);
+    if ((!wall || at === null) && /\bhere\b/i.test(s) && ctx?.here) {
+      const room = roomForTarget(ctx, target?.id);
+      if (room) {
+        const here = resolveHere(ctx.here.x, ctx.here.y, room);
+        wall ??= here.wall;
+        at ??= here.at;
+      }
+    }
     if (!wall) {
       return {
         kind: "clarify",
         question: `Which wall should the ${secret ? "secret " : ""}door go on — north, south, east, or west?`,
       };
     }
-    const at = parseCell(s);
     return {
       kind: "build",
       op: {
@@ -375,16 +602,24 @@ export function parseBuildRequest(
         wall,
         at: at ?? -1, // -1 = middle cell, resolved at apply time
         ...(secret ? { secret: true } : {}),
+        ...(target ? { target: target.id } : {}),
       },
     };
   }
 
-  // Move a door.
+  // Move a door. "Here" is the ping: the wall nearest it.
   if (/\bmove\b/i.test(s) && /\bdoor\b/i.test(s)) {
-    const wall = parseWall(s);
-    const toAt = parseCell(s);
-    const room = ctx?.room;
+    const target = resolveRoomTarget(s, ctx);
+    if (target && "clarify" in target) {
+      return { kind: "clarify", question: target.clarify };
+    }
+    const room = roomForTarget(ctx, target?.id);
     const doors = room?.doors ?? [];
+    let wall = parseWall(s);
+    if (!wall && /\bhere\b/i.test(s) && ctx?.here && room) {
+      wall = resolveHere(ctx.here.x, ctx.here.y, room).wall;
+    }
+    const toAt = parseCell(s);
     let from: DoorSpec | undefined;
     if (wall) {
       const onWall = doors.filter((d) => d.wall === wall);
@@ -419,7 +654,7 @@ export function parseBuildRequest(
     }
     const effectiveWall = from.wall;
     if (toAt !== null) {
-      return { kind: "build", op: { type: "move-door", wall: effectiveWall, fromAt: from.at, toAt } };
+      return { kind: "build", op: { type: "move-door", wall: effectiveWall, fromAt: from.at, toAt, ...(target ? { target: target.id } : {}) } };
     }
     const dir = /\bleft\b/i.test(s) ? -1 : /\bright\b/i.test(s) ? 1 : 0;
     if (dir === 0) {
@@ -432,12 +667,13 @@ export function parseBuildRequest(
     const steps = byM ? Number(byM[1]) : 1;
     const step = dir === -1 ? leftDelta(effectiveWall) : -leftDelta(effectiveWall);
     const to = from.at + step * steps;
-    return { kind: "build", op: { type: "move-door", wall: effectiveWall, fromAt: from.at, toAt: to } };
+    return { kind: "build", op: { type: "move-door", wall: effectiveWall, fromAt: from.at, toAt: to, ...(target ? { target: target.id } : {}) } };
   }
 
   // Dressing — bones, rubble, pillar, ritual circle, altar, skeleton,
-  // chest. "Here" with no position asks; no position defaults to the
-  // south-east corner (said in the summary, so it's visible).
+  // chest. "Here" is the ping: the dressing lands on the pinged cell
+  // (an explicit corner/middle/near-the-door wins over the ping);
+  // without a ping, "here" asks where, as before.
   const DRESSING_TILES: Record<string, string> = {
     bones: "bones",
     bone: "bones",
@@ -454,7 +690,20 @@ export function parseBuildRequest(
   ).exec(s);
   if (dressingMatch) {
     const tile = DRESSING_TILES[dressingMatch[2].toLowerCase()];
-    if (/\bhere\b/i.test(s) && !/\b(corner|middle|center|near|by)\b/i.test(s)) {
+    const target = resolveRoomTarget(s, ctx);
+    if (target && "clarify" in target) {
+      return { kind: "clarify", question: target.clarify };
+    }
+    const hasPosition = /\b(corner|middle|center|near|by)\b/i.test(s);
+    if (/\bhere\b/i.test(s) && !hasPosition) {
+      const room = roomForTarget(ctx, target?.id);
+      if (room && ctx?.here) {
+        const here = resolveHere(ctx.here.x, ctx.here.y, room);
+        return {
+          kind: "build",
+          op: { type: "add-dressing", tile, where: { kind: "cell", gx: here.gx, gy: here.gy }, ...(target ? { target: target.id } : {}) },
+        };
+      }
       return {
         kind: "clarify",
         question: `Where should the ${tile} go — in a corner, in the middle, or near the door?`,
@@ -472,25 +721,42 @@ export function parseBuildRequest(
         : /\b(near|by|next to)\b.{0,12}\bdoor\b/i.test(s)
           ? { kind: "entry" }
           : { kind: "corner", corner: "se" };
-    return { kind: "build", op: { type: "add-dressing", tile, where } };
+    return { kind: "build", op: { type: "add-dressing", tile, where, ...(target ? { target: target.id } : {}) } };
   }
 
   // Torches — the dressing pass, torch items only (candles and
   // braziers have no tiles yet, so they are never smuggled in).
   if (/\b(add|put|more)\b/i.test(s) && /\btorches?\b/i.test(s)) {
-    return { kind: "build", op: { type: "add-torches" } };
+    const target = resolveRoomTarget(s, ctx);
+    if (target && "clarify" in target) {
+      return { kind: "clarify", question: target.clarify };
+    }
+    return { kind: "build", op: { type: "add-torches", ...(target ? { target: target.id } : {}) } };
   }
 
   // Fog.
   if (/\b(add|more|foggy|fog)\b/i.test(s) && /\bfog\b/i.test(s)) {
-    return { kind: "build", op: { type: "add-fog" } };
+    const target = resolveRoomTarget(s, ctx);
+    if (target && "clarify" in target) {
+      return { kind: "clarify", question: target.clarify };
+    }
+    return { kind: "build", op: { type: "add-fog", ...(target ? { target: target.id } : {}) } };
   }
 
   // Regional overlay — "make the north half underwater". "This part"
-  // with no region asks which part.
+  // with no region asks which part; "here" takes the half the ping
+  // sits in.
   if (/\b(underwater|wet|flooded)\b/i.test(s)) {
-    const region = /\b(north|south|east|west)\s+half\b/i.exec(s)?.[1].toLowerCase() as
-      | "north" | "south" | "east" | "west" | undefined;
+    const target = resolveRoomTarget(s, ctx);
+    if (target && "clarify" in target) {
+      return { kind: "clarify", question: target.clarify };
+    }
+    const half = /\b(north|south|east|west)\s+half\b/i.exec(s)?.[1].toLowerCase();
+    let region: OverlayRegion | undefined = half ? `${half}-half` as OverlayRegion : undefined;
+    if (!region && /\bhere\b/i.test(s) && ctx?.here) {
+      const room = roomForTarget(ctx, target?.id);
+      if (room) region = resolveHereRegion(ctx.here.x, ctx.here.y, room);
+    }
     if (!region && /\bwhole\b/i.test(s)) {
       return {
         kind: "build",
@@ -498,6 +764,7 @@ export function parseBuildRequest(
           type: "overlay",
           region: "whole",
           variants: { "floor-plain": "floor-dark", "floor-cracked": "floor-dark", "floor-rubble": "floor-dark" },
+          ...(target ? { target: target.id } : {}),
         },
       };
     }
@@ -511,8 +778,9 @@ export function parseBuildRequest(
       kind: "build",
       op: {
         type: "overlay",
-        region: `${region}-half` as OverlayRegion,
+        region,
         variants: { "floor-plain": "floor-dark", "floor-cracked": "floor-dark", "floor-rubble": "floor-dark" },
+        ...(target ? { target: target.id } : {}),
       },
     };
   }
@@ -542,6 +810,59 @@ export function parseBuildRequest(
   return null;
 }
 
+// ---------------------------------------------------------------- compound requests
+
+/** What the compound parser decided about one chat line. */
+export type CompoundParseResult =
+  | { kind: "build"; ops: BuildOp[] }
+  | { kind: "clarify"; question: string }
+  | { kind: "unsupported"; reason: string };
+
+/** Split a line on "and" / "then" (", and" too) — the joints between
+ *  two build requests. Returns null for a single request. */
+function splitCompound(text: string): string[] | null {
+  const parts = text
+    .split(/\s+(?:and|then)\s+|\s*,\s+and\s+/i)
+    .map((p) => p.trim())
+    .filter((p) => p !== "");
+  return parts.length > 1 ? parts : null;
+}
+
+/**
+ * Parse one chat line into a list of build decisions, in order.
+ * "add a door on the north wall and widen the room 10 east" is two
+ * ops; each segment must parse standalone — a segment that is not a
+ * complete request ("add bones and torches", where "torches" has no
+ * verb) falls back to parsing the whole line as one request, so a
+ * line that parsed before still parses exactly the same way. A
+ * segment that asks a question or is out of scope falls back the
+ * same way: the whole line gets the single-request answer.
+ */
+export function parseBuildRequests(
+  text: string,
+  ctx?: BuildParseContext,
+): CompoundParseResult | null {
+  const single = parseBuildRequest(text, ctx);
+  const parts = splitCompound(text);
+  if (!parts) {
+    if (!single) return null;
+    if (single.kind === "build") return { kind: "build", ops: [single.op] };
+    return single;
+  }
+  const ops: BuildOp[] = [];
+  for (const part of parts) {
+    const parsed = parseBuildRequest(part, ctx);
+    if (!parsed || parsed.kind !== "build") {
+      // Not a clean compound — answer the whole line as one request.
+      if (!single) return null;
+      if (single.kind === "build") return { kind: "build", ops: [single.op] };
+      return single;
+    }
+    ops.push(parsed.op);
+  }
+  return { kind: "build", ops };
+}
+
 // ---------------------------------------------------------------- applying ops
 
 function slugify(name: string): string {
@@ -569,6 +890,21 @@ function roomById(state: BuildState, id: string): DungeonRoomSpec {
   const room = state.dungeon.rooms.find((r) => r.id === id);
   if (!room) throw new Error(`No room "${id}" in this build.`);
   return room;
+}
+
+/** The room an op acts on: the named/pinged target, else the active
+ *  room. Throws a plain-English error when there is no room at all,
+ *  or the target isn't in this build. */
+function targetRoom(state: BuildState, op: { target?: string }, noRoom: string): DungeonRoomSpec {
+  const id = op.target ?? state.activeRoom;
+  if (!id) throw new Error(noRoom);
+  return roomById(state, id);
+}
+
+/** A targeted op makes its room the active one, so the next edit
+ *  lands there too; an untargeted op keeps the focus where it was. */
+function withFocus(state: BuildState, op: { target?: string }): BuildState {
+  return op.target ? { ...state, activeRoom: op.target } : state;
 }
 
 function replaceRoom(state: BuildState, room: DungeonRoomSpec): BuildState {
@@ -607,6 +943,11 @@ function resolvePlacement(
   switch (where.kind) {
     case "center":
       return { gx: Math.floor((room.gridW - size) / 2), gy: Math.floor((room.gridH - size) / 2) };
+    case "cell":
+      return {
+        gx: Math.max(0, Math.min(room.gridW - size, where.gx)),
+        gy: Math.max(0, Math.min(room.gridH - size, where.gy)),
+      };
     case "entry": {
       const first = room.doors?.[0];
       if (!first) throw new Error(`There's no door in this room to put the "${tile}" near.`);
@@ -741,19 +1082,17 @@ export function applyOp(
       };
     }
     case "widen": {
-      if (!state.activeRoom) throw new Error("No room to widen yet — build a room first.");
-      const room = roomById(state, state.activeRoom);
+      const room = targetRoom(state, op, "No room to widen yet — build a room first.");
       // widenRoom returns a RoomSpec; the dungeon id lives on our side.
       const next: DungeonRoomSpec = { ...widenRoom(room, op.side, op.by), id: room.id };
       return {
-        state: replaceRoom(state, next),
+        state: withFocus(replaceRoom(state, next), op),
         summary: `Widened the ${room.name} ${op.by} ${op.by === 1 ? "square" : "squares"} ${op.side} (now ${next.gridW}×${next.gridH}).`,
         changed: true,
       };
     }
     case "add-door": {
-      if (!state.activeRoom) throw new Error("No room to add a door to yet — build a room first.");
-      const room = roomById(state, state.activeRoom);
+      const room = targetRoom(state, op, "No room to add a door to yet — build a room first.");
       const at = op.at === -1 ? middleAt(op.wall, room.gridW, room.gridH) : op.at;
       checkDoorAt(op.wall, at, room.gridW, room.gridH);
       const clash = [...(room.doors ?? []), ...(room.openings ?? [])].some(
@@ -767,14 +1106,13 @@ export function applyOp(
         doors: [...(room.doors ?? []), { wall: op.wall, at, ...(op.secret ? { secret: true } : {}) }],
       };
       return {
-        state: replaceRoom(state, next),
+        state: withFocus(replaceRoom(state, next), op),
         summary: `Added a ${op.secret ? "secret " : ""}door to the ${op.wall} wall of the ${room.name}.`,
         changed: true,
       };
     }
     case "move-door": {
-      if (!state.activeRoom) throw new Error("No room with a door to move yet — build a room first.");
-      const room = roomById(state, state.activeRoom);
+      const room = targetRoom(state, op, "No room with a door to move yet — build a room first.");
       const door = (room.doors ?? []).find((d) => d.wall === op.wall && d.at === op.fromAt);
       if (!door) {
         throw new Error(`There's no door on the ${op.wall} wall at cell ${op.fromAt} to move.`);
@@ -796,14 +1134,13 @@ export function applyOp(
         ),
       };
       return {
-        state: replaceRoom(state, next),
+        state: withFocus(replaceRoom(state, next), op),
         summary: `Moved the ${op.wall} door from cell ${op.fromAt} to cell ${op.toAt}.`,
         changed: true,
       };
     }
     case "add-dressing": {
-      if (!state.activeRoom) throw new Error("No room to dress yet — build a room first.");
-      const room = roomById(state, state.activeRoom);
+      const room = targetRoom(state, op, "No room to dress yet — build a room first.");
       const { gx, gy } = resolvePlacement(op.where, op.tile, room, pack);
       const next: DungeonRoomSpec = {
         ...room,
@@ -814,29 +1151,29 @@ export function applyOp(
           ? ` in the ${op.where.corner ?? "se"} corner`
           : op.where.kind === "center"
             ? " in the middle"
-            : " by the door";
+            : op.where.kind === "cell"
+              ? " where you pinged"
+              : " by the door";
       return {
-        state: replaceRoom(state, next),
+        state: withFocus(replaceRoom(state, next), op),
         summary: `Added ${op.tile === "bones" ? "some bones" : `a ${op.tile}`} to the ${room.name}${whereNote}.`,
         changed: true,
       };
     }
     case "add-torches": {
-      if (!state.activeRoom) throw new Error("No room to light yet — build a room first.");
-      const room = roomById(state, state.activeRoom);
+      const room = targetRoom(state, op, "No room to light yet — build a room first.");
       const merged = mergeTorches(room);
       if (merged.added === 0) {
         return { state, summary: `The ${room.name} already has torches on every wall.`, changed: false };
       }
       return {
-        state: replaceRoom(state, merged.room),
+        state: withFocus(replaceRoom(state, merged.room), op),
         summary: `Added ${merged.added} torches to the ${room.name}.`,
         changed: true,
       };
     }
     case "add-fog": {
-      if (!state.activeRoom) throw new Error("No room to fog yet — build a room first.");
-      const room = roomById(state, state.activeRoom);
+      const room = targetRoom(state, op, "No room to fog yet — build a room first.");
       const tile = "fog-wisp-large";
       const size = tileCells(tile, pack);
       if (size > room.gridW || size > room.gridH) {
@@ -855,7 +1192,7 @@ export function applyOp(
         fog: [...(room.fog ?? []), { tile, gx, gy }],
       };
       return {
-        state: replaceRoom(state, next),
+        state: withFocus(replaceRoom(state, next), op),
         summary:
           n === 0
             ? `Added fog to the ${room.name}.`
@@ -864,22 +1201,20 @@ export function applyOp(
       };
     }
     case "overlay": {
-      if (!state.activeRoom) throw new Error("No room to flood yet — build a room first.");
-      const room = roomById(state, state.activeRoom);
+      const room = targetRoom(state, op, "No room to flood yet — build a room first.");
       const rect = overlayRect(op.region, room.gridW, room.gridH);
       // applyOverlay returns a RoomSpec; the dungeon id lives on our side.
       const next: DungeonRoomSpec = { ...applyOverlay(room, { ...rect, variants: op.variants }), id: room.id };
       const regionName =
         op.region === "whole" ? "the whole room" : `the ${op.region.replace("-half", "")} half`;
       return {
-        state: replaceRoom(state, next),
+        state: withFocus(replaceRoom(state, next), op),
         summary: `Made ${regionName} of the ${room.name} underwater.`,
         changed: true,
       };
     }
     case "add-corridor": {
-      if (!state.activeRoom) throw new Error("No room to run a corridor from yet — build a room first.");
-      const fromRoom = roomById(state, state.activeRoom);
+      const fromRoom = targetRoom(state, op, "No room to run a corridor from yet — build a room first.");
       const wall = op.direction; // the corridor leaves through the wall it runs toward
       const n = cellsAlong(wall, fromRoom.gridW, fromRoom.gridH);
       const at = Math.floor(n / 2);
@@ -997,6 +1332,108 @@ export class BuildSession {
     const entry = this.entries[this.index];
     this.index += 1;
     return entry;
+  }
+
+  /** The whole session as plain JSON: every state, every entry, the
+   *  index into them. `built` is the executor's map (room id -> what
+   *  the server already holds) — it travels with the session so a
+   *  restart doesn't rebuild rooms that already exist as scenes. */
+  snapshot(built?: Map<string, BuiltRoomRef>): BuildSessionSnapshot {
+    return {
+      version: 1,
+      states: clone(this.states),
+      entries: clone(this.entries),
+      index: this.index,
+      built: Object.fromEntries(built ?? new Map()),
+    };
+  }
+
+  /** Replace this session's history with a snapshot's. Returns false
+   *  when the snapshot is the wrong shape (a corrupt state file) —
+   *  the caller starts fresh instead. */
+  restore(snap: unknown): boolean {
+    if (!isBuildSessionSnapshot(snap)) return false;
+    this.states = clone(snap.states);
+    this.entries = clone(snap.entries);
+    this.index = snap.index;
+    return true;
+  }
+}
+
+/** A BuildSession as plain JSON (version 1). */
+export interface BuildSessionSnapshot {
+  version: 1;
+  states: BuildState[];
+  entries: BuildHistoryEntry[];
+  index: number;
+  built: Record<string, BuiltRoomRef>;
+}
+
+/** Shape check for a snapshot read back from disk — every field the
+ *  session needs, nothing assumed about the rest. */
+export function isBuildSessionSnapshot(v: unknown): v is BuildSessionSnapshot {
+  if (!v || typeof v !== "object") return false;
+  const s = v as Record<string, unknown>;
+  if (s.version !== 1) return false;
+  if (!Array.isArray(s.states) || s.states.length === 0) return false;
+  if (!Array.isArray(s.entries)) return false;
+  if (typeof s.index !== "number" || s.index < 0 || s.index >= s.states.length) return false;
+  if (!s.built || typeof s.built !== "object" || Array.isArray(s.built)) return false;
+  for (const st of s.states as Record<string, unknown>[]) {
+    if (!st || typeof st !== "object") return false;
+    const d = (st as Record<string, unknown>).dungeon as Record<string, unknown> | undefined;
+    if (!d || !Array.isArray(d.rooms) || !Array.isArray(d.links)) return false;
+  }
+  return true;
+}
+
+/**
+ * Where the build session lives so a monitor restart keeps the
+ * dungeon, the history, and the rooms already built on the server.
+ * Same pattern as the autopilot / pins state files: an env override,
+ * else a dotfile at the repo root. The file is a CACHE of the
+ * session, not the source of truth — the scenes themselves live on
+ * the server, so a lost file only loses the edit history (and the
+ * next build would treat existing scenes as new — re-issue the
+ * builds, don't hand-edit the file).
+ */
+export function defaultBuildStatePath(): string {
+  return (
+    process.env.FOUNDRY_BUILD_STATE ??
+    path.join(import.meta.dir, "..", "..", ".build-state.json")
+  );
+}
+
+/** Write the session + built map to the state file. Best effort, like
+ *  the autopilot/pins state: a failed write never breaks a build. */
+export function saveBuildState(
+  session: BuildSession,
+  built: Map<string, BuiltRoomRef>,
+  filePath: string = defaultBuildStatePath(),
+): void {
+  try {
+    fs.writeFileSync(filePath, JSON.stringify(session.snapshot(built)), "utf-8");
+  } catch {
+    // State is a convenience; a failed write must not break the build.
+  }
+}
+
+/** Read the session + built map back. Returns null when there is no
+ *  state yet, or the file is unreadable or the wrong shape — the
+ *  caller starts a fresh session either way. */
+export function loadBuildState(
+  filePath: string = defaultBuildStatePath(),
+): { session: BuildSession; built: Map<string, BuiltRoomRef> } | null {
+  try {
+    const snap = JSON.parse(fs.readFileSync(filePath, "utf-8")) as unknown;
+    const session = new BuildSession();
+    if (!session.restore(snap)) return null;
+    const built = new Map<string, BuiltRoomRef>(
+      Object.entries((snap as BuildSessionSnapshot).built),
+    );
+    return { session, built };
+  } catch {
+    return null;
   }
 }
 

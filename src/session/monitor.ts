@@ -24,9 +24,13 @@
  *   loop (`src/session/build-loop.ts` — pure parser + history) and the
  *   executor (`src/session/build-exec.ts`, loaded lazily — it imports
  *   the live composer, which is not test-safe). One confirmation line
- *   per build; ambiguous requests get a clarifying question in chat;
- *   out-of-scope requests get "I can't do that yet". The loop never
- *   guesses a position and never hallucinates a build.
+ *   per build op; a compound request runs its ops in order, one line
+ *   each. Ambiguous requests get a clarifying question in chat;
+ *   out-of-scope requests get "I can't do that yet". Rooms are
+ *   targetable by name, and "here" resolves from the GM's last ping
+ *   or cursor. The session persists to a state file after each build,
+ *   so a restart keeps the dungeon and the rooms already built. The
+ *   loop never guesses a position and never hallucinates a build.
  * - GM whispers (BRA-185, FR-18): a whisper from the GM to Meroki is
  *   an instruction, not table chatter. An embedded cutscene script or
  *   a named sequence ("mice and the ogre") is validated with the
@@ -36,6 +40,12 @@
  *   routes through the normal paths with replies whispered back to
  *   the GM. Anything else gets a whispered clarification. Rolls are
  *   out of scope for the whisper channel — they live in public chat.
+ * - Speed budget (BRA-230, FR-10): every handled message is timed —
+ *   detect (message timestamp → loop sees it) plus one action record
+ *   (message → visible effect: roll/question answer, room built,
+ *   whispered sequence's first step). Over-budget stages log one
+ *   `latency-over-budget` line; the summary carries the p50/p95
+ *   report. A failed action records nothing — no effect landed.
  * - Everything else (open chat, requests, roleplay): logged as
  *   "needs-agent" and skipped. A human Muse can answer those from the
  *   log; the CLI does not improvise.
@@ -51,7 +61,10 @@ import type { CombatStatus } from "./autopilot.js";
 import { extractPin, handlePin, findOpenPins, PinProcessor } from "./pins.js";
 import {
   BuildSession,
+  loadBuildState,
   parseBuildRequest,
+  parseBuildRequests,
+  saveBuildState,
   type BuildParseContext,
 } from "./build-loop.js";
 import { loadPack, type Pack } from "../worldbuilding/tiles-layout.js";
@@ -64,6 +77,15 @@ import {
 } from "./whisper.js";
 import type { NamedSequenceKey } from "./whisper.js";
 import { validateCutscene, playCutscene } from "./cutscene.js";
+import {
+  LatencyLog,
+  cutsceneStepKind,
+  latencyLine,
+  realClock,
+  type Clock,
+  type LatencyRecord,
+  type SessionLatencyReport,
+} from "./perf.js";
 
 /** What the monitor does with one chat message. */
 export type MessageClass =
@@ -311,6 +333,18 @@ export type WhisperSequenceOutcome =
   | { state: "rejected"; name: string | null; reason: string };
 
 /**
+ * Latency events a whispered sequence reports to its caller (BRA-230):
+ * `first-effect` fires once, when the first timeline step completes —
+ * that is the first visible effect, and the ack whisper is not it.
+ * `step` fires per executed step at run completion, with the duration
+ * the player measured — the caller records it under `cutscene-step`
+ * (or `cutscene-wait` for wait steps).
+ */
+export type WhisperLatencyEvent =
+  | { type: "first-effect" }
+  | { type: "step"; index: number; kind: string; durationMs: number };
+
+/**
  * Play (or refuse) a sequence the GM whispered: an embedded script, a
  * named sequence, or a JSON block that failed to parse.
  *
@@ -338,7 +372,11 @@ export async function handleWhisperSequence(
     | { kind: "script"; script: unknown }
     | { kind: "named"; key: NamedSequenceKey }
     | { kind: "script-invalid"; error: string },
-  opts: { onLog?: (log: MonitorLog) => void } = {},
+  opts: {
+    onLog?: (log: MonitorLog) => void;
+    /** Latency hook (BRA-230): first completed step + per-step durations. */
+    onLatency?: (ev: WhisperLatencyEvent) => void;
+  } = {},
 ): Promise<WhisperSequenceOutcome> {
   const log = opts.onLog ?? (() => {});
   const whisperTo = (text: string): Promise<string> =>
@@ -382,12 +420,31 @@ export async function handleWhisperSequence(
   name = validated.script.name;
   await whisperTo(`On it — playing "${name}"…`);
   const runKey = `whisper:${msg.id}`;
+  // First completed step = first visible effect (BRA-230). Fires once;
+  // a rejected script never reaches here, so no phantom "effect".
+  let firstStep = true;
   void playCutscene(live, validated.script, {
     runKey,
-    onStep: (r) =>
-      log({ event: "whisper-step", id: msg.id, name, index: r.index, kind: r.kind, ok: r.ok }),
+    onStep: (r) => {
+      if (firstStep) {
+        firstStep = false;
+        opts.onLatency?.({ type: "first-effect" });
+      }
+      log({ event: "whisper-step", id: msg.id, name, index: r.index, kind: r.kind, ok: r.ok });
+    },
   })
     .then(async (res) => {
+      // Per-step execution times, as the player measured them — the
+      // caller records them (wait steps land unbudgeted). Reported
+      // even for a run that stopped mid-way: the steps that ran, ran.
+      for (const s of res.steps) {
+        opts.onLatency?.({
+          type: "step",
+          index: s.index,
+          kind: s.kind,
+          durationMs: s.durationMs,
+        });
+      }
       // The run resolves (never rejects) for a step failure, so check
       // `ok` before claiming it finished: a run that stopped mid-way
       // whispers "stopped" with the failing step, never "finished".
@@ -453,6 +510,14 @@ export interface MonitorOptions {
   /** Server folder the pack was uploaded to (default: derived from
    *  the world title, e.g. "worlds/testbed"). */
   serverBase?: string;
+  /** Clock for latency instrumentation (BRA-230, FR-10). Default: the
+   *  wall clock. Inject a fake clock in tests to pin timings. */
+  clock?: Clock;
+  /** Build-session state file (default: $FOUNDRY_BUILD_STATE or the
+   *  repo's .build-state.json). Restored on start, saved after each
+   *  build, so a restart keeps the dungeon and the rooms already
+   *  built on the server. */
+  buildStatePath?: string;
 }
 
 export interface MonitorSummary {
@@ -467,6 +532,40 @@ export interface MonitorSummary {
   /** GM whispers acted on as instructions (sequences, builds, questions, clarifications). */
   whispersHandled: number;
   skipped: number;
+  /** Speed-budget report (BRA-230, FR-10): p50/p95 per latency kind. */
+  latency: SessionLatencyReport;
+}
+
+/**
+ * The GM's "here" for a build request: their most recent ping or
+ * cursor point, with the pinged scene resolved to a room we built.
+ * A ping carries its scene; a cursor-only point has none, so it pairs
+ * with the active room. Returns undefined when we've seen no point
+ * from the GM, or the point is on a scene we didn't build (a ping
+ * elsewhere in the world is not a build "here"). The live object may
+ * not have lastPointFor (test fakes) — then there is no "here".
+ */
+export function gmHerePoint(
+  live: FoundryLive,
+  gmId: string | null,
+  builtRooms: Map<string, BuiltTileRoom>,
+  activeRoomId: string | null,
+): { roomId: string; x: number; y: number } | undefined {
+  if (!gmId) return undefined;
+  const maybe = live as unknown as {
+    lastPointFor?: (id: string) => { sceneId?: string; x: number; y: number } | null;
+  };
+  if (typeof maybe.lastPointFor !== "function") return undefined;
+  const point = maybe.lastPointFor(gmId);
+  if (!point) return undefined;
+  if (point.sceneId) {
+    for (const [roomId, ref] of builtRooms) {
+      if (ref.sceneId === point.sceneId) return { roomId, x: point.x, y: point.y };
+    }
+    return undefined;
+  }
+  if (!activeRoomId) return undefined;
+  return { roomId: activeRoomId, x: point.x, y: point.y };
 }
 
 /**
@@ -485,6 +584,31 @@ export async function runMonitor(
   const log = opts.onLog ?? ((l: MonitorLog) => {
     process.stderr.write(JSON.stringify(l) + "\n");
   });
+  // Speed-budget instrumentation (BRA-230, FR-10): one record per
+  // handled action, on the injected clock (wall clock live). The
+  // helper logs the per-action latency line and, when a stage exceeds
+  // its budget, one over-budget warning line.
+  const perf = new LatencyLog(opts.clock ?? realClock);
+  const recordLatency = (rec: LatencyRecord): void => {
+    log({
+      event: "latency",
+      kind: rec.kind,
+      label: rec.label,
+      ms: rec.durationMs,
+      budgetMs: rec.budgetMs,
+      over: rec.overBudget,
+      line: latencyLine(rec),
+    });
+    if (rec.overBudget) {
+      log({
+        event: "latency-over-budget",
+        kind: rec.kind,
+        label: rec.label,
+        ms: rec.durationMs,
+        budgetMs: rec.budgetMs,
+      });
+    }
+  };
   const summary: MonitorSummary = {
     cycles: 0,
     messagesSeen: 0,
@@ -496,14 +620,25 @@ export async function runMonitor(
     clarifications: 0,
     whispersHandled: 0,
     skipped: 0,
+    latency: perf.summary(),
   };
   const pins = new PinProcessor();
   // The build loop's state lives for the whole monitor run: the
-  // dungeon spec + edit history (in memory — a restart loses it; a
-  // state file is a follow-up, see BACKLOG.md) and the rooms already
-  // built on the server, by room id.
-  const buildSession = new BuildSession();
-  const builtRooms = new Map<string, BuiltTileRoom>();
+  // dungeon spec + edit history and the rooms already built on the
+  // server, by room id. Restored from the state file when one exists
+  // (a restart keeps the build); a missing or corrupt file starts
+  // fresh, as with the pins/autopilot state.
+  const restoredBuild = loadBuildState(opts.buildStatePath);
+  const buildSession = restoredBuild?.session ?? new BuildSession();
+  const builtRooms = new Map<string, BuiltTileRoom>(restoredBuild?.built ?? []);
+  if (restoredBuild) {
+    log({
+      event: "build-state-restored",
+      rooms: buildSession.current().dungeon.rooms.length,
+      history: buildSession.history().length,
+      built: builtRooms.size,
+    });
+  }
   let pack: Pack | null = null;
   const pinQueue: Record<string, unknown>[][] = [];
   const unsubscribe = live.on((event) => {
@@ -543,6 +678,14 @@ export async function runMonitor(
       lastSeen = result.lastSeen;
       for (const msg of result.newMessages) {
         summary.messagesSeen += 1;
+        // Detect latency (BRA-230): message timestamp → the loop sees
+        // it. Includes the waitForChat debounce, so ~3s is the loop
+        // working as designed. A message without a usable timestamp
+        // is skipped, not guessed (fakes use timestamp 0).
+        const receivedAt = perf.now();
+        if (typeof msg.timestamp === "number" && msg.timestamp > 0) {
+          recordLatency(perf.record("detect", msg.timestamp, receivedAt, msg.id));
+        }
         const text = stripHtml(msg.content);
         // A GM whisper is an instruction, not table chatter (BRA-185 /
         // FR-18). Checked first: a whispered roll or question must not
@@ -556,7 +699,30 @@ export async function runMonitor(
             } else {
               summary.whispersHandled += 1;
               summary.answered += 1;
-              void handleWhisperSequence(live, msg, gmId, w, { onLog: log }).catch((err) => {
+              // First visible effect lands in the background timeline
+              // (BRA-230): the timer finishes on the first completed
+              // step. A rejected script drops the timer — no effect
+              // will land, so nothing is recorded.
+              const whisperTimer = perf.start("whisper-first-effect", msg.id);
+              void handleWhisperSequence(live, msg, gmId, w, {
+                onLog: log,
+                onLatency: (ev) => {
+                  if (ev.type === "first-effect") {
+                    recordLatency(perf.finish(whisperTimer));
+                  } else {
+                    // Per-step execution time, as the player measured it.
+                    recordLatency(
+                      perf.recordDuration(
+                        cutsceneStepKind(ev.kind),
+                        ev.durationMs,
+                        `${msg.id}:${ev.index}`,
+                      ),
+                    );
+                  }
+                },
+                // A rejected script never calls playCutscene, so
+                // onLatency never fires and the timer is dropped.
+              }).catch((err) => {
                 log({ event: "error", class: "whisper", id: msg.id, error: String(err) });
               });
             }
@@ -565,9 +731,17 @@ export async function runMonitor(
           // Not a sequence — fall through to the ordinary routing
           // below, but every reply goes back as a whisper to the GM.
         }
-        const cls = classifyMessage(msg, live.userId, alias, {
+        // The build context for this message: the room being built,
+        // every room (for names), and the GM's last ping/cursor
+        // ("here"). Built fresh per message — the session, the rooms,
+        // and the ping all move.
+        const cur = buildSession.current();
+        const buildCtx: BuildParseContext = {
           room: buildSession.activeRoomSpec() ?? undefined,
-        });
+          rooms: cur.dungeon.rooms,
+          here: gmHerePoint(live, gmId, builtRooms, cur.activeRoom),
+        };
+        const cls = classifyMessage(msg, live.userId, alias, buildCtx);
         if (cls === "own" || cls === "noise") {
           summary.skipped += 1;
           log({ event: "skip", class: cls, id: msg.id });
@@ -599,12 +773,15 @@ export async function runMonitor(
             log({ event: "roll", id: msg.id, dryRun: true });
           } else {
             try {
+              const rollTimer = perf.start("roll", msg.id);
               const id = await rollForChat(live, text);
               if (id) {
+                recordLatency(perf.finish(rollTimer));
                 summary.rollsHandled += 1;
                 summary.answered += 1;
                 log({ event: "roll", id: msg.id, posted: id });
               } else {
+                // No roll posted, no visible effect — timer dropped.
                 summary.skipped += 1;
                 log({ event: "skip", class: "roll-unhandled", id: msg.id });
               }
@@ -624,7 +801,9 @@ export async function runMonitor(
             log({ event: "question", id: msg.id, intent, dryRun: true });
           } else {
             try {
+              const questionTimer = perf.start("question", msg.id);
               const id = await answerQuestion(live, intent, replyWhisperTo ?? undefined);
+              recordLatency(perf.finish(questionTimer));
               summary.answered += 1;
               if (whisper) summary.whispersHandled += 1;
               log({ event: "question", id: msg.id, intent, posted: id });
@@ -637,11 +816,10 @@ export async function runMonitor(
         // Build / clarify / unsupported — the FR-1 loop. The parse runs
         // again here (classify only returned the class) with the
         // session's room, so "that door" resolves against the room
-        // being built.
+        // being built. Compound requests run their ops in order, one
+        // confirmation line each.
         if (cls === "build" || cls === "clarify" || cls === "unsupported") {
-          const parsed = parseBuildRequest(text, {
-            room: buildSession.activeRoomSpec() ?? undefined,
-          });
+          const parsed = parseBuildRequests(text, buildCtx);
           if (!parsed) {
             // Classify said build, the parse says otherwise — defensive;
             // treat as needs-agent rather than building the wrong thing.
@@ -675,28 +853,38 @@ export async function runMonitor(
             continue;
           }
           if (opts.dryRun) {
-            log({ event: "build", id: msg.id, op: parsed.op, dryRun: true });
+            log({ event: "build", id: msg.id, ops: parsed.ops, dryRun: true });
             continue;
           }
           try {
             pack ??= loadPack(opts.packPath);
             // The executor imports the live composer — lazy, so the
             // pure tests never load the vendored client.
-            const { executeBuild, serverBaseForWorld } = await import("./build-exec.js");
+            const { executeBuilds, serverBaseForWorld } = await import("./build-exec.js");
             const world = live.getWorldSummary() as { title?: string | null };
-            const line = await executeBuild(live, buildSession, parsed.op, text, {
+            // Room-build latency (BRA-230): tiles synced + confirmation
+            // posted. Pack load and the one-time import are setup, not
+            // the build, so the timer starts here.
+            const buildTimer = perf.start("room-build", msg.id);
+            const lines = await executeBuilds(live, buildSession, parsed.ops, text, {
               pack,
               serverBase: opts.serverBase ?? serverBaseForWorld(world.title),
               built: builtRooms,
             });
-            await say(line);
-            summary.buildsHandled += 1;
+            for (const line of lines) await say(line);
+            recordLatency(perf.finish(buildTimer));
+            summary.buildsHandled += lines.length;
             summary.answered += 1;
             if (whisper) summary.whispersHandled += 1;
-            log({ event: "build", id: msg.id, op: parsed.op, line });
+            log({ event: "build", id: msg.id, ops: parsed.ops, lines });
+            // The session changed — persist it (and the rooms now
+            // built) so a restart keeps the build.
+            saveBuildState(buildSession, builtRooms, opts.buildStatePath);
           } catch (err) {
             // A failed build never commits: the session is unchanged,
-            // so the GM can rephrase and try again.
+            // so the GM can rephrase and try again. (A compound that
+            // fails mid-list keeps the ops before the failure —
+            // executeBuilds reports those in its lines, not here.)
             const line = `I couldn't build that — ${err instanceof Error ? err.message : String(err)}`;
             try {
               await say(line);
@@ -780,6 +968,9 @@ export async function runMonitor(
   } finally {
     unsubscribe();
   }
+  // The latency report is a snapshot at shutdown (BRA-230): background
+  // plays that finish after this land in the log lines, not here.
+  summary.latency = perf.summary();
   log({ event: "shutdown", ...summary });
   return summary;
 }

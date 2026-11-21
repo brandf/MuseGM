@@ -27,6 +27,7 @@ import type { FoundryLive } from "../live.js";
 import {
   buildTileRoom,
   rebuildTileRoom,
+  tileRoomBuildKey,
   type BuiltTileRoom,
 } from "../worldbuilding/tiles.js";
 import type { Pack } from "../worldbuilding/tiles-layout.js";
@@ -97,6 +98,35 @@ export async function executeBuild(
 }
 
 /**
+ * Execute a compound request's ops in order, one chat line per op.
+ * An op that fails stops the list — the ops before it stay committed
+ * (and synced), so the chat shows what landed and what didn't, and
+ * the GM recovers with "undo that" + a re-issue, as with any
+ * mid-sync failure. A no-change op posts its summary line and the
+ * list carries on.
+ */
+export async function executeBuilds(
+  live: FoundryLive,
+  session: BuildSession,
+  ops: BuildOp[],
+  said: string,
+  opts: BuildExecOptions,
+): Promise<string[]> {
+  const lines: string[] = [];
+  for (const op of ops) {
+    try {
+      lines.push(await executeBuild(live, session, op, said, opts));
+    } catch (err) {
+      lines.push(
+        `I couldn't build that — ${err instanceof Error ? err.message : String(err)}`,
+      );
+      break;
+    }
+  }
+  return lines;
+}
+
+/**
  * Sync the table to the session's current dungeon: build new rooms,
  * rebuild changed ones, delete removed scenes. `before` is the dungeon
  * as it was before the last commit — the caller captures it before
@@ -117,11 +147,14 @@ async function syncSession(
     built.delete(roomId);
   }
   for (const { room, previous } of plan.rebuild) {
-    const rebuilt = await rebuildTileRoom(live, previous.sceneId, room, pack, serverBase, previous);
+    // Keyed by room id (BRA-202): a crash between the session commit
+    // and the table sync re-issues the same op, and the rebuild
+    // converges instead of duplicating the room's tiles.
+    const rebuilt = await rebuildTileRoom(live, previous.sceneId, { ...room, buildKey: tileRoomBuildKey(room.id) }, pack, serverBase, previous);
     built.set(room.id, rebuilt);
   }
   for (const room of plan.build) {
-    const created = await buildTileRoom(live, room, pack, serverBase);
+    const created = await buildTileRoom(live, { ...room, buildKey: tileRoomBuildKey(room.id) }, pack, serverBase);
     built.set(room.id, created);
   }
 }

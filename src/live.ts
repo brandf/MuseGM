@@ -100,6 +100,23 @@ export class FoundryLive {
   private socketHandler: ((payload: unknown) => void) | null = null;
   private watching = false;
   /**
+   * Last ping / cursor point per user, from the socket's `userActivity`
+   * broadcasts — the same event this client emits for its own pings
+   * (see ping()/moveCursor()), now also listened to. A ping is a
+   * deliberate "here"; a cursor is where the mouse currently is. Each
+   * keeps its own arrival time so `lastPointFor` can take the newer
+   * of the two. Our own activity is ignored — our pings are never
+   * the GM's "here".
+   */
+  private activityByUser = new Map<
+    string,
+    {
+      ping?: { sceneId: string; x: number; y: number; at: number };
+      cursor?: { x: number; y: number; at: number };
+    }
+  >();
+  private activityHandler: ((...args: unknown[]) => void) | null = null;
+  /**
    * Dedupe keys this connection has already sent, key -> message _id. The
    * world-payload scan (findMessageByDedupeKey) closes the cross-process
    * gap; this map closes the same-process gap, because a connection never
@@ -519,13 +536,62 @@ export class FoundryLive {
       }
     };
     socket.on("modifyDocument", this.socketHandler);
+    // Incoming userActivity: other clients' pings and cursor moves.
+    // Foundry relays a client's own emit to the rest of the room, so
+    // this is how the GM's "here" reaches us — no new protocol, the
+    // same event ping()/moveCursor() already send.
+    this.activityHandler = (...args: unknown[]) => {
+      const [userId, activity] = args as [unknown, Record<string, unknown> | undefined];
+      if (typeof userId !== "string" || !activity || typeof activity !== "object") return;
+      if (userId === this.ownUserId) return;
+      const rec = this.activityByUser.get(userId) ?? {};
+      const now = Date.now();
+      const cursor = activity.cursor as { x?: unknown; y?: unknown } | undefined;
+      if (cursor && typeof cursor.x === "number" && typeof cursor.y === "number") {
+        rec.cursor = { x: cursor.x, y: cursor.y, at: now };
+      }
+      const ping = activity.ping as { scene?: unknown; x?: unknown; y?: unknown } | undefined;
+      if (
+        ping &&
+        typeof ping.scene === "string" &&
+        typeof ping.x === "number" &&
+        typeof ping.y === "number"
+      ) {
+        rec.ping = { sceneId: ping.scene, x: ping.x, y: ping.y, at: now };
+      }
+      if (rec.cursor || rec.ping) this.activityByUser.set(userId, rec);
+    };
+    socket.on("userActivity", this.activityHandler);
   }
 
   private stopWatching(): void {
     const socket = this.rawSocket();
     if (socket && this.socketHandler) socket.off("modifyDocument", this.socketHandler);
+    if (socket && this.activityHandler) socket.off("userActivity", this.activityHandler);
     this.socketHandler = null;
+    this.activityHandler = null;
     this.watching = false;
+  }
+
+  /**
+   * A user's most recent ping or cursor point, whichever arrived
+   * last — the "here" for a build request. A ping carries its scene;
+   * a cursor doesn't (it is on whatever scene the user is viewing),
+   * so the caller pairs a cursor-only point with the active room.
+   * Returns null when we've seen no activity from that user (e.g.
+   * the monitor started after the ping, or the user never pinged).
+   */
+  lastPointFor(
+    userId: string,
+  ): { sceneId?: string; x: number; y: number; kind: "ping" | "cursor"; at: number } | null {
+    const rec = this.activityByUser.get(userId);
+    if (!rec) return null;
+    const { ping, cursor } = rec;
+    if (ping && (!cursor || ping.at >= cursor.at)) {
+      return { sceneId: ping.sceneId, x: ping.x, y: ping.y, kind: "ping", at: ping.at };
+    }
+    if (cursor) return { x: cursor.x, y: cursor.y, kind: "cursor", at: cursor.at };
+    return null;
   }
 
   /**

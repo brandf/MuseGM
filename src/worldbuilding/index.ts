@@ -192,14 +192,21 @@ export async function createSceneFromImage(
   return id;
 }
 
-/** Add walls to a scene. Returns the created Wall _ids. */
+/**
+ * Add walls to a scene. Returns the created Wall _ids.
+ *
+ * With `opts.embedKeys`, the i-th wall is stamped with
+ * `flags["foundry-live"].tileRoomKey = embedKeys[i]` (BRA-202) so a
+ * keyed re-run can find it again. Without it, behavior is unchanged.
+ */
 export async function addWalls(
   live: FoundryLive,
   sceneId: string,
   walls: WallSpec[],
+  opts: { embedKeys?: string[] } = {},
 ): Promise<string[]> {
   const created = await live.modifyDocument("Wall", "create", {
-    data: walls.map((w) => ({
+    data: walls.map((w, i) => ({
       c: [w.x1, w.y1, w.x2, w.y2],
       move: 1,
       sense: 1,
@@ -208,20 +215,28 @@ export async function addWalls(
       dir: 0,
       door: w.door ?? 0,
       ds: 0,
+      ...(opts.embedKeys?.[i] ? { flags: flagValue(FLAG_FIELDS.tileRoom, opts.embedKeys[i]) } : {}),
     })),
     parentUuid: `Scene.${sceneId}`,
   });
   return created.map((d) => String(d._id));
 }
 
-/** Add lights to a scene. Returns the created AmbientLight _ids. */
+/**
+ * Add lights to a scene. Returns the created AmbientLight _ids.
+ *
+ * With `opts.embedKeys`, the i-th light is stamped with
+ * `flags["foundry-live"].tileRoomKey = embedKeys[i]` (BRA-202) so a
+ * keyed re-run can find it again. Without it, behavior is unchanged.
+ */
 export async function addLights(
   live: FoundryLive,
   sceneId: string,
   lights: LightSpec[],
+  opts: { embedKeys?: string[] } = {},
 ): Promise<string[]> {
   const created = await live.modifyDocument("AmbientLight", "create", {
-    data: lights.map((l) => ({
+    data: lights.map((l, i) => ({
       x: l.x,
       y: l.y,
       rotation: 0,
@@ -233,6 +248,7 @@ export async function addLights(
         alpha: 0.5,
       },
       hidden: false,
+      ...(opts.embedKeys?.[i] ? { flags: flagValue(FLAG_FIELDS.tileRoom, opts.embedKeys[i]) } : {}),
     })),
     parentUuid: `Scene.${sceneId}`,
   });

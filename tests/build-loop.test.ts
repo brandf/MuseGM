@@ -3,6 +3,9 @@
  * Pure — no Foundry connection needed. Run with `bun test`.
  */
 import { describe, expect, it } from "bun:test";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 import {
   BuildSession,
   applyOp,
@@ -10,13 +13,22 @@ import {
   describeDungeon,
   diffSummary,
   formatBuildLine,
+  isBuildSessionSnapshot,
+  loadBuildState,
   parseBuildRequest,
+  parseBuildRequests,
   planSync,
+  resolveHere,
+  resolveHereRegion,
+  saveBuildState,
   type BuildOp,
+  type BuildParseContext,
   type BuildParseResult,
   type BuildState,
+  type CompoundParseResult,
 } from "../src/session/build-loop.js";
-import { classifyMessage } from "../src/session/monitor.js";
+import { classifyMessage, runMonitor } from "../src/session/monitor.js";
+import type { FoundryLive } from "../src/live.js";
 import {
   layoutRoom,
   packFromManifest,
@@ -531,5 +543,468 @@ describe("formatting", () => {
     expect(describeDungeon({ rooms: [{ ...room(), id: "entry-hall" }], links: [] })).toEqual([
       "Entry Hall (8×6, door south@3)",
     ]);
+  });
+});
+
+// ---------------------------------------------------------------- rooms by name (BRA-225)
+
+function twoRoomDungeon(): DungeonSpec {
+  return {
+    rooms: [
+      { ...room(), id: "entry-hall" },
+      { name: "Crypt", gridW: 6, gridH: 5, seed: 1, doors: [{ wall: "west", at: 2 }], id: "crypt" },
+    ],
+    links: [],
+  };
+}
+
+function twoRoomCtx(overrides: Partial<BuildParseContext> = {}): BuildParseContext {
+  const d = twoRoomDungeon();
+  return { room: d.rooms[0], rooms: d.rooms, ...overrides };
+}
+
+function opOf(result: BuildParseResult | null): BuildOp {
+  if (!result || result.kind !== "build") {
+    throw new Error(`expected a build parse, got ${JSON.stringify(result)}`);
+  }
+  return result.op;
+}
+
+function opsOf(result: CompoundParseResult | null): BuildOp[] {
+  if (!result || result.kind !== "build") {
+    throw new Error(`expected a compound build parse, got ${JSON.stringify(result)}`);
+  }
+  return result.ops;
+}
+
+describe("rooms by name (BRA-225)", () => {
+  it("widen the Entry Hall targets it, not the active room", () => {
+    const op = opOf(parseBuildRequest("widen the Entry Hall 10 units east", twoRoomCtx()));
+    expect(op.type).toBe("widen");
+    if (op.type === "widen") {
+      expect(op.target).toBe("entry-hall");
+      expect(op.by).toBe(10);
+      expect(op.side).toBe("east");
+    }
+    // The active room is the Crypt; the widen still lands in the Hall.
+    const state: BuildState = { dungeon: twoRoomDungeon(), activeRoom: "crypt" };
+    const out = applyOp(state, op);
+    expect(out.state.dungeon.rooms[0].gridW).toBe(18);
+    expect(out.state.dungeon.rooms[1].gridW).toBe(6);
+    // A targeted op makes its room the active one.
+    expect(out.state.activeRoom).toBe("entry-hall");
+  });
+
+  it("add a door to the Crypt lands in the Crypt only", () => {
+    const op = opOf(parseBuildRequest("add a door to the Crypt on the north wall", twoRoomCtx()));
+    expect(op.type).toBe("add-door");
+    if (op.type === "add-door") expect(op.target).toBe("crypt");
+    const state: BuildState = { dungeon: twoRoomDungeon(), activeRoom: "entry-hall" };
+    const out = applyOp(state, op);
+    expect(out.state.dungeon.rooms[1].doors).toContainEqual({ wall: "north", at: 3 });
+    expect(out.state.dungeon.rooms[0].doors).toEqual([{ wall: "south", at: 3 }]);
+  });
+
+  it("an unknown room name is a question naming the rooms we have", () => {
+    const parsed = parseBuildRequest("widen the Sunken Chapel", twoRoomCtx());
+    expect(parsed?.kind).toBe("clarify");
+    if (parsed?.kind === "clarify") {
+      expect(parsed.question).toContain("Sunken Chapel");
+      expect(parsed.question).toContain("Entry Hall");
+      expect(parsed.question).toContain("Crypt");
+    }
+  });
+
+  it("two rooms named in one line is a question", () => {
+    const parsed = parseBuildRequest("move the door from the Entry Hall to the Crypt", twoRoomCtx());
+    expect(parsed?.kind).toBe("clarify");
+    if (parsed?.kind === "clarify") {
+      expect(parsed.question).toContain("Entry Hall");
+      expect(parsed.question).toContain("Crypt");
+    }
+  });
+
+  it("no name means the active room, as before", () => {
+    const op = opOf(parseBuildRequest("widen the room west by 5", twoRoomCtx()));
+    expect(op.type).toBe("widen");
+    if (op.type === "widen") expect(op.target).toBeUndefined();
+  });
+
+  it("wall phrases are not room names", () => {
+    const op = opOf(parseBuildRequest("add a door on the north wall", twoRoomCtx()));
+    expect(op.type).toBe("add-door");
+    if (op.type === "add-door") expect(op.target).toBeUndefined();
+  });
+
+  it("creating a room ignores existing names — the name is the new room's", () => {
+    const op = opOf(parseBuildRequest("build a room called the Sunken Chapel", twoRoomCtx()));
+    expect(op.type).toBe("create-room");
+    if (op.type === "create-room") {
+      expect(op.name).toBe("Sunken Chapel");
+      expect("target" in op).toBe(false);
+    }
+  });
+
+  it("a longer name that contains a shorter one wins, not a question", () => {
+    const rooms = [
+      { name: "Hall", gridW: 5, gridH: 5, seed: 1, id: "hall" },
+      { ...room(), id: "entry-hall" },
+    ];
+    const op = opOf(parseBuildRequest("widen the Entry Hall", { room: rooms[1], rooms }));
+    if (op.type === "widen") expect(op.target).toBe("entry-hall");
+  });
+
+  it("after a targeted op, the next untargeted edit lands in that room", () => {
+    const session = new BuildSession(twoRoomDungeon());
+    session.apply(
+      opOf(parseBuildRequest("widen the Crypt 2 units east", twoRoomCtx())),
+      "widen the Crypt 2 units east",
+    );
+    expect(session.current().activeRoom).toBe("crypt");
+    session.apply(
+      opOf(parseBuildRequest("add some bones", twoRoomCtx())),
+      "add some bones",
+    );
+    const cur = session.current();
+    // The Crypt was widened 6→8 first, so its south-east corner is (6,3).
+    expect(cur.dungeon.rooms[1].dressing).toContainEqual({ tile: "bones", gx: 6, gy: 3 });
+    expect(cur.dungeon.rooms[0].dressing ?? []).toHaveLength(0);
+  });
+
+  it("a target that isn't in the build throws plainly at apply time", () => {
+    const state: BuildState = { dungeon: twoRoomDungeon(), activeRoom: "entry-hall" };
+    expect(() =>
+      applyOp(state, { type: "widen", side: "east", by: 2, target: "no-such-room" }),
+    ).toThrow('No room "no-such-room" in this build.');
+  });
+});
+
+// ---------------------------------------------------------------- "here" from ping/cursor (BRA-225)
+
+describe("here from the GM's ping/cursor (BRA-225)", () => {
+  it("resolveHere: nearest wall, cell along it, doors never in a corner", () => {
+    const r = room();
+    expect(resolveHere(450, 50, r)).toEqual({ wall: "north", at: 4, gx: 4, gy: 0 });
+    expect(resolveHere(50, 350, r)).toEqual({ wall: "west", at: 3, gx: 0, gy: 3 });
+    // South and east tie at 50px — south wins the tie-break.
+    expect(resolveHere(750, 550, r)).toEqual({ wall: "south", at: 6, gx: 7, gy: 5 });
+    // A corner cell clamps into the door range.
+    expect(resolveHere(5, 5, r)).toEqual({ wall: "north", at: 1, gx: 0, gy: 0 });
+  });
+
+  it("resolveHereRegion: the half the ping sits in", () => {
+    const r = room();
+    expect(resolveHereRegion(400, 100, r)).toBe("north-half");
+    expect(resolveHereRegion(400, 500, r)).toBe("south-half");
+    expect(resolveHereRegion(50, 300, r)).toBe("west-half");
+    expect(resolveHereRegion(750, 300, r)).toBe("east-half");
+  });
+
+  it("add a door here takes the wall + cell from the ping, in the pinged room", () => {
+    const op = opOf(
+      parseBuildRequest(
+        "add a door here",
+        twoRoomCtx({ here: { roomId: "entry-hall", x: 450, y: 50 } }),
+      ),
+    );
+    expect(op).toEqual({ type: "add-door", wall: "north", at: 4, target: "entry-hall" });
+  });
+
+  it("add a door here with no ping still asks which wall", () => {
+    const parsed = parseBuildRequest("add a door here", twoRoomCtx());
+    expect(parsed?.kind).toBe("clarify");
+  });
+
+  it("add some bones here lands on the pinged cell", () => {
+    const op = opOf(
+      parseBuildRequest(
+        "add some bones here",
+        twoRoomCtx({ here: { roomId: "entry-hall", x: 250, y: 250 } }),
+      ),
+    );
+    expect(op.type).toBe("add-dressing");
+    if (op.type === "add-dressing") {
+      expect(op.where).toEqual({ kind: "cell", gx: 2, gy: 2 });
+      expect(op.target).toBe("entry-hall");
+    }
+    const state: BuildState = { dungeon: twoRoomDungeon(), activeRoom: "entry-hall" };
+    const out = applyOp(state, op);
+    expect(out.state.dungeon.rooms[0].dressing).toContainEqual({ tile: "bones", gx: 2, gy: 2 });
+    expect(out.summary).toContain("where you pinged");
+  });
+
+  it("widen here widens the wall nearest the ping", () => {
+    const op = opOf(
+      parseBuildRequest(
+        "widen here",
+        twoRoomCtx({ here: { roomId: "entry-hall", x: 750, y: 300 } }),
+      ),
+    );
+    expect(op.type).toBe("widen");
+    if (op.type === "widen") expect(op.side).toBe("east");
+  });
+
+  it("add a corridor here runs through the wall nearest the ping", () => {
+    const op = opOf(
+      parseBuildRequest(
+        "add a corridor here",
+        twoRoomCtx({ here: { roomId: "entry-hall", x: 400, y: 550 } }),
+      ),
+    );
+    expect(op.type).toBe("add-corridor");
+    if (op.type === "add-corridor") expect(op.direction).toBe("south");
+  });
+
+  it("make this part underwater here takes the pinged half", () => {
+    const op = opOf(
+      parseBuildRequest(
+        "make this part underwater here",
+        twoRoomCtx({ here: { roomId: "entry-hall", x: 400, y: 100 } }),
+      ),
+    );
+    expect(op.type).toBe("overlay");
+    if (op.type === "overlay") expect(op.region).toBe("north-half");
+  });
+
+  it("a ping in one room and a name for another is a question", () => {
+    const parsed = parseBuildRequest(
+      "add a door here in the Crypt",
+      twoRoomCtx({ here: { roomId: "entry-hall", x: 450, y: 50 } }),
+    );
+    expect(parsed?.kind).toBe("clarify");
+    if (parsed?.kind === "clarify") {
+      expect(parsed.question).toContain("Entry Hall");
+      expect(parsed.question).toContain("Crypt");
+    }
+  });
+});
+
+// ---------------------------------------------------------------- compound requests (BRA-225)
+
+describe("compound requests (BRA-225)", () => {
+  it("add a door and widen is two ops, applied in order", () => {
+    const ops = opsOf(
+      parseBuildRequests("add a door on the north wall and widen the room 10 east", {
+        room: room(),
+      }),
+    );
+    expect(ops).toHaveLength(2);
+    expect(ops[0].type).toBe("add-door");
+    expect(ops[1].type).toBe("widen");
+    const session = new BuildSession();
+    session.apply({ type: "create-room", name: "Entry Hall", gridW: 8, gridH: 6, doors: [{ wall: "south" }], chest: false, torches: false, fog: false }, "build an 8x6 entry hall");
+    for (const op of ops) session.apply(op, "add a door on the north wall and widen the room 10 east");
+    const cur = session.current();
+    expect(cur.dungeon.rooms[0].gridW).toBe(18);
+    expect(cur.dungeon.rooms[0].doors).toContainEqual({ wall: "north", at: 4 });
+    expect(session.history()).toHaveLength(3);
+  });
+
+  it("add some bones and add torches is two ops", () => {
+    const ops = opsOf(parseBuildRequests("add some bones and add torches", { room: room() }));
+    expect(ops.map((o) => o.type)).toEqual(["add-dressing", "add-torches"]);
+  });
+
+  it("a single-op line is still one op", () => {
+    const ops = opsOf(parseBuildRequests("add a door on the north wall", { room: room() }));
+    expect(ops).toHaveLength(1);
+    expect(ops[0].type).toBe("add-door");
+  });
+
+  it("an unparseable second segment falls back to the whole line as one request", () => {
+    const ops = opsOf(
+      parseBuildRequests("add a door on the north wall and frobnicate the ceiling", { room: room() }),
+    );
+    expect(ops).toHaveLength(1);
+    expect(ops[0].type).toBe("add-door");
+  });
+
+  it("undo that and add a door is an undo op plus a build op", () => {
+    const ops = opsOf(parseBuildRequests("undo that and add a door on the north wall", { room: room() }));
+    expect(ops.map((o) => o.type)).toEqual(["undo", "add-door"]);
+  });
+
+  it("a compound line classifies as build", () => {
+    const ctx = { room: room() };
+    expect(
+      classifyMessage(
+        msg({ content: "add a door on the north wall and widen the room 10 east" }),
+        null,
+        "Meroki",
+        ctx,
+      ),
+    ).toBe("build");
+  });
+
+  it("a compound that starts with a question stays a question", () => {
+    const parsed = parseBuildRequests("add a corridor and widen the room", { room: room() });
+    expect(parsed?.kind).toBe("clarify");
+  });
+});
+
+// ---------------------------------------------------------------- session persistence (BRA-225)
+
+describe("build session persistence (BRA-225)", () => {
+  it("snapshot / restore round-trips states, entries, index, and focus", () => {
+    const session = new BuildSession(twoRoomDungeon());
+    session.apply({ type: "widen", side: "east", by: 2 }, "widen the room");
+    session.apply({ type: "add-door", wall: "north", at: 3 }, "add a door");
+    session.undo();
+    const built = new Map([
+      ["entry-hall", { sceneId: "scene-1", tileIds: ["t1"], wallIds: ["w1"], lightIds: [] }],
+    ]);
+    const snap = session.snapshot(built);
+    expect(isBuildSessionSnapshot(snap)).toBe(true);
+    const restored = new BuildSession();
+    expect(restored.restore(snap)).toBe(true);
+    expect(restored.current()).toEqual(session.current());
+    expect(restored.history()).toEqual(session.history());
+    expect(restored.canUndo()).toBe(session.canUndo());
+    expect(restored.canRedo()).toBe(session.canRedo());
+    // The restored session keeps working: redo re-applies the undone door.
+    const redone = restored.redo();
+    expect(redone?.op.type).toBe("add-door");
+    expect(restored.current().dungeon.rooms[0].doors).toContainEqual({ wall: "north", at: 3 });
+  });
+
+  it("restore rejects the wrong shape instead of throwing", () => {
+    const session = new BuildSession();
+    expect(session.restore({})).toBe(false);
+    expect(session.restore(null)).toBe(false);
+    expect(session.restore({ version: 2, states: [], entries: [], index: 0, built: {} })).toBe(false);
+    expect(session.restore({ version: 1, states: [], entries: [], index: 0, built: {} })).toBe(false);
+    expect(session.current().dungeon.rooms).toHaveLength(0);
+  });
+
+  it("save / load round-trips a session + built map through a file", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "build-state-"));
+    try {
+      const file = path.join(dir, "state.json");
+      const session = new BuildSession(twoRoomDungeon());
+      session.apply({ type: "widen", side: "east", by: 2 }, "widen the room");
+      const built = new Map([
+        ["entry-hall", { sceneId: "scene-1", tileIds: ["t1"], wallIds: [], lightIds: ["l1"] }],
+      ]);
+      saveBuildState(session, built, file);
+      const loaded = loadBuildState(file);
+      expect(loaded).not.toBeNull();
+      expect(loaded!.session.current()).toEqual(session.current());
+      expect(loaded!.session.history()).toEqual(session.history());
+      expect(loaded!.built.get("entry-hall")).toEqual({
+        sceneId: "scene-1",
+        tileIds: ["t1"],
+        wallIds: [],
+        lightIds: ["l1"],
+      });
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("load returns null for a missing file and for a corrupt one", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "build-state-"));
+    try {
+      expect(loadBuildState(path.join(dir, "nope.json"))).toBeNull();
+      const bad = path.join(dir, "bad.json");
+      fs.writeFileSync(bad, "this is not json", "utf-8");
+      expect(loadBuildState(bad)).toBeNull();
+      fs.writeFileSync(bad, JSON.stringify({ version: 9 }), "utf-8");
+      expect(loadBuildState(bad)).toBeNull();
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+// ---------------------------------------------------------------- runMonitor dry-run (BRA-225)
+
+const GM_ID = "gm-1";
+const OWN_ID = "own-1";
+
+function fakeLive(overrides: Record<string, unknown> = {}) {
+  const live = {
+    userId: OWN_ID,
+    getChatMessages: (_limit: number) => [],
+    getUsers: () => [{ _id: GM_ID, name: "Gamemaster", role: 4, active: true }],
+    getCombatState: () => null,
+    getWorldSummary: () => ({ title: "TestBed", counts: {} }),
+    raw: () => ({ getJournals: () => [] }),
+    on: (_fn: unknown) => () => {},
+    sendChat: async () => "sent-1",
+    sendChatIdempotent: async () => ({ id: "idem-1", duplicate: false }),
+    rollDice: async (formula: string) => ({
+      formula,
+      total: 17,
+      breakdown: "12 + 5",
+      timestamp: new Date().toISOString(),
+      source: "local" as const,
+    }),
+    waitForChat: async () => ({ timedOut: true, newMessages: [], lastSeen: null }),
+    lastPointFor: (_id: string) => null,
+    ...overrides,
+  };
+  return live;
+}
+
+describe("runMonitor dry-run — compound builds + state restore (BRA-225)", () => {
+  it("a compound build line logs one build event with both ops", async () => {
+    const logs: Record<string, unknown>[] = [];
+    const live = fakeLive({
+      waitForChat: async () => ({
+        timedOut: false,
+        newMessages: [
+          msg({
+            id: "m1",
+            author: "player-1",
+            content: "add a door on the north wall and widen the room 10 east",
+          }),
+        ],
+        lastSeen: "m1",
+      }),
+    });
+    const summary = await runMonitor(live as unknown as FoundryLive, {
+      dryRun: true,
+      once: true,
+      onLog: (l) => logs.push(l as unknown as Record<string, unknown>),
+      buildStatePath: path.join(os.tmpdir(), "build-state-does-not-exist.json"),
+    });
+    expect(summary.messagesSeen).toBe(1);
+    expect(summary.buildsHandled).toBe(0); // dry-run executes nothing
+    const build = logs.find((l) => l.event === "build");
+    expect(build).toBeDefined();
+    expect((build!.ops as unknown[]).map((o) => (o as { type: string }).type)).toEqual([
+      "add-door",
+      "widen",
+    ]);
+    expect(build!.dryRun).toBe(true);
+  });
+
+  it("a saved state file restores the session on start", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "build-state-"));
+    try {
+      const file = path.join(dir, "state.json");
+      const session = new BuildSession(twoRoomDungeon());
+      session.apply({ type: "widen", side: "east", by: 2 }, "widen the room");
+      saveBuildState(
+        session,
+        new Map([["entry-hall", { sceneId: "scene-1", tileIds: [], wallIds: [], lightIds: [] }]]),
+        file,
+      );
+      const logs: Record<string, unknown>[] = [];
+      const live = fakeLive();
+      await runMonitor(live as unknown as FoundryLive, {
+        dryRun: true,
+        once: true,
+        onLog: (l) => logs.push(l as unknown as Record<string, unknown>),
+        buildStatePath: file,
+      });
+      const restored = logs.find((l) => l.event === "build-state-restored");
+      expect(restored).toBeDefined();
+      expect(restored!.rooms).toBe(2);
+      expect(restored!.history).toBe(1);
+      expect(restored!.built).toBe(1);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

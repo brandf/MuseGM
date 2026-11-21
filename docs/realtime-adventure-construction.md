@@ -73,7 +73,7 @@ or the named wall — never from coordinates in chat.
 **Acceptance:** a 3-room dungeon built in under 2 minutes of chat, no
 coordinate talk, each step visible within seconds of the message.
 
-**Status:** [~] built + unit-tested offline Nov 20 — `src/session/build-loop.ts` (pure parser: chat line -> one `BuildOp` — create-room, widen, door add/move, dressing, torches, fog, overlay, corridor — or a clarifying question, or "can't do that yet"; `BuildSession` history of specs; `planSync`) + `src/session/build-exec.ts` (live executor: peek -> validate -> commit -> sync via `buildTileRoom`/`rebuildTileRoom`) + the monitor hook (new routing kinds `build` / `clarify` / `unsupported`, after roll/question) + `src/cli/build-loop.ts` (`--demo`, `--say`, no connection) + `tests/build-loop.test.ts` (57 checks). One confirmation line per build in chat. Live test pending: the full BACKLOG checklist (3-room dungeon in under 2 minutes of chat, widen/secret-door/corridor live, clarification + unsupported lines). "Here" asks which wall for now — resolving it from the GM's ping/cursor is a follow-up. Composer + dungeon graph built and unit-tested (18-tile pack, 0 gaps); the chat-driven iterative loop (monitor → composer) is now wired.
+**Status:** [~] built + unit-tested offline Nov 20 — `src/session/build-loop.ts` (pure parser: chat line -> one `BuildOp` — create-room, widen, door add/move, dressing, torches, fog, overlay, corridor — or a clarifying question, or "can't do that yet"; `BuildSession` history of specs; `planSync`) + `src/session/build-exec.ts` (live executor: peek -> validate -> commit -> sync via `buildTileRoom`/`rebuildTileRoom`) + the monitor hook (new routing kinds `build` / `clarify` / `unsupported`, after roll/question) + `src/cli/build-loop.ts` (`--demo`, `--say`, no connection) + `tests/build-loop.test.ts` (89 checks). One confirmation line per build in chat. Live test pending: the full BACKLOG checklist (3-room dungeon in under 2 minutes of chat, widen/secret-door/corridor live, clarification + unsupported lines). "Here" now resolves from the GM's last ping/cursor (BRA-225, Nov 20) — the pinged scene identifies the room, the point the wall/cell; without a ping it still asks. Rooms are targetable by name, and compound requests run their ops in order. Composer + dungeon graph built and unit-tested (18-tile pack, 0 gaps); the chat-driven iterative loop (monitor → composer) is now wired.
 
 ### FR-2 — Theme re-skin
 
@@ -250,6 +250,8 @@ enumerate placements one by one, the feature is shaped wrong — push the
 enumeration into code. This is the same principle as the monitor (code
 watches, Muse only wakes when needed) and the sequence runner (code
 plays, no round-trip per step).
+
+**Status:** [~] built + unit-tested offline Nov 20 — `src/session/perf.ts` (LatencyLog on an injectable clock; SPEED_BUDGETS with a cited source per budget, `ms: null` where no sourced budget exists; p50/p95 session report) + monitor wiring (detect per message from msg.timestamp; one action record per handled message — roll/question/room-build/whisper-first-effect; per-step cutscene durations; one latency line per action, one latency-over-budget warning per over-budget stage). Live validation against TestBed pending.
 
 ### FR-11 — Rapid custom encounter generation (story-aware NPCs)
 

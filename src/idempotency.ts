@@ -36,6 +36,9 @@ export const FLAG_FIELDS = {
   tokenPlace: "placeKey",
   combatEncounter: "encounterKey",
   chest: "chestKey",
+  /** Per-embed key on a tile room's Tile/Wall/AmbientLight docs:
+   *  `<buildKey>:tile|wall|light:<index>` (BRA-202). */
+  tileRoom: "tileRoomKey",
 } as const;
 
 /** FNV-1a 32-bit hash of a string — deterministic seed input. */

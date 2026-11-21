@@ -28,11 +28,60 @@ import type { FoundryLive } from "../live.js";
 import type { DungeonLayout, DungeonSpec, PackManifest, ResolvedDoorLink, RoomSpec, WallSide } from "./tiles-layout.js";
 import { TILE_PX, layoutDungeon, layoutRoom } from "./tiles-layout.js";
 import { resolveTheme, type ThemeSpec } from "./themes.js";
+import { FLAG_FIELDS, flagValue } from "../idempotency.js";
+import { findSceneByBuildKey } from "./index.js";
+import {
+  extractTileRoomEmbeds,
+  parseTileEmbedKey,
+  planTileRoomConverge,
+  sceneHasTileRoomKey,
+  tileEmbedKey,
+  type KeyedEmbed,
+} from "./tile-keys.js";
 import { addLights, addWalls } from "./index.js";
 import { deleteToken, placeToken, resolveToken } from "../session/movement.js";
 import { uploadImage } from "./upload.js";
 
 export * from "./tiles-layout.js";
+export { tileRoomBuildKey } from "./tile-keys.js";
+
+/**
+ * In-process memo of keyed tile-room builds, per connection. The live
+ * client's cache never sees its own Tile creates (no Tile entry in
+ * EMBEDDED_COLLECTIONS), so without this a same-connection re-run
+ * would miss in the scene scan and duplicate the tiles — the same
+ * reason `live.ts` keeps `sentDedupeKeys`. A fresh connection
+ * re-scans the server instead; the memo is a cache, never the source
+ * of truth, and it is keyed by the live object so it dies with the
+ * connection. The memo also records the layout fingerprint: a re-run
+ * with the same key but a CHANGED spec is not a retry, it is a new
+ * layout for the same room — a fingerprint mismatch falls through to
+ * the server converge instead of returning stale ids.
+ */
+const tileRoomMemo = new WeakMap<
+  FoundryLive,
+  Map<string, { built: BuiltTileRoom; fingerprint: string }>
+>();
+
+/** Stable fingerprint of what a build should look like (deterministic
+ *  layout: dims, tiles, walls, lights). */
+function tileRoomFingerprint(layout: import("./tiles-layout.js").RoomLayout): string {
+  return JSON.stringify(layout);
+}
+
+function memoizeTileRoom(
+  live: FoundryLive,
+  key: string,
+  built: BuiltTileRoom,
+  fingerprint: string,
+): void {
+  let perLive = tileRoomMemo.get(live);
+  if (!perLive) {
+    perLive = new Map();
+    tileRoomMemo.set(live, perLive);
+  }
+  perLive.set(key, { built, fingerprint });
+}
 
 export interface BuiltTileRoom {
   sceneId: string;
@@ -42,11 +91,152 @@ export interface BuiltTileRoom {
 }
 
 /**
+ * Create the Level for a tile room (factored out of buildTileRoom so
+ * a keyed re-run can finish one a crash interrupted — see
+ * convergeTileRoom). The Level carries a plain dark colour from the
+ * theme instead of a src: the tiles are the map.
+ */
+async function createTileRoomLevel(
+  live: FoundryLive,
+  sceneId: string,
+  name: string,
+  resolved: ThemeSpec,
+): Promise<string> {
+  const levels = await live.modifyDocument("Level", "create", {
+    data: [{
+      name,
+      background: { color: resolved.backgroundColor, src: null, tint: "#ffffff", alphaThreshold: 0.75 },
+      foreground: { src: null, tint: "#ffffff", alphaThreshold: 0.75 },
+      elevation: { top: 20, bottom: 0 },
+      fog: { src: null },
+      textures: { anchorX: 0.5, anchorY: 0.5, offsetX: 0, offsetY: 0, fit: "fill", scaleX: 1, scaleY: 1, rotation: 0 },
+      visibility: { levels: [] },
+      sort: 0,
+      flags: {},
+    }],
+    parentUuid: `Scene.${sceneId}`,
+  });
+  const levelId = String(levels[0]?._id ?? "");
+  if (!levelId) throw new Error("Level create returned no _id.");
+  return levelId;
+}
+
+/** Raw scene docs, as `live.raw().getScenes()` returns them. */
+interface RawSceneDoc {
+  _id?: string;
+  flags?: Record<string, Record<string, unknown> | undefined> | null;
+  [key: string]: unknown;
+}
+
+function readSceneDoc(live: FoundryLive, sceneId: string): RawSceneDoc | undefined {
+  const raw = live.raw() as unknown as { getScenes(): RawSceneDoc[] };
+  return raw.getScenes().find((s) => s._id === sceneId);
+}
+
+/**
+ * Converge an existing keyed scene to the requested layout: delete
+ * surplus keyed embeds, create the missing ones (stamped with their
+ * per-embed keys), finish a missing Level, and update the scene dims.
+ * Embeds that belong to another build key — or carry no key at all —
+ * are never touched. The room description is announced via
+ * `sendChatIdempotent` (`<buildKey>:announce`, the buildRoom pattern):
+ * a crash before the first attempt's post still gets announced once,
+ * and a re-run after a posted announcement posts nothing twice.
+ */
+async function convergeTileRoom(
+  live: FoundryLive,
+  sceneId: string,
+  spec: RoomSpec,
+  layout: import("./tiles-layout.js").RoomLayout,
+  resolved: ThemeSpec,
+): Promise<BuiltTileRoom> {
+  const key = spec.buildKey as string;
+  const parentUuid = `Scene.${sceneId}`;
+  const present = extractTileRoomEmbeds(readSceneDoc(live, sceneId));
+  const plan = planTileRoomConverge(
+    { tiles: layout.tiles.length, walls: layout.walls.length, lights: layout.lights.length },
+    present,
+    key,
+  );
+  if (plan.deleteTileIds.length > 0) {
+    await live.modifyDocument("Tile", "delete", { ids: plan.deleteTileIds, parentUuid });
+  }
+  if (plan.deleteWallIds.length > 0) {
+    await live.modifyDocument("Wall", "delete", { ids: plan.deleteWallIds, parentUuid });
+  }
+  if (plan.deleteLightIds.length > 0) {
+    await live.modifyDocument("AmbientLight", "delete", { ids: plan.deleteLightIds, parentUuid });
+  }
+  const tileIds = [...plan.keepTileIds];
+  if (plan.createTiles.length > 0) {
+    const created = await live.modifyDocument("Tile", "create", {
+      data: plan.createTiles.map((i) => ({
+        ...layout.tiles[i],
+        flags: flagValue(FLAG_FIELDS.tileRoom, tileEmbedKey(key, "tile", i)),
+      })),
+      parentUuid,
+    });
+    created.forEach((d, n) => {
+      tileIds[plan.createTiles[n]] = String(d._id);
+    });
+  }
+  const wallIds = [...plan.keepWallIds];
+  if (plan.createWalls.length > 0) {
+    const createdIds = await addWalls(
+      live,
+      sceneId,
+      plan.createWalls.map((i) => layout.walls[i]),
+      { embedKeys: plan.createWalls.map((i) => tileEmbedKey(key, "wall", i)) },
+    );
+    createdIds.forEach((id, n) => {
+      wallIds[plan.createWalls[n]] = id;
+    });
+  }
+  const lightIds = [...plan.keepLightIds];
+  if (plan.createLights.length > 0) {
+    const createdIds = await addLights(
+      live,
+      sceneId,
+      plan.createLights.map((i) => layout.lights[i]),
+      { embedKeys: plan.createLights.map((i) => tileEmbedKey(key, "light", i)) },
+    );
+    createdIds.forEach((id, n) => {
+      lightIds[plan.createLights[n]] = id;
+    });
+  }
+  // A crash between Scene create and Level create leaves a scene with
+  // no initialLevel — finish it now instead of leaving a room that
+  // will not load.
+  const updates: Record<string, unknown> = { _id: sceneId, width: layout.width, height: layout.height };
+  if (!present.initialLevel) {
+    updates.initialLevel = await createTileRoomLevel(live, sceneId, spec.name, resolved);
+  }
+  await live.modifyDocument("Scene", "update", { updates: [updates] });
+  if (spec.description) {
+    await live.sendChatIdempotent(`🏰 **${spec.name}**\n${spec.description}`, {
+      dedupeKey: `${key}:announce`,
+    });
+  }
+  return {
+    sceneId,
+    tileIds: tileIds as string[],
+    wallIds: wallIds as string[],
+    lightIds: lightIds as string[],
+  };
+}
+
+/**
  * Create a tile room on the server: Scene + Level (colour-only
  * background — the tiles are the map) + Tile/Wall/Light embeds.
  * The scene is NOT activated (the GM activates it when ready).
  * GM users are added as owners (role 4) so the DM can edit the scene —
  * the ownership gap that bit Lich's Lair (BACKLOG.md).
+ *
+ * With `spec.buildKey` (BRA-202), the build is retry-safe: the key is
+ * stored in the scene's flags and every tile/wall/light carries a
+ * per-embed key. A re-run with the same key returns the existing
+ * scene — converging a half-built one to the full layout — instead of
+ * building a duplicate. Without a key, behavior is unchanged.
  *
  * @param theme an explicit theme (one-word name or ThemeSpec) — it
  *   overrides `spec.theme`; with neither, the dungeon baseline.
@@ -62,20 +252,39 @@ export async function buildTileRoom(
 ): Promise<BuiltTileRoom> {
   const resolved = resolveTheme(theme ?? spec.theme);
   const layout = layoutRoom(spec, pack, serverBase, resolved);
+  const key = spec.buildKey;
+  if (key) {
+    // Same-connection re-run with the same layout: the memo has the
+    // exact ids (the live cache never sees its own Tile creates). No
+    // server traffic. A changed layout under the same key is not a
+    // retry — fall through to the server converge below.
+    const memo = tileRoomMemo.get(live)?.get(key);
+    if (memo && memo.fingerprint === tileRoomFingerprint(layout)) return memo.built;
+    // Cross-connection re-run (crash re-dispatch): the scene is on
+    // the server under this key — converge it, don't duplicate it.
+    const existingId = findSceneByBuildKey(live, key);
+    if (existingId) {
+      const converged = await convergeTileRoom(live, existingId, spec, layout, resolved);
+      memoizeTileRoom(live, key, converged, tileRoomFingerprint(layout));
+      return converged;
+    }
+  }
   const gms = live.getUsers().filter((u) => u.role === 4);
   const ownership: Record<string, number> = { default: 0 };
   for (const gm of gms) ownership[gm._id] = 3;
   if (live.userId) ownership[live.userId] = 3;
 
+  const sceneData: Record<string, unknown> = {
+    name: spec.name,
+    width: layout.width,
+    height: layout.height,
+    grid: { size: TILE_PX, type: 1, distance: 5, units: "ft" },
+    navigation: true,
+    ownership,
+  };
+  if (key) sceneData.flags = flagValue(FLAG_FIELDS.sceneBuild, key);
   const created = await live.modifyDocument("Scene", "create", {
-    data: [{
-      name: spec.name,
-      width: layout.width,
-      height: layout.height,
-      grid: { size: TILE_PX, type: 1, distance: 5, units: "ft" },
-      navigation: true,
-      ownership,
-    }],
+    data: [sceneData],
   });
   const sceneId = String(created[0]?._id ?? "");
   if (!sceneId) throw new Error("Scene create returned no _id.");
@@ -83,40 +292,49 @@ export async function buildTileRoom(
   // v14: the map lives on a Level. A tile room has no background image,
   // so the Level carries a plain dark colour from the theme instead of
   // a src.
-  const levels = await live.modifyDocument("Level", "create", {
-    data: [{
-      name: spec.name,
-      background: { color: resolved.backgroundColor, src: null, tint: "#ffffff", alphaThreshold: 0.75 },
-      foreground: { src: null, tint: "#ffffff", alphaThreshold: 0.75 },
-      elevation: { top: 20, bottom: 0 },
-      fog: { src: null },
-      textures: { anchorX: 0.5, anchorY: 0.5, offsetX: 0, offsetY: 0, fit: "fill", scaleX: 1, scaleY: 1, rotation: 0 },
-      visibility: { levels: [] },
-      sort: 0,
-      flags: {},
-    }],
-    parentUuid: `Scene.${sceneId}`,
-  });
-  const levelId = String(levels[0]?._id ?? "");
-  if (!levelId) throw new Error("Level create returned no _id.");
+  const levelId = await createTileRoomLevel(live, sceneId, spec.name, resolved);
   await live.modifyDocument("Scene", "update", {
     updates: [{ _id: sceneId, initialLevel: levelId }],
   });
 
   // Tiles in one create — the vendored client's cache does not track
   // Tile documents, so verify on a FRESH connection, not this one.
+  // A keyed build stamps each tile with its per-embed key so a re-run
+  // can find it again.
   const tileCreated = await live.modifyDocument("Tile", "create", {
-    data: layout.tiles,
+    data: layout.tiles.map((t, i) =>
+      key ? { ...t, flags: flagValue(FLAG_FIELDS.tileRoom, tileEmbedKey(key, "tile", i)) } : t,
+    ),
     parentUuid: `Scene.${sceneId}`,
   });
   const tileIds = tileCreated.map((d) => String(d._id));
-  const wallIds = await addWalls(live, sceneId, layout.walls);
-  const lightIds = await addLights(live, sceneId, layout.lights);
+  const wallIds = await addWalls(
+    live,
+    sceneId,
+    layout.walls,
+    key ? { embedKeys: layout.walls.map((_, i) => tileEmbedKey(key, "wall", i)) } : {},
+  );
+  const lightIds = await addLights(
+    live,
+    sceneId,
+    layout.lights,
+    key ? { embedKeys: layout.lights.map((_, i) => tileEmbedKey(key, "light", i)) } : {},
+  );
 
   if (spec.description) {
-    await live.sendChat(`🏰 **${spec.name}**\n${spec.description}`);
+    // Keyed builds announce idempotently (<buildKey>:announce, the
+    // buildRoom pattern): a re-run after a crash posts once, never twice.
+    if (key) {
+      await live.sendChatIdempotent(`🏰 **${spec.name}**\n${spec.description}`, {
+        dedupeKey: `${key}:announce`,
+      });
+    } else {
+      await live.sendChat(`🏰 **${spec.name}**\n${spec.description}`);
+    }
   }
-  return { sceneId, tileIds, wallIds, lightIds };
+  const built = { sceneId, tileIds, wallIds, lightIds };
+  if (key) memoizeTileRoom(live, key, built, tileRoomFingerprint(layout));
+  return built;
 }
 
 /**
@@ -126,6 +344,14 @@ export async function buildTileRoom(
  * Changing gridW/gridH is all it takes; no new images are involved.
  * A `theme` here re-skins the room at the same time (FR-2) — same
  * layout, new look.
+ *
+ * With `spec.buildKey` (BRA-202), the rebuild is retry-safe too: the
+ * delete set is the union of `previous` and every embed on the scene
+ * carrying this build's per-embed keys (a crashed earlier rebuild's
+ * leftovers), the new embeds are stamped with their per-embed keys,
+ * and the scene is stamped with the build key when it lacks it — so a
+ * later keyed buildTileRoom re-run finds the scene and converges
+ * instead of duplicating it.
  */
 export async function rebuildTileRoom(
   live: FoundryLive,
@@ -138,27 +364,75 @@ export async function rebuildTileRoom(
 ): Promise<BuiltTileRoom> {
   const resolved = resolveTheme(theme ?? spec.theme);
   const parentUuid = `Scene.${sceneId}`;
-  if (previous.tileIds.length > 0) {
-    await live.modifyDocument("Tile", "delete", { ids: previous.tileIds, parentUuid });
-  }
-  if (previous.wallIds.length > 0) {
-    await live.modifyDocument("Wall", "delete", { ids: previous.wallIds, parentUuid });
-  }
-  if (previous.lightIds.length > 0) {
-    await live.modifyDocument("AmbientLight", "delete", { ids: previous.lightIds, parentUuid });
+  const key = spec.buildKey;
+  // Keyed rebuild: the scene scan, not just `previous`, is the delete
+  // set — `previous` is stale after a crashed rebuild.
+  let sceneDoc: RawSceneDoc | undefined;
+  if (key) {
+    sceneDoc = readSceneDoc(live, sceneId);
+    const present = extractTileRoomEmbeds(sceneDoc);
+    const ownedNotKnown = (list: KeyedEmbed[], known: string[]): string[] => {
+      const knownSet = new Set(known);
+      return list
+        .filter((e) => parseTileEmbedKey(e.key)?.buildKey === key && !knownSet.has(e.id))
+        .map((e) => e.id);
+    };
+    const tileIds = [...previous.tileIds, ...ownedNotKnown(present.tiles, previous.tileIds)];
+    const wallIds = [...previous.wallIds, ...ownedNotKnown(present.walls, previous.wallIds)];
+    const lightIds = [...previous.lightIds, ...ownedNotKnown(present.lights, previous.lightIds)];
+    if (tileIds.length > 0) {
+      await live.modifyDocument("Tile", "delete", { ids: tileIds, parentUuid });
+    }
+    if (wallIds.length > 0) {
+      await live.modifyDocument("Wall", "delete", { ids: wallIds, parentUuid });
+    }
+    if (lightIds.length > 0) {
+      await live.modifyDocument("AmbientLight", "delete", { ids: lightIds, parentUuid });
+    }
+  } else {
+    if (previous.tileIds.length > 0) {
+      await live.modifyDocument("Tile", "delete", { ids: previous.tileIds, parentUuid });
+    }
+    if (previous.wallIds.length > 0) {
+      await live.modifyDocument("Wall", "delete", { ids: previous.wallIds, parentUuid });
+    }
+    if (previous.lightIds.length > 0) {
+      await live.modifyDocument("AmbientLight", "delete", { ids: previous.lightIds, parentUuid });
+    }
   }
   const layout = layoutRoom(spec, pack, serverBase, resolved);
+  // Stamp the scene with the build key when it lacks it (a scene built
+  // before keys existed, now rebuilt under one). Flag updates merge
+  // per scope — the quest log stamps flags the same way.
+  const sceneUpdate: Record<string, unknown> = { _id: sceneId, width: layout.width, height: layout.height };
+  if (key && !sceneHasTileRoomKey(sceneDoc, key)) {
+    sceneUpdate.flags = flagValue(FLAG_FIELDS.sceneBuild, key);
+  }
   await live.modifyDocument("Scene", "update", {
-    updates: [{ _id: sceneId, width: layout.width, height: layout.height }],
+    updates: [sceneUpdate],
   });
   const tileCreated = await live.modifyDocument("Tile", "create", {
-    data: layout.tiles,
+    data: layout.tiles.map((t, i) =>
+      key ? { ...t, flags: flagValue(FLAG_FIELDS.tileRoom, tileEmbedKey(key, "tile", i)) } : t,
+    ),
     parentUuid,
   });
   const tileIds = tileCreated.map((d) => String(d._id));
-  const wallIds = await addWalls(live, sceneId, layout.walls);
-  const lightIds = await addLights(live, sceneId, layout.lights);
-  return { sceneId, tileIds, wallIds, lightIds };
+  const wallIds = await addWalls(
+    live,
+    sceneId,
+    layout.walls,
+    key ? { embedKeys: layout.walls.map((_, i) => tileEmbedKey(key, "wall", i)) } : {},
+  );
+  const lightIds = await addLights(
+    live,
+    sceneId,
+    layout.lights,
+    key ? { embedKeys: layout.lights.map((_, i) => tileEmbedKey(key, "light", i)) } : {},
+  );
+  const built = { sceneId, tileIds, wallIds, lightIds };
+  if (key) memoizeTileRoom(live, key, built, tileRoomFingerprint(layout));
+  return built;
 }
 
 /**
@@ -203,6 +477,11 @@ export interface BuiltDungeon {
  * layoutDungeon, so a bad graph fails before any scene is created.
  * A `theme` here re-skins every room that does not set its own
  * (FR-2) — one call, whole dungeon, new look.
+ *
+ * With `opts.buildKey` (BRA-202), every room is built under
+ * `<buildKey>:<room id>` (unless the room's own spec already sets a
+ * buildKey), so a re-run of the whole dungeon returns the existing
+ * scenes instead of building a second dungeon.
  */
 export async function buildDungeon(
   live: FoundryLive,
@@ -210,11 +489,16 @@ export async function buildDungeon(
   pack: import("./tiles-layout.js").Pack,
   serverBase: string,
   theme?: string | ThemeSpec,
+  opts: { buildKey?: string } = {},
 ): Promise<BuiltDungeon> {
   const dungeon: DungeonLayout = layoutDungeon(spec, pack, serverBase, theme);
   const rooms: BuiltDungeonRoom[] = [];
   for (const room of spec.rooms) {
-    const built = await buildTileRoom(live, room, pack, serverBase, theme);
+    const keyed: RoomSpec =
+      opts.buildKey && !room.buildKey
+        ? { ...room, buildKey: `${opts.buildKey}:${room.id}` }
+        : room;
+    const built = await buildTileRoom(live, keyed, pack, serverBase, theme);
     rooms.push({ id: room.id, ...built });
   }
   return { rooms, links: dungeon.links };

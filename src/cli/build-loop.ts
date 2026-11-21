@@ -7,10 +7,14 @@
  *   bun run src/cli/build-loop.ts --demo
  *       The canned Nov 19 script: build the Entry Hall, add a secret
  *       door, widen it, carve a corridor, add bones, undo, redo.
- *   bun run src/cli/build-loop.ts --say "<line>" [--spec <dungeon.json>]
+ *   bun run src/cli/build-loop.ts --say "<line>" [--spec <dungeon.json>] [--state <build-state.json>] [--here <roomId,x,y>]
  *       Parse one line against the demo room (8x6 Entry Hall, south
  *       door) or the dungeon in --spec, and print the plan: the parse,
- *       the op, the spec diff, and the chat line.
+ *       the ops, the spec diff, and the chat lines. A compound line
+ *       ("add a door here and widen the room") runs its ops in order,
+ *       one step each. --state loads the build session from a state
+ *       file (and saves it back after); --here is the GM's last
+ *       ping/cursor point as roomId,x,y in scene px.
  *
  * Arg parsing and --help run BEFORE the library import: importing the
  * live layer validates FOUNDRY_URL at import time (see dice.ts), so
@@ -26,12 +30,15 @@ const {
   describeDungeon,
   diffSummary,
   formatBuildLine,
+  loadBuildState,
   parseBuildRequest,
+  parseBuildRequests,
+  saveBuildState,
   validateDungeonRooms,
 } = await import("../session/build-loop.js");
 const { loadPack } = await import("../worldbuilding/tiles-layout.js");
 import type { DungeonSpec } from "../worldbuilding/tiles-layout.js";
-import type { BuildSession as BuildSessionType } from "../session/build-loop.js";
+import type { BuildParseContext, BuildSession as BuildSessionType } from "../session/build-loop.js";
 
 function arg(name: string): string | undefined {
   const i = process.argv.indexOf(name);
@@ -45,7 +52,7 @@ function has(name: string): boolean {
 function usage(): never {
   process.stderr.write(
     "usage: bun run src/cli/build-loop.ts --demo\n" +
-      "   or: bun run src/cli/build-loop.ts --say \"<line>\" [--spec <dungeon.json>]\n",
+      "   or: bun run src/cli/build-loop.ts --say \"<line>\" [--spec <dungeon.json>] [--state <build-state.json>] [--here <roomId,x,y>]\n",
   );
   process.exit(2);
 }
@@ -163,8 +170,14 @@ async function main(): Promise<void> {
   const said = arg("--say");
   if (said === undefined) usage();
   let session: BuildSessionType;
+  // --state loads a saved session (dungeon + history + built rooms);
+  // --spec is the initial dungeon when there is no state file.
+  const statePath = arg("--state");
   const specPath = arg("--spec");
-  if (specPath !== undefined) {
+  const restored = statePath !== undefined ? loadBuildState(statePath) : null;
+  if (restored) {
+    session = restored.session;
+  } else if (specPath !== undefined) {
     try {
       const dungeon = JSON.parse(fs.readFileSync(specPath, "utf8")) as DungeonSpec;
       session = new BuildSession(dungeon);
@@ -177,10 +190,26 @@ async function main(): Promise<void> {
   } else {
     session = new BuildSession(demoDungeon());
   }
+  // --here <roomId,x,y>: the GM's last ping/cursor point, scene px.
+  let here: BuildParseContext["here"];
+  const hereArg = arg("--here");
+  if (hereArg !== undefined) {
+    const [roomId, xs, ys] = hereArg.split(",");
+    const x = Number(xs);
+    const y = Number(ys);
+    if (!roomId || !Number.isFinite(x) || !Number.isFinite(y)) {
+      process.stderr.write(`build-loop failed: --here takes roomId,x,y (got ${hereArg})\n`);
+      process.exit(1);
+    }
+    here = { roomId, x, y };
+  }
   const before = session.current();
-  const parsed = parseBuildRequest(said, {
+  const ctx: BuildParseContext = {
     room: session.activeRoomSpec() ?? undefined,
-  });
+    rooms: before.dungeon.rooms,
+    here,
+  };
+  const parsed = parseBuildRequests(said, ctx);
   if (!parsed) {
     process.stdout.write(JSON.stringify({ said, kind: "not-build" }) + "\n");
     return;
@@ -202,11 +231,14 @@ async function main(): Promise<void> {
     );
     return;
   }
-  const op = parsed.op;
-  if (op.type === "undo" || op.type === "redo") {
-    const entry = op.type === "undo" ? session.undo() : session.redo();
-    process.stdout.write(
-      JSON.stringify({
+  // A compound line runs its ops in order, one step each; an op that
+  // fails stops the list (the ops before it stay committed).
+  const steps: Record<string, unknown>[] = [];
+  for (const op of parsed.ops) {
+    const stepBefore = session.current();
+    if (op.type === "undo" || op.type === "redo") {
+      const entry = op.type === "undo" ? session.undo() : session.redo();
+      steps.push({
         said,
         kind: "build",
         op,
@@ -216,42 +248,49 @@ async function main(): Promise<void> {
         chatLine: entry
           ? `${op.type === "undo" ? "↩️" : "↪️"} ${op.type === "undo" ? "Undid" : "Redid"}: ${entry.summary}`
           : `Nothing to ${op.type}.`,
-        before: describeDungeon(before.dungeon),
-        after: describeDungeon(session.current().dungeon),
-        diff: diffSummary(before.dungeon, session.current().dungeon),
-      }) + "\n",
-    );
-    return;
-  }
-  try {
-    const peeked = session.peek(op, { pack });
-    validateDungeonRooms(peeked.state.dungeon, pack, SERVER_BASE);
-    if (peeked.changed) session.commit(peeked.state, said, op, peeked.summary);
-    process.stdout.write(
-      JSON.stringify({
+        diff: diffSummary(stepBefore.dungeon, session.current().dungeon),
+      });
+      continue;
+    }
+    try {
+      const peeked = session.peek(op, { pack });
+      validateDungeonRooms(peeked.state.dungeon, pack, SERVER_BASE);
+      if (peeked.changed) session.commit(peeked.state, said, op, peeked.summary);
+      steps.push({
         said,
         kind: "build",
         op,
         summary: peeked.summary,
         chatLine: formatBuildLine(peeked.summary, op),
-        before: describeDungeon(before.dungeon),
-        after: describeDungeon(session.current().dungeon),
-        diff: diffSummary(before.dungeon, session.current().dungeon),
-      }) + "\n",
-    );
-  } catch (err) {
-    process.stdout.write(
-      JSON.stringify({
+        diff: diffSummary(stepBefore.dungeon, session.current().dungeon),
+      });
+    } catch (err) {
+      steps.push({
         said,
         kind: "build",
         op,
         error: err instanceof Error ? err.message : String(err),
         chatLine: `I couldn't build that — ${err instanceof Error ? err.message : String(err)}`,
-        before: describeDungeon(before.dungeon),
-        after: describeDungeon(session.current().dungeon),
-      }) + "\n",
-    );
+        diff: ["(no change)"],
+      });
+      break;
+    }
   }
+  if (statePath !== undefined) {
+    saveBuildState(session, restored?.built ?? new Map(), statePath);
+  }
+  process.stdout.write(
+    JSON.stringify({
+      said,
+      kind: "build",
+      steps,
+      chatLines: steps.map((s) => s.chatLine),
+      before: describeDungeon(before.dungeon),
+      after: describeDungeon(session.current().dungeon),
+      diff: diffSummary(before.dungeon, session.current().dungeon),
+      history: session.history().map((e) => e.summary),
+    }) + "\n",
+  );
 }
 
 main().catch((err) => {
