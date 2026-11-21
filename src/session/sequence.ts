@@ -25,13 +25,16 @@ import type { FoundryLive, PingStyle } from "../live.js";
 import { moveTokenTo, placeToken, deleteToken, resolveToken, resolveScene } from "./movement.js";
 import { postVisibleRoll } from "./dice.js";
 import { dedupeKeyFor } from "../idempotency.js";
-import { animateLight, lightsOut } from "./lights.js";
+import { animateLight, animateNamedLights, lightsOut } from "./lights.js";
 import type { LightSelector, LightState } from "./lights.js";
 import { angleToFace } from "./formations.js";
 import { FLAG_SCOPE } from "../idempotency.js";
 import { swapTileTexture } from "./tile-ops.js";
 import { nearestWall, sceneWalls } from "./pins.js";
 import { revealImageChatHtml } from "./reveal.js";
+import { buildPopoutDismiss, buildPopoutShow, emitPopout } from "./popout.js";
+import { recordCutsceneProp } from "../worldbuilding/tiles-layout.js";
+import type { Pack, RoomSpec } from "../worldbuilding/tiles-layout.js";
 
 export type SequenceStep =
   | { kind: "place"; sceneId: string; actor: string; x: number; y: number; name?: string; key?: string }
@@ -47,10 +50,11 @@ export type SequenceStep =
   | { kind: "cursor"; x: number; y: number; sceneId?: string }
   | { kind: "waitChat"; timeout?: number; debounce?: number }
   | { kind: "face"; sceneId: string; token: string; x?: number; y?: number; towardToken?: string; rotation?: number }
-  | { kind: "light"; sceneId: string; light: LightSelector; dim?: number; bright?: number; color?: string; alpha?: number; durationMs?: number; steps?: number; from?: Partial<LightState> }
+  | { kind: "light"; sceneId: string; light: LightSelector | { name: string }; dim?: number; bright?: number; color?: string; alpha?: number; durationMs?: number; steps?: number; from?: Partial<LightState> }
   | { kind: "prop"; sceneId: string; src: string; x: number; y: number; width?: number; height?: number; rotation?: number; elevation?: number; sort?: number; alpha?: number; hidden?: boolean; key?: string }
   | { kind: "reveal"; what: "scene" | "tile" | "token" | "light"; id: string; sceneId?: string }
   | { kind: "reveal"; what?: "image"; image: string; caption?: string; mode?: "chat" | "popout"; alias?: string; sceneId?: string }
+  | { kind: "dismissReveal"; id?: string }
   | { kind: "wait"; timeout?: number; debounce?: number; match?: string }
   | { kind: "swapTile"; sceneId: string; tile?: string; cell?: { x: number; y: number }; to: string }
   | { kind: "waitRound"; round: number; relative?: boolean; timeoutMs?: number; sceneId?: string }
@@ -84,6 +88,27 @@ export interface RunSequenceOptions {
    * it, every step applies fresh, as before.
    */
   runKey?: string;
+  /**
+   * The room spec the played props belong to (BRA-242). When given,
+   * each played `prop` step is recorded into the spec via
+   * placeProp (see tiles-layout.ts `recordCutsceneProp`), and the
+   * updated spec is handed back through `onSpec` after each
+   * recording — a rebuild of the room then puts the prop back at
+   * the same cell. The caller owns the spec (the monitor's build
+   * session) and must persist what `onSpec` hands it; the player
+   * never writes the spec anywhere itself.
+   *
+   * When no spec is supplied, props still play (the Tile is
+   * created) but are NOT recorded — the step result says so, and
+   * the prop will not survive a rebuild. The player cannot invent
+   * a spec: it has no room to attach one to. That is the honest
+   * limit — wire the caller to pass its spec.
+   */
+  roomSpec?: {
+    spec: RoomSpec;
+    pack: Pack;
+    onSpec: (next: RoomSpec) => void;
+  };
 }
 
 const sleep = (ms: number): Promise<void> =>
@@ -91,7 +116,7 @@ const sleep = (ms: number): Promise<void> =>
 
 const KNOWN_KINDS = new Set([
   "place", "deleteToken", "move", "pause", "chat", "roll", "damage", "heal", "effect", "ping", "cursor", "waitChat",
-  "face", "light", "prop", "reveal", "wait", "swapTile", "waitRound", "lightsOut", "breakWall",
+  "face", "light", "prop", "reveal", "dismissReveal", "wait", "swapTile", "waitRound", "lightsOut", "breakWall",
 ]);
 
 type RawActorAccess = {
@@ -130,6 +155,10 @@ export async function runSequence(
   // position is the authority for a later move, because our own creates
   // are invisible in this connection's cache (see movement.ts TokenRef).
   const placed = new Map<string, { id: string; name: string; x: number; y: number }>();
+  // The room spec threaded through this run (BRA-242): each recorded
+  // prop updates it, so the next prop in the same run sees the
+  // earlier ones (a re-play dedupes instead of doubling).
+  let currentSpec = opts.roomSpec?.spec;
 
   for (let i = 0; i < steps.length; i++) {
     const step = steps[i];
@@ -319,6 +348,33 @@ export async function runSequence(
           break;
         }
         case "light": {
+          // BRA-239: a named light step ({name}) animates the whole
+          // group via animateNamedLights. The `from` decision: the
+          // plan carries it — each light starts from its own current
+          // state, read from the cache at plan time. A single `from`
+          // cannot describe a group of lights in different states,
+          // so a named step carrying one is an error, never a
+          // silently-ignored field (validation rejects it too).
+          if ("name" in step.light) {
+            if (step.from !== undefined) {
+              throw new Error(
+                `A named light step ("${step.light.name}") animates from each light's current state — "from" does not apply to a group.`,
+              );
+            }
+            const named = await animateNamedLights(
+              live,
+              step.sceneId,
+              step.light.name,
+              { dim: step.dim, bright: step.bright, color: step.color, alpha: step.alpha },
+              { durationMs: step.durationMs, steps: step.steps },
+            );
+            result.result = {
+              name: named.name,
+              lightIds: named.results.map((r) => r.lightId),
+              results: named.results,
+            };
+            break;
+          }
           result.result = await animateLight(
             live,
             step.sceneId,
@@ -354,28 +410,69 @@ export async function runSequence(
           });
           const tileId = String(created[0]?._id ?? "");
           if (!tileId) throw new Error("Tile create returned no _id.");
-          result.result = { tileId };
+          // BRA-242: record the played prop in the room spec when the
+          // caller supplied one. A recording failure is reported on
+          // the step, never a silent skip — but it does not fail the
+          // step: the prop IS on the table, it just will not survive
+          // a rebuild. Without a spec there is nothing to record
+          // into, and the result says so.
+          let recorded = false;
+          let recordNote: string | undefined;
+          let recordError: string | undefined;
+          let propId: string | undefined;
+          if (opts.roomSpec && currentSpec) {
+            try {
+              const rec = recordCutsceneProp(currentSpec, step, opts.roomSpec.pack);
+              recorded = rec.recorded;
+              recordNote = rec.note;
+              propId = rec.propId;
+              if (rec.recorded) {
+                currentSpec = rec.spec;
+                opts.roomSpec.onSpec(currentSpec);
+              }
+            } catch (err) {
+              recordError = err instanceof Error ? err.message : String(err);
+            }
+          } else {
+            recordNote =
+              "No room spec supplied — the prop plays but is not recorded, and will not survive a rebuild.";
+          }
+          result.result = {
+            tileId,
+            recorded,
+            ...(propId ? { propId } : {}),
+            ...(recordNote ? { recordNote } : {}),
+            ...(recordError ? { recordError } : {}),
+          };
           break;
         }
         case "reveal": {
-          // FR-18 image reveal: the image posts inline in chat.
-          // "popout" is accepted by validation but has no client-side
-          // route from the MCP path — it falls back to the chat post
-          // and the result says so, never pretending a popup happened.
+          // FR-18 image reveal: the image posts inline in chat FIRST,
+          // unconditionally — that post is the degraded path. A player
+          // without the meroki-reveal module never sees a popout;
+          // they see this image, never nothing.
           if (step.what === "image" || ("image" in step && step.image !== undefined)) {
             const imageStep = step as { image: string; caption?: string; mode?: "chat" | "popout"; alias?: string };
             const mode = imageStep.mode ?? "chat";
             const html = revealImageChatHtml(imageStep.image, imageStep.caption);
             const id = await live.sendChat(html, { alias: imageStep.alias });
-            result.result =
-              mode === "popout"
-                ? {
-                    id,
-                    mode,
-                    popout: false,
-                    note: "No client-side popout is reachable from the MCP path — posted inline in chat instead.",
-                  }
-                : { id, mode };
+            if (mode === "chat") {
+              result.result = { id, mode };
+              break;
+            }
+            // mode === "popout": attempt the socket popout on top of
+            // the chat post. A failed build or emit is reported in
+            // the result, never swallowed — the chat image above is
+            // already the fallback.
+            const built = buildPopoutShow(imageStep.image, imageStep.caption);
+            if (!built.ok) {
+              result.result = { id, mode, popout: false, note: built.errors.join(" ") };
+              break;
+            }
+            const sent = emitPopout(live, built.message);
+            result.result = sent.emitted
+              ? { id, mode, popout: true, popoutId: built.message.id }
+              : { id, mode, popout: false, popoutId: built.message.id, note: sent.reason };
             break;
           }
           // Activating a scene switches the whole table's view to it —
@@ -400,6 +497,18 @@ export async function runSequence(
             });
             result.result = { what: doc.what, id: doc.id, hidden: false };
           }
+          break;
+        }
+        case "dismissReveal": {
+          // BRA-236: the GM closes the popout on every client. No chat
+          // post — the table already saw the image; a dismiss is
+          // silent. A failed emit is reported, never swallowed; the
+          // players can still dismiss locally (Esc / backdrop / X).
+          const dismissStep = step as { id?: string };
+          const sent = emitPopout(live, buildPopoutDismiss(dismissStep.id));
+          result.result = sent.emitted
+            ? { dismissed: true, ...(dismissStep.id ? { popoutId: dismissStep.id } : {}) }
+            : { dismissed: false, note: sent.reason };
           break;
         }
         case "wait": {

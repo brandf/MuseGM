@@ -213,7 +213,15 @@ function fakeLive(overrides: Record<string, unknown> = {}) {
     getUsers: () => [{ _id: GM, name: "Gamemaster", role: 4, active: true }],
     getCombatState: () => null,
     getWorldSummary: () => ({ title: "TestBed", counts: {} }),
-    raw: () => ({ getJournals: () => [] }),
+    raw: () => ({
+      getJournals: () => [],
+      getWorldData: () => ({
+        scenes: [{ _id: "scene-1", name: "Entry Hall", tokens: [], lights: [], tiles: [], walls: [] }],
+        packs: [],
+      }),
+      getScenes: () => [],
+      searchActors: async (_q: unknown) => ({ actors: [] }),
+    }),
     on: (_fn: unknown) => () => {},
     sendChat: async (content: string, opts: Record<string, unknown> = {}) => {
       sent.push({ content, opts });
@@ -326,27 +334,40 @@ describe("handleWhisperSequence", () => {
 });
 
 describe("runMonitor with a GM whisper (fake live, --once)", () => {
-  it("a whispered embedded script is played; the ack is private, the effect is public", async () => {
-    const whisper = msg({
+  it("a whispered embedded script is staged, then fired; the preview and ack are private, the effect is public", async () => {
+    // Stage-then-fire (BRA-244): the script whisper stages and gets a
+    // preview back; nothing plays until the GM says "fire".
+    const scriptMsg = msg({
       id: "w10",
       content: `play this:\n\`\`\`json\n${JSON.stringify(CHAT_SCRIPT)}\n\`\`\``,
       whisper: [OWN],
     });
+    const fireMsg = msg({ id: "w10b", content: "fire", whisper: [OWN] });
+    const queue = [scriptMsg, fireMsg];
+    let calls = 0;
     const live = fakeLive({
-      waitForChat: async () => ({
-        timedOut: false,
-        newMessages: [whisper],
-        lastSeen: whisper.id,
-      }),
+      waitForChat: async () => {
+        calls += 1;
+        if (queue.length === 0) return { timedOut: true, newMessages: [], lastSeen: null };
+        const m = queue.shift()!;
+        return { timedOut: false, newMessages: [m], lastSeen: m.id };
+      },
     });
     const logs: unknown[] = [];
     const summary = await runMonitor(live as unknown as FoundryLive, {
-      once: true,
+      once: false,
       onLog: (l) => logs.push(l),
+      shouldStop: () => calls >= 2,
     });
-    expect(summary.messagesSeen).toBe(1);
-    expect(summary.whispersHandled).toBe(1);
-    expect(summary.answered).toBe(1);
+    expect(summary.messagesSeen).toBe(2);
+    expect(summary.whispersHandled).toBe(2);
+    expect(summary.stagesHandled).toBe(2);
+    expect(summary.answered).toBe(2);
+    // The staged preview goes to the GM by whisper, and nothing has
+    // played yet at that point.
+    const preview = live.sent.find((m) => m.content.includes("🎭 Staged"));
+    expect(preview).toBeDefined();
+    expect(preview?.opts.whisperTo).toEqual([GM]);
     await waitFor(() => live.sent.some((m) => m.content.includes('playing "Test Whisper"')));
     const ack = live.sent.find((m) => m.content.includes("playing"));
     expect(ack?.opts.whisperTo).toEqual([GM]);

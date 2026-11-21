@@ -36,8 +36,11 @@
     "build-loop": "bun run src/cli/build-loop.ts",
     "questlog": "bun run src/cli/questlog.ts",
     "chronicle": "bun run src/cli/chronicle.ts",
+    "downtime": "bun run src/cli/downtime.ts",
+    "rules": "bun run src/cli/rules.ts",
     "clocks": "bun run src/cli/clocks.ts",
     "scoreboard": "bun run src/cli/scoreboard.ts",
+    "rehearsal": "bun run src/cli/rehearsal.ts",
     "vehicles": "bun run src/cli/vehicles.ts"
   },
   "type": "module",

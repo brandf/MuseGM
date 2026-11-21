@@ -32,7 +32,7 @@ import { DUNGEON_THEME } from "../src/worldbuilding/themes.js";
 
 const pack: Pack = loadPack(path.resolve(import.meta.dir, "../tiles/manifest.json"));
 const BASE = "worlds/testbed";
-const KNOWN_PROPS = "altar, bones, bones-scattered, bookshelf, chest, chest-open, column-broken, dais-round, pillar, pool-round, ritual-circle, rubble, sconce, skeleton, skeleton-partial, spear, treasure-pile, wall-curved";
+const KNOWN_PROPS = "altar, bones, bones-scattered, bookshelf, brazier, candle, chest, chest-open, column-broken, dais-round, pillar, pool-round, ritual-circle, rubble, sconce, skeleton, skeleton-partial, spear, treasure-pile, wall-curved";
 
 /** 8x6 room with one legacy prop (no id — written before ids existed). */
 const baseSpec: RoomSpec = {
@@ -55,10 +55,10 @@ const dressingTiles = (spec: RoomSpec, theme?: string) => {
 const srcName = (t: { texture: { src: string } }) => t.texture.src.split("/").pop() ?? t.texture.src;
 
 describe("listPropTiles", () => {
-  it("names the dressing-layer tiles, sorted — and no brazier", () => {
+  it("names the dressing-layer tiles, sorted — brazier and candle included now", () => {
     expect(listPropTiles(pack)).toEqual(KNOWN_PROPS.split(", "));
-    expect(listPropTiles(pack)).not.toContain("brazier");
-    expect(listPropTiles(pack)).not.toContain("candle");
+    expect(listPropTiles(pack)).toContain("brazier");
+    expect(listPropTiles(pack)).toContain("candle");
   });
 });
 
@@ -116,10 +116,9 @@ describe("placeProp", () => {
     );
   });
 
-  it("rejects a brazier — no such tile exists, so it is never smuggled in", () => {
-    expect(() => placeProp(baseSpec, { tile: "brazier", gx: 0, gy: 0 }, pack)).toThrow(
-      `Unknown prop "brazier" — not in the pack. Known props: ${KNOWN_PROPS}.`,
-    );
+  it("places a brazier — the tile exists now (BRA-192)", () => {
+    const spec = placeProp(baseSpec, { tile: "brazier", gx: 0, gy: 0 }, pack);
+    expect(spec.dressing?.[1]).toEqual({ tile: "brazier", gx: 0, gy: 0, id: "prop-1" });
   });
 
   it("rejects a real tile that is not a prop, naming its layer", () => {

@@ -34,11 +34,18 @@ import {
   extractTileRoomEmbeds,
   parseTileEmbedKey,
   planTileRoomConverge,
+  plannedLightOf,
+  plannedWallOf,
   sceneHasTileRoomKey,
   tileEmbedKey,
   type KeyedEmbed,
 } from "./tile-keys.js";
 import { addLights, addWalls } from "./index.js";
+import {
+  layoutRoomWithDressing,
+  resolveDressingPairing,
+  type DressingPair,
+} from "../session/dressing.js";
 import { deleteToken, placeToken, resolveToken } from "../session/movement.js";
 import { uploadImage } from "./upload.js";
 
@@ -157,6 +164,8 @@ async function convergeTileRoom(
     {
       // Tiles converge by position + look, not flat index (see
       // planTileRoomConverge) — a widen or re-skin shifts indices.
+      // Walls and lights converge the same way (BRA-243): endpoints
+      // + door flag, position + config + name.
       tiles: layout.tiles.map((t) => ({
         sort: t.sort,
         elevation: t.elevation,
@@ -165,8 +174,8 @@ async function convergeTileRoom(
         src: t.texture.src,
         rotation: t.rotation,
       })),
-      walls: layout.walls.length,
-      lights: layout.lights.length,
+      walls: layout.walls.map((w) => plannedWallOf(w)),
+      lights: layout.lights.map((l) => plannedLightOf(l)),
     },
     present,
     key,
@@ -348,6 +357,109 @@ export async function buildTileRoom(
   const built = { sceneId, tileIds, wallIds, lightIds };
   if (key) memoizeTileRoom(live, key, built, tileRoomFingerprint(layout));
   return built;
+}
+
+/**
+ * The live half of the FR-16 composer hook (BRA-192): build a room
+ * with its dressing pass, then write the completed click flags back
+ * onto the tiles.
+ *
+ * Why a separate function instead of dressing inside buildTileRoom:
+ * buildTileRoom's contract — its layout fingerprint, its keyed memo
+ * and converge, and the existing callers/tests — is built around the
+ * spec as given. Dressing changes the layout (extra tiles + lights),
+ * so dressing by default would change every room build's fingerprint
+ * and every keyed re-run. Callers that want the map you can touch
+ * call this; plain buildTileRoom stays exactly as it was.
+ *
+ * Steps: layoutRoomWithDressing plans + merges + lays out in one
+ * call; buildTileRoom builds that dressed spec (the layout inside
+ * buildTileRoom is recomputed from the same inputs, so it matches
+ * the hook's layout exactly); resolveDressingPairing pairs the
+ * created ids back to their items by dressing id; then each pair's
+ * full flag record (`flags.meroki = { dressingId, lightId, kind,
+ * alpha }`) is written onto its tile, so the meroki-dressing module
+ * can flip the light on click. Flag updates merge per scope, so the
+ * write completes the `{ dressingId }` the layout stamped (and, on a
+ * keyed build, leaves the `foundry-live` embed-key flag alone).
+ *
+ * A pairing failure throws before the flag write — a room whose
+ * tiles cannot be paired is not silently left unclickable. The flag
+ * write itself is one update call; on a keyed memo re-run it rewrites
+ * the same values (idempotent).
+ */
+export async function buildDressedTileRoom(
+  live: FoundryLive,
+  spec: RoomSpec,
+  pack: import("./tiles-layout.js").Pack,
+  serverBase: string,
+  theme?: string | ThemeSpec,
+): Promise<BuiltTileRoom & { dressingPairs: DressingPair[] }> {
+  const { plan, spec: dressed, layout } = layoutRoomWithDressing(
+    spec,
+    pack,
+    serverBase,
+    theme ? { theme } : {},
+  );
+  const built = await buildTileRoom(live, dressed, pack, serverBase, theme);
+  const { pairs, errors } = resolveDressingPairing(plan, layout, built.tileIds, built.lightIds);
+  if (errors.length > 0) {
+    throw new Error(`Dressing pairing failed for "${spec.name}": ${errors.join(" ")}`);
+  }
+  if (pairs.length > 0) {
+    await live.modifyDocument("Tile", "update", {
+      updates: pairs.map((p) => ({ _id: p.tileId, flags: { meroki: p.tileFlags } })),
+      parentUuid: `Scene.${built.sceneId}`,
+    });
+  }
+  return { ...built, dressingPairs: pairs };
+}
+
+/**
+ * The dressed rebuild (BRA-192 follow-up, monitor build path): the
+ * same shape as buildDressedTileRoom, but on the rebuild path — the
+ * dressed spec goes through rebuildTileRoom (which deletes the
+ * previous build's embeds and recreates from the new layout), then
+ * the pairing + flag write run exactly as in the build path. The
+ * dressing plan is deterministic per seed, so a rebuild re-plans the
+ * same items (plus any props the spec recorded since, e.g. a cutscene
+ * prop) — nothing duplicates, because the rebuild deletes the old
+ * tiles first.
+ *
+ * A pairing failure throws before the flag write, same as the build
+ * path — the room is left built-but-unclickable and the caller (the
+ * build executor) reports it as a chat line; there is no silent
+ * undressed fallback. A plain rebuildTileRoom call on a dressed room
+ * would silently drop every click flag, which is why the executor
+ * routes all rebuilds through here.
+ */
+export async function rebuildDressedTileRoom(
+  live: FoundryLive,
+  sceneId: string,
+  spec: RoomSpec,
+  pack: import("./tiles-layout.js").Pack,
+  serverBase: string,
+  previous: { tileIds: string[]; wallIds: string[]; lightIds: string[] },
+  theme?: string | ThemeSpec,
+): Promise<BuiltTileRoom & { dressingPairs: DressingPair[] }> {
+  const { plan, spec: dressed, layout } = layoutRoomWithDressing(
+    spec,
+    pack,
+    serverBase,
+    theme ? { theme } : {},
+  );
+  const built = await rebuildTileRoom(live, sceneId, dressed, pack, serverBase, previous, theme);
+  const { pairs, errors } = resolveDressingPairing(plan, layout, built.tileIds, built.lightIds);
+  if (errors.length > 0) {
+    throw new Error(`Dressing pairing failed for "${spec.name}": ${errors.join(" ")}`);
+  }
+  if (pairs.length > 0) {
+    await live.modifyDocument("Tile", "update", {
+      updates: pairs.map((p) => ({ _id: p.tileId, flags: { meroki: p.tileFlags } })),
+      parentUuid: `Scene.${built.sceneId}`,
+    });
+  }
+  return { ...built, dressingPairs: pairs };
 }
 
 /**

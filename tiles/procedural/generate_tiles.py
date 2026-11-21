@@ -940,34 +940,69 @@ def wall_wood_broken(seed=114):
 
 # ---------------------------------------------------------------- fog
 
-def fog_tile(seed=21, variant="pool", color=(110, 190, 130)):
-    """100x100 fog tile: a soft pool of eerie smoke on a transparent
-    background, so it can sit over any floor. `color` is the smoke
-    colour — green for the dungeon, tan dust for the western theme.
-    The pools are blurred blobs — nothing touches the tile edge, so
-    neighbours butt seamlessly."""
-    t = Image.new("RGBA", (100, 100), (0, 0, 0, 0))
+def _wavy_fog_line(d, rnd, size, y_base, amp, alpha, width, color):
+    """One drifting smoke line: a sine polyline spanning the tile,
+    so the wisp has visible curl instead of a straight band."""
+    pts = []
+    steps = 16
+    phase = rnd.random() * 1.2
+    for i in range(steps + 1):
+        x = size * 0.05 + i * (size * 0.9) / steps
+        y = (y_base + math.sin(i * 0.8 + phase) * amp
+             + rnd.randint(-2, 2))
+        pts.append((x, y))
+    d.line(pts, fill=color + (alpha,), width=width, joint="curve")
+
+
+def fog_tile(seed=21, variant="pool", color=(110, 190, 130), size=100):
+    """Fog tile drawn at its native `size` (100/200/400): a soft pool
+    of eerie smoke on a transparent background, so it can sit over any
+    floor. `color` is the smoke colour — green for the dungeon, tan
+    dust for the western theme. Drawn at native size, not upscaled:
+    the old build drew at 100px then 4x-upscaled, which blurred the
+    wisps to almost nothing at table scale while the pool read as one
+    flat glow. Alphas stay moderate so the floor stays readable
+    through it, and nothing touches the tile edge, so neighbours butt
+    seamlessly."""
+    t = Image.new("RGBA", (size, size), (0, 0, 0, 0))
     d = ImageDraw.Draw(t)
     rnd = random.Random(seed)
+    s = size / 100.0
+    m = size * 0.06  # keep clear of the edges
     if variant == "pool":
-        for _ in range(4):
-            cx, cy = rnd.randint(30, 70), rnd.randint(30, 70)
-            rx, ry = rnd.randint(14, 22), rnd.randint(10, 16)
+        # overlapping blobs of varied size/alpha so the pool reads as
+        # smoke with structure, not one flat glow; cores are smaller
+        # and off-centre so the middle stays readable through
+        for _ in range(6):
+            cx = rnd.randint(int(size * 0.30), int(size * 0.70))
+            cy = rnd.randint(int(size * 0.30), int(size * 0.70))
+            rx = rnd.randint(int(12 * s), int(24 * s))
+            ry = rnd.randint(int(9 * s), int(17 * s))
             d.ellipse([cx - rx, cy - ry, cx + rx, cy + ry],
-                      fill=color + (200,))
-        # a brighter core so the pool still reads at 100px under tokens
+                      fill=color + (rnd.randint(130, 170),))
         for _ in range(2):
-            cx, cy = rnd.randint(38, 62), rnd.randint(38, 62)
-            d.ellipse([cx - 10, cy - 7, cx + 10, cy + 7],
-                      fill=color + (230,))
+            cx = rnd.randint(int(size * 0.38), int(size * 0.62))
+            cy = rnd.randint(int(size * 0.38), int(size * 0.62))
+            d.ellipse([cx - int(9 * s), cy - int(6 * s),
+                       cx + int(9 * s), cy + int(6 * s)],
+                      fill=color + (190,))
+        # a couple of thin satellite wisps at the pool's edge
+        for _ in range(2):
+            y = rnd.randint(int(size * 0.2), int(size * 0.8))
+            d.line([(int(m), y), (int(size - m), y + rnd.randint(-8, 8))],
+                   fill=color + (110,), width=max(3, int(5 * s)))
     elif variant == "wisp":
-        for _ in range(3):
-            y = rnd.randint(28, 72)
-            d.line([20, y, 80, y + rnd.randint(-6, 6)],
-                   fill=color + (200,), width=10)
+        # faint broad body, then wavy drifting lines spanning the tile
+        d.ellipse([m, size * 0.30, size - m, size * 0.70],
+                  fill=color + (55,))
+        for k in range(4):
+            _wavy_fog_line(d, rnd, size, size * (0.32 + 0.12 * k),
+                       6 * s, rnd.randint(150, 185), max(4, int(9 * s)),
+                       color)
     else:  # "ring"
-        d.ellipse([26, 26, 74, 74], outline=color + (200,), width=12)
-    t = t.filter(ImageFilter.GaussianBlur(8))
+        d.ellipse([26 * s, 26 * s, 74 * s, 74 * s],
+                  outline=color + (200,), width=max(3, int(12 * s)))
+    t = t.filter(ImageFilter.GaussianBlur(max(4, int(size * 0.03))))
     return t
 
 
@@ -1088,6 +1123,79 @@ def sconce_tile(seed=34):
     glow = Image.new("RGBA", (100, 100), (0, 0, 0, 0))
     gd = ImageDraw.Draw(glow)
     gd.ellipse([14, 6, 86, 92], fill=(240, 170, 60, 85))
+    glow = glow.filter(ImageFilter.GaussianBlur(10))
+    t = Image.alpha_composite(glow, t)
+    return t
+
+
+def candle_tile(seed=42):
+    """A candle in a small brass holder: a wax stick, a pale flame and
+    a soft glow pool. A standalone prop sprite (100px, like the
+    sconce) — never baked into a floor tile. It sits on a table cell
+    (or a floor cell next to a wall), so the holder is drawn low in
+    the canvas with the flame rising above it."""
+    t = _prop_canvas()
+    d = ImageDraw.Draw(t)
+    # contact shadow + holder: a low brass dish with a stem
+    d.ellipse([30, 82, 70, 90], fill=(0, 0, 0, 70))
+    d.rectangle([38, 76, 62, 82], fill=_shade(GOLD, -20))
+    d.ellipse([36, 74, 64, 82], fill=GOLD, outline=_shade(GOLD, -50))
+    d.rectangle([46, 66, 54, 76], fill=_shade(GOLD, -30))
+    # wax stick: pale, slightly uneven, with a drip on one side
+    d.rectangle([45, 44, 55, 68], fill=(238, 228, 200), outline=(196, 182, 150))
+    d.rectangle([53, 52, 57, 68], fill=(222, 210, 178))
+    # wick + flame: a small pale teardrop, bright core, big enough to
+    # read at 100px — the candle's light is smaller and paler than a
+    # torch's, so the flame is narrower and the glow is softer
+    d.line([50, 40, 50, 46], fill=(30, 24, 18), width=2)
+    d.polygon([(50, 16), (57, 32), (54, 42), (46, 42), (43, 32)],
+              fill=(255, 196, 107))
+    d.polygon([(50, 24), (54, 34), (52, 40), (48, 40), (46, 34)],
+              fill=(255, 238, 180))
+    # glow pool: a small pale wash, blurred, centred on the flame
+    glow = Image.new("RGBA", (100, 100), (0, 0, 0, 0))
+    gd = ImageDraw.Draw(glow)
+    gd.ellipse([26, 8, 74, 76], fill=(255, 196, 107, 60))
+    glow = glow.filter(ImageFilter.GaussianBlur(8))
+    t = Image.alpha_composite(glow, t)
+    return t
+
+
+def brazier_tile(seed=43):
+    """A standing brazier: an iron bowl on a tripod, fire tongues
+    rising from it. A standalone prop sprite (100px, like the
+    sconce) — the bowl is drawn bold to fill the canvas, because the
+    dressing plan puts braziers in room corners where a 200px
+    footprint would not fit. Never baked into a floor tile."""
+    t = _prop_canvas()
+    d = ImageDraw.Draw(t)
+    # contact shadow + tripod legs
+    d.ellipse([24, 82, 76, 92], fill=(0, 0, 0, 80))
+    d.polygon([(38, 62), (46, 62), (34, 88), (28, 88)], fill=IRON)
+    d.polygon([(62, 62), (54, 62), (66, 88), (72, 88)], fill=IRON)
+    d.polygon([(48, 62), (52, 62), (50, 88), (46, 88)], fill=_shade(IRON, 20))
+    # bowl: a wide iron dish with a rim highlight and rivets
+    d.polygon([(22, 52), (78, 52), (70, 68), (30, 68)], fill=IRON)
+    d.ellipse([22, 46, 78, 58], fill=_shade(IRON, 26), outline=_shade(IRON, -20))
+    d.ellipse([30, 48, 70, 56], fill=(16, 12, 10))
+    for rx in (30, 40, 50, 60, 70):
+        d.ellipse([rx - 1, 59, rx + 1, 61], fill=_shade(IRON, 40))
+    # fire: three tongues over the coals — orange outside, yellow
+    # core — with ember dots, big enough to read at 100px
+    d.polygon([(50, 12), (60, 34), (56, 50), (44, 50), (40, 34)],
+              fill=(255, 140, 46))
+    d.polygon([(36, 26), (44, 42), (40, 50), (30, 50), (28, 40)],
+              fill=(240, 160, 60))
+    d.polygon([(64, 26), (72, 40), (70, 50), (60, 50), (56, 42)],
+              fill=(240, 160, 60))
+    d.polygon([(50, 24), (56, 38), (53, 48), (47, 48), (44, 38)],
+              fill=(255, 214, 110))
+    for (ex, ey) in [(40, 46), (60, 46), (50, 40)]:
+        d.ellipse([ex - 1, ey - 1, ex + 1, ey + 1], fill=(255, 120, 40))
+    # glow pool: a strong amber wash over the whole tile
+    glow = Image.new("RGBA", (100, 100), (0, 0, 0, 0))
+    gd = ImageDraw.Draw(glow)
+    gd.ellipse([8, 2, 92, 90], fill=(255, 140, 46, 80))
     glow = glow.filter(ImageFilter.GaussianBlur(10))
     t = Image.alpha_composite(glow, t)
     return t
@@ -1454,11 +1562,11 @@ PACK_SPECS = [
      "sizePx": 100, "layer": "floor", "kind": "base", "tags": ["wall", "carved"]},
     {"name": "wall-diagonal", "make": lambda: wall_diagonal(16),
      "sizePx": 100, "layer": "floor", "kind": "base", "tags": ["wall", "diagonal"]},
-    {"name": "fog-wisp-small", "make": lambda: fog_tile(22, "wisp"),
+    {"name": "fog-wisp-small", "make": lambda: fog_tile(22, "wisp", size=200),
      "sizePx": 200, "layer": "atmosphere", "kind": "base", "tags": ["fog", "atmosphere", "green"]},
-    {"name": "fog-wisp-large", "make": lambda: fog_tile(23, "wisp"),
+    {"name": "fog-wisp-large", "make": lambda: fog_tile(23, "wisp", size=400),
      "sizePx": 400, "layer": "atmosphere", "kind": "base", "tags": ["fog", "atmosphere", "green"]},
-    {"name": "fog-pool", "make": lambda: fog_tile(21, "pool"),
+    {"name": "fog-pool", "make": lambda: fog_tile(21, "pool", size=400),
      "sizePx": 400, "layer": "atmosphere", "kind": "base", "tags": ["fog", "atmosphere", "green", "dense"]},
     # --- western base (11) ---
     {"name": "floor-sand", "make": lambda: floor_tile("plain", 107, WESTERN_FLOOR_PAL, SAND_TEX),
@@ -1477,11 +1585,11 @@ PACK_SPECS = [
      "sizePx": 100, "layer": "floor", "kind": "base", "tags": ["wall", "wood", "door", "western"]},
     {"name": "wall-wood-broken", "make": lambda: wall_wood_broken(114),
      "sizePx": 100, "layer": "floor", "kind": "base", "tags": ["wall", "wood", "broken", "western"]},
-    {"name": "dust-wisp-small", "make": lambda: fog_tile(122, "wisp", DUST),
+    {"name": "dust-wisp-small", "make": lambda: fog_tile(122, "wisp", DUST, size=200),
      "sizePx": 200, "layer": "atmosphere", "kind": "base", "tags": ["dust", "atmosphere", "western"]},
-    {"name": "dust-wisp-large", "make": lambda: fog_tile(123, "wisp", DUST),
+    {"name": "dust-wisp-large", "make": lambda: fog_tile(123, "wisp", DUST, size=400),
      "sizePx": 400, "layer": "atmosphere", "kind": "base", "tags": ["dust", "atmosphere", "western"]},
-    {"name": "dust-pool", "make": lambda: fog_tile(121, "pool", DUST),
+    {"name": "dust-pool", "make": lambda: fog_tile(121, "pool", DUST, size=400),
      "sizePx": 400, "layer": "atmosphere", "kind": "base", "tags": ["dust", "atmosphere", "dense", "western"]},
     # --- wet base (4): same dry seed as the dry twin, so the swap
     # reads as the same floor, now under water ---
@@ -1504,6 +1612,10 @@ PACK_SPECS = [
      "sizePx": 200, "layer": "dressing", "kind": "prop", "tags": ["dressing", "pillar"]},
     {"name": "sconce", "make": lambda: sconce_tile(34),
      "sizePx": 100, "layer": "dressing", "kind": "prop", "tags": ["dressing", "torch", "sconce"]},
+    {"name": "candle", "make": lambda: candle_tile(42),
+     "sizePx": 100, "layer": "dressing", "kind": "prop", "tags": ["dressing", "candle", "light"]},
+    {"name": "brazier", "make": lambda: brazier_tile(43),
+     "sizePx": 100, "layer": "dressing", "kind": "prop", "tags": ["dressing", "brazier", "fire"]},
     {"name": "ritual-circle", "make": lambda: ritual_circle_tile(35),
      "sizePx": 200, "layer": "dressing", "kind": "prop", "tags": ["dressing", "ritual", "lich"]},
     {"name": "spear", "make": lambda: spear_tile(36),
@@ -1620,7 +1732,8 @@ def render_previews():
     _room(c, 0, 0, 6, lambda gx, gy: "floor-plain",
           "wall-straight", "wall-corner", "wall-door",
           [("dais-round", 2, 2), ("bones", 1, 1), ("chest", 3, 1),
-           ("skeleton", 1, 3), ("sconce", 2, 0), ("fog-wisp-small", 4, 3)],
+           ("skeleton", 1, 3), ("sconce", 2, 0), ("candle", 4, 1),
+           ("brazier", 4, 3), ("fog-wisp-small", 5, 4)],
           pack)
     _room(c, 600, 0, 6, lambda gx, gy: "floor-plain",
           "wall-straight", "wall-corner", "wall-door",

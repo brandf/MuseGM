@@ -404,6 +404,30 @@
       ]
     },
     {
+      "name": "candle",
+      "file": "pack/candle.png",
+      "sizePx": 100,
+      "layer": "dressing",
+      "kind": "prop",
+      "tags": [
+        "dressing",
+        "candle",
+        "light"
+      ]
+    },
+    {
+      "name": "brazier",
+      "file": "pack/brazier.png",
+      "sizePx": 100,
+      "layer": "dressing",
+      "kind": "prop",
+      "tags": [
+        "dressing",
+        "brazier",
+        "fire"
+      ]
+    },
+    {
       "name": "ritual-circle",
       "file": "pack/ritual-circle.png",
       "sizePx": 200,

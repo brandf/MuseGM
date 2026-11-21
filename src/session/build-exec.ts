@@ -25,8 +25,8 @@
  */
 import type { FoundryLive } from "../live.js";
 import {
-  buildTileRoom,
-  rebuildTileRoom,
+  buildDressedTileRoom,
+  rebuildDressedTileRoom,
   tileRoomBuildKey,
   type BuiltTileRoom,
 } from "../worldbuilding/tiles.js";
@@ -149,12 +149,17 @@ async function syncSession(
   for (const { room, previous } of plan.rebuild) {
     // Keyed by room id (BRA-202): a crash between the session commit
     // and the table sync re-issues the same op, and the rebuild
-    // converges instead of duplicating the room's tiles.
-    const rebuilt = await rebuildTileRoom(live, previous.sceneId, { ...room, buildKey: tileRoomBuildKey(room.id) }, pack, serverBase, previous);
+    // converges instead of duplicating the room's tiles. Dressed
+    // (BRA-192): every build and rebuild goes through the dressed
+    // variants, so the click flags survive edits — a plain rebuild
+    // would silently drop them. A pairing failure throws and the
+    // executor reports it as a chat line; there is no silent
+    // undressed fallback.
+    const rebuilt = await rebuildDressedTileRoom(live, previous.sceneId, { ...room, buildKey: tileRoomBuildKey(room.id) }, pack, serverBase, previous);
     built.set(room.id, rebuilt);
   }
   for (const room of plan.build) {
-    const created = await buildTileRoom(live, { ...room, buildKey: tileRoomBuildKey(room.id) }, pack, serverBase);
+    const created = await buildDressedTileRoom(live, { ...room, buildKey: tileRoomBuildKey(room.id) }, pack, serverBase);
     built.set(room.id, created);
   }
 }

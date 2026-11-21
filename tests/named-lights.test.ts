@@ -274,6 +274,32 @@ describe("lightCreateData — the name flag at build time", () => {
     const data = lightCreateData({ x: 0, y: 0, dim: 100, bright: 50, name: "  the braziers " });
     expect(data.flags).toEqual({ "foundry-live": { lightName: "the braziers" } });
   });
+
+  it("honours an explicit alpha instead of the 0.5 default (BRA-192)", () => {
+    const data = lightCreateData({ x: 0, y: 0, dim: 300, bright: 120, color: "#ff9a3c", alpha: 0.4 });
+    expect(data.config).toEqual({
+      dim: 300,
+      bright: 120,
+      angle: 360,
+      color: "#ff9a3c",
+      alpha: 0.4,
+    });
+  });
+
+  it("a dressing light's alpha rides through unchanged", () => {
+    const data = lightCreateData({
+      x: 0, y: 0, dim: 400, bright: 200, color: "#ff8c2e", alpha: 0.5,
+      name: "the braziers", dressingId: "brazier-nw",
+    });
+    expect((data.config as { alpha: number }).alpha).toBe(0.5);
+    expect(data.flags).toEqual({ "foundry-live": { lightName: "the braziers" } });
+  });
+
+  it("dressingId is a build-time marker only — never sent to Foundry", () => {
+    const data = lightCreateData({ x: 0, y: 0, dim: 100, bright: 50, dressingId: "torch-n-4" });
+    expect("dressingId" in data).toBe(false);
+    expect(JSON.stringify(data)).not.toContain("torch-n-4");
+  });
 });
 
 describe("room spec passthrough — layoutRoom", () => {

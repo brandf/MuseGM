@@ -23,11 +23,15 @@ import {
   extractTileRoomEmbeds,
   parseTileEmbedKey,
   planTileRoomConverge,
+  plannedLightOf,
+  plannedWallOf,
   sceneHasTileRoomKey,
   tileEmbedKey,
   tileRoomBuildKey,
   type KeyedEmbed,
+  type PlannedLight,
   type PlannedTile,
+  type PlannedWall,
   type TileRoomEmbeds,
 } from "../src/worldbuilding/tile-keys.js";
 import {
@@ -49,7 +53,7 @@ const prevEnv = {
 process.env.FOUNDRY_URL ??= "http://localhost:30000";
 process.env.FOUNDRY_USERNAME ??= "dummy";
 process.env.FOUNDRY_PASSWORD ??= "dummy";
-const { buildDungeon, buildTileRoom, rebuildTileRoom } = await import(
+const { buildDressedTileRoom, buildDungeon, buildTileRoom, rebuildDressedTileRoom, rebuildTileRoom } = await import(
   "../src/worldbuilding/tiles.js"
 );
 const { executeBuild } = await import("../src/session/build-exec.js");
@@ -119,6 +123,28 @@ describe("planTileRoomConverge", () => {
     id,
     ...t,
   });
+  // A planned wall: endpoints + door flag. Distinct segments so each
+  // slot is distinguishable by position alone.
+  const W = (x1: number, y1: number, x2: number, y2: number, door = 0): PlannedWall =>
+    plannedWallOf({ x1, y1, x2, y2, door });
+  const keyedWall = (i: number, w: PlannedWall, id: string): KeyedEmbed => ({
+    key: tileEmbedKey(KEY, "wall", i),
+    id,
+    ...w,
+  });
+  // A planned light: position + config + name.
+  const L = (
+    x: number,
+    y: number,
+    dim = 300,
+    bright = 120,
+    extra: Partial<PlannedLight> = {},
+  ): PlannedLight => plannedLightOf({ x, y, dim, bright, ...extra });
+  const keyedLight = (i: number, l: PlannedLight, id: string): KeyedEmbed => ({
+    key: tileEmbedKey(KEY, "light", i),
+    id,
+    ...l,
+  });
   const keyed = (kind: "wall" | "light", i: number, id: string): KeyedEmbed => ({
     key: tileEmbedKey(KEY, kind, i),
     id,
@@ -149,13 +175,13 @@ describe("planTileRoomConverge", () => {
       src: t.texture.src,
       rotation: t.rotation,
     })),
-    walls: layout.walls.length,
-    lights: layout.lights.length,
+    walls: layout.walls.map((w) => plannedWallOf(w)),
+    lights: layout.lights.map((l) => plannedLightOf(l)),
   });
 
   it("creates everything when the scene is empty", () => {
     const plan = planTileRoomConverge(
-      { tiles: [T(0, 0), T(100, 0), T(200, 0)], walls: 2, lights: 1 },
+      { tiles: [T(0, 0), T(100, 0), T(200, 0)], walls: [W(0, 0, 100, 0), W(100, 0, 200, 0)], lights: [L(50, 50)] },
       present([], [], []),
       KEY,
     );
@@ -168,12 +194,14 @@ describe("planTileRoomConverge", () => {
 
   it("creates nothing when everything is already in place", () => {
     const tiles = [T(0, 0), T(100, 0), T(200, 0)];
+    const walls = [W(0, 0, 100, 0), W(100, 0, 200, 0)];
+    const lights = [L(50, 50)];
     const plan = planTileRoomConverge(
-      { tiles, walls: 2, lights: 1 },
+      { tiles, walls, lights },
       present(
         tiles.map((t, i) => keyedTile(i, t, `t${i}`)),
-        [keyed("wall", 0, "w0"), keyed("wall", 1, "w1")],
-        [keyed("light", 0, "l0")],
+        walls.map((w, i) => keyedWall(i, w, `w${i}`)),
+        lights.map((l, i) => keyedLight(i, l, `l${i}`)),
       ),
       KEY,
     );
@@ -189,8 +217,8 @@ describe("planTileRoomConverge", () => {
   it("creates only the missing tiles and keeps the rest in order", () => {
     const tiles = [T(0, 0), T(100, 0), T(200, 0)];
     const plan = planTileRoomConverge(
-      { tiles, walls: 2, lights: 1 },
-      present([keyedTile(0, tiles[0], "t0"), keyedTile(2, tiles[2], "t2")], [], [keyed("light", 0, "l0")]),
+      { tiles, walls: [W(0, 0, 100, 0), W(100, 0, 200, 0)], lights: [L(50, 50)] },
+      present([keyedTile(0, tiles[0], "t0"), keyedTile(2, tiles[2], "t2")], [], [keyedLight(0, L(50, 50), "l0")]),
       KEY,
     );
     expect(plan.createTiles).toEqual([1]);
@@ -201,22 +229,23 @@ describe("planTileRoomConverge", () => {
 
   it("deletes surplus keyed tiles when the spec shrank", () => {
     const plan = planTileRoomConverge(
-      { tiles: [T(0, 0)], walls: 1, lights: 0 },
+      { tiles: [T(0, 0)], walls: [W(0, 0, 100, 0)], lights: [] },
       present(
         [keyedTile(0, T(0, 0), "t0"), keyedTile(1, T(100, 0), "t1"), keyedTile(5, T(500, 0), "t5")],
-        [keyed("wall", 0, "w0")],
-        [keyed("light", 0, "l0"), keyed("light", 1, "l1")],
+        [keyedWall(0, W(0, 0, 100, 0), "w0")],
+        [keyedLight(0, L(50, 50), "l0"), keyedLight(1, L(150, 50), "l1")],
       ),
       KEY,
     );
     expect(plan.deleteTileIds).toEqual(["t1", "t5"]);
     expect(plan.deleteLightIds).toEqual(["l0", "l1"]);
     expect(plan.keepTileIds).toEqual(["t0"]);
+    expect(plan.keepWallIds).toEqual(["w0"]);
   });
 
   it("never touches another build's embeds or unkeyed ones", () => {
     const plan = planTileRoomConverge(
-      { tiles: [T(0, 0), T(100, 0), T(200, 0)], walls: 2, lights: 1 },
+      { tiles: [T(0, 0), T(100, 0), T(200, 0)], walls: [W(0, 0, 100, 0), W(100, 0, 200, 0)], lights: [L(50, 50)] },
       present(
         [
           // Same position as the first planned tile, but another
@@ -233,12 +262,14 @@ describe("planTileRoomConverge", () => {
     expect(plan.deleteTileIds).toEqual(["ours-t9"]);
     expect(plan.createTiles).toEqual([0, 1, 2]);
     expect(plan.keepTileIds).toEqual([null, null, null]);
+    expect(plan.deleteWallIds).toEqual([]);
+    expect(plan.createWalls).toEqual([0, 1]);
   });
 
   it("keeps the first of two identical-position tiles and deletes the second", () => {
     const tiles = [T(0, 0), T(100, 0), T(200, 0)];
     const plan = planTileRoomConverge(
-      { tiles, walls: 2, lights: 1 },
+      { tiles, walls: [W(0, 0, 100, 0), W(100, 0, 200, 0)], lights: [L(50, 50)] },
       present([keyedTile(0, tiles[0], "t0-a"), keyedTile(0, tiles[0], "t0-b")], [], []),
       KEY,
     );
@@ -298,6 +329,155 @@ describe("planTileRoomConverge", () => {
     expect(plan.keepTileIds[floorW]).toBeNull();
     expect(plan.createTiles).toContain(floorW);
   });
+
+  // --- walls + lights by position + look (BRA-243) ----------------
+
+  it("a wall keeps its embed when the layout order shifts (index would delete + recreate)", () => {
+    // The widen/shift bug for walls: two walls swap layout positions
+    // (their key indices now point at the other's slot). Index
+    // matching would delete both and recreate them; position + look
+    // matching keeps each wall where it stands.
+    const walls = [W(0, 0, 300, 0), W(0, 0, 0, 300)];
+    const plan = planTileRoomConverge(
+      { tiles: [], walls, lights: [] },
+      present(
+        [],
+        [keyedWall(1, walls[0], "w-a"), keyedWall(0, walls[1], "w-b")],
+        [],
+      ),
+      KEY,
+    );
+    expect(plan.createWalls).toEqual([]);
+    expect(plan.deleteWallIds).toEqual([]);
+    expect(plan.keepWallIds).toEqual(["w-a", "w-b"]);
+  });
+
+  it("a wall that gained a door is deleted + recreated, not kept as a plain wall", () => {
+    const plan = planTileRoomConverge(
+      { tiles: [], walls: [W(0, 0, 300, 0, 1)], lights: [] },
+      present([], [keyedWall(0, W(0, 0, 300, 0, 0), "w0")], []),
+      KEY,
+    );
+    expect(plan.keepWallIds).toEqual([null]);
+    expect(plan.createWalls).toEqual([0]);
+    expect(plan.deleteWallIds).toEqual(["w0"]);
+  });
+
+  it("a wall that moved is deleted + recreated at its new position", () => {
+    const plan = planTileRoomConverge(
+      { tiles: [], walls: [W(0, 100, 300, 100)], lights: [] },
+      present([], [keyedWall(0, W(0, 0, 300, 0), "w0")], []),
+      KEY,
+    );
+    expect(plan.keepWallIds).toEqual([null]);
+    expect(plan.createWalls).toEqual([0]);
+    expect(plan.deleteWallIds).toEqual(["w0"]);
+  });
+
+  it("a re-skin recreates the light whose color changed and keeps the rest", () => {
+    const plan = planTileRoomConverge(
+      { tiles: [], walls: [], lights: [L(150, 150, 300, 120, { color: "#ffb347" }), L(450, 150)] },
+      present(
+        [],
+        [],
+        [keyedLight(0, L(150, 150, 300, 120, { color: "#ff9a3c" }), "l0"), keyedLight(1, L(450, 150), "l1")],
+      ),
+      KEY,
+    );
+    expect(plan.keepLightIds).toEqual([null, "l1"]);
+    expect(plan.createLights).toEqual([0]);
+    expect(plan.deleteLightIds).toEqual(["l0"]);
+  });
+
+  it("two lights at one cell are told apart by name, even when indices swap", () => {
+    const lights = [
+      L(150, 150, 300, 120, { name: "the torches" }),
+      L(150, 150, 300, 120, { name: "the altar candles" }),
+    ];
+    const plan = planTileRoomConverge(
+      { tiles: [], walls: [], lights },
+      present(
+        [],
+        [],
+        [keyedLight(1, lights[0], "l-torches"), keyedLight(0, lights[1], "l-candles")],
+      ),
+      KEY,
+    );
+    expect(plan.createLights).toEqual([]);
+    expect(plan.deleteLightIds).toEqual([]);
+    expect(plan.keepLightIds).toEqual(["l-torches", "l-candles"]);
+  });
+
+  it("an unnamed light does not match a named one at the same cell", () => {
+    const plan = planTileRoomConverge(
+      { tiles: [], walls: [], lights: [L(150, 150)] },
+      present([], [], [keyedLight(0, L(150, 150, 300, 120, { name: "the torches" }), "l0")]),
+      KEY,
+    );
+    expect(plan.keepLightIds).toEqual([null]);
+    expect(plan.createLights).toEqual([0]);
+    expect(plan.deleteLightIds).toEqual(["l0"]);
+  });
+
+  it("among field-matching duplicates the key-indexed embed wins, the other is surplus", () => {
+    // A crashed partial build left the same wall twice: the embed
+    // whose key index is this planned index is the canonical one.
+    const walls = [W(0, 0, 300, 0)];
+    const plan = planTileRoomConverge(
+      { tiles: [], walls, lights: [] },
+      present(
+        [],
+        [keyedWall(7, walls[0], "w-dupe"), keyedWall(0, walls[0], "w-canonical")],
+        [],
+      ),
+      KEY,
+    );
+    expect(plan.keepWallIds).toEqual(["w-canonical"]);
+    expect(plan.deleteWallIds).toEqual(["w-dupe"]);
+    expect(plan.createWalls).toEqual([]);
+  });
+
+  it("a tie between two identical planned lights is an error, not a silent duplicate", () => {
+    expect(() =>
+      planTileRoomConverge(
+        { tiles: [], walls: [], lights: [L(150, 150), L(150, 150)] },
+        present([], [], [keyedLight(0, L(150, 150), "l0")]),
+        KEY,
+      ),
+    ).toThrow(/Converge tie: planned light 1 .*l0/);
+  });
+
+  it("a tie between two identical planned walls is an error listing the candidates", () => {
+    expect(() =>
+      planTileRoomConverge(
+        { tiles: [], walls: [W(0, 0, 300, 0), W(0, 0, 300, 0)], lights: [] },
+        present([], [keyedWall(0, W(0, 0, 300, 0), "w0")], []),
+        KEY,
+      ),
+    ).toThrow(/Converge tie: planned wall 1 .*w0/);
+  });
+
+  it("a wall with no readable endpoints matches nothing and is surplus", () => {
+    const plan = planTileRoomConverge(
+      { tiles: [], walls: [W(0, 0, 300, 0)], lights: [] },
+      present([], [{ key: tileEmbedKey(KEY, "wall", 0), id: "w-ghost" }], []),
+      KEY,
+    );
+    expect(plan.keepWallIds).toEqual([null]);
+    expect(plan.createWalls).toEqual([0]);
+    expect(plan.deleteWallIds).toEqual(["w-ghost"]);
+  });
+
+  it("plannedWallOf orders endpoints canonically, plannedLightOf applies the Foundry defaults", () => {
+    expect(plannedWallOf({ x1: 300, y1: 0, x2: 0, y2: 0 })).toEqual({ x1: 0, y1: 0, x2: 300, y2: 0, door: 0 });
+    expect(plannedWallOf({ x1: 0, y1: 300, x2: 0, y2: 0, door: 2 })).toEqual({ x1: 0, y1: 0, x2: 0, y2: 300, door: 2 });
+    expect(plannedLightOf({ x: 150, y: 150, dim: 300, bright: 120 })).toEqual({
+      x: 150, y: 150, dim: 300, bright: 120, angle: 360, color: "#ff9a3c", alpha: 0.5,
+    });
+    expect(plannedLightOf({ x: 150, y: 150, dim: 300, bright: 120, name: "  " })).toEqual({
+      x: 150, y: 150, dim: 300, bright: 120, angle: 360, color: "#ff9a3c", alpha: 0.5,
+    });
+  });
 });
 
 describe("extractTileRoomEmbeds / sceneHasTileRoomKey", () => {
@@ -322,6 +502,51 @@ describe("extractTileRoomEmbeds / sceneHasTileRoomKey", () => {
     expect(got.initialLevel).toBe("lvl-1");
     expect(sceneHasTileRoomKey(scene, KEY)).toBe(true);
     expect(sceneHasTileRoomKey(scene, "tile-room:other")).toBe(false);
+  });
+
+  it("reads wall endpoints + door and light config + name from raw docs (BRA-243)", () => {
+    const scene = {
+      _id: "scene-1",
+      flags: { "foundry-live": { buildKey: KEY } },
+      tiles: [],
+      walls: [
+        // Reversed endpoints + an opened door (ds: 1): the embed is
+        // the canonical segment with its door flag — ds is state,
+        // not look, and is never extracted.
+        { _id: "w0", c: [300, 0, 0, 0], door: 1, ds: 1, flags: { "foundry-live": { tileRoomKey: `${KEY}:wall:0` } } },
+        // Malformed c: no fields at all — matches nothing.
+        { _id: "w1", c: [0, 0, 100], door: 0, flags: { "foundry-live": { tileRoomKey: `${KEY}:wall:1` } } },
+      ],
+      lights: [
+        {
+          _id: "l0",
+          x: 150,
+          y: 150,
+          config: { dim: 300, bright: 120, angle: 360, color: "#ff9a3c", alpha: 0.4 },
+          hidden: false,
+          flags: { "foundry-live": { tileRoomKey: `${KEY}:light:0`, lightName: "the torches" } },
+        },
+        // Partial config: only the fields present are attached.
+        {
+          _id: "l1",
+          x: 450,
+          y: 150,
+          config: { dim: 300, bright: 120 },
+          flags: { "foundry-live": { tileRoomKey: `${KEY}:light:1` } },
+        },
+      ],
+      levels: [],
+      initialLevel: null,
+    };
+    const got = extractTileRoomEmbeds(scene);
+    expect(got.walls).toEqual([
+      { key: `${KEY}:wall:0`, id: "w0", x1: 0, y1: 0, x2: 300, y2: 0, door: 1 },
+      { key: `${KEY}:wall:1`, id: "w1", door: 0 },
+    ]);
+    expect(got.lights).toEqual([
+      { key: `${KEY}:light:0`, id: "l0", x: 150, y: 150, dim: 300, bright: 120, angle: 360, color: "#ff9a3c", alpha: 0.4, name: "the torches" },
+      { key: `${KEY}:light:1`, id: "l1", x: 450, y: 150, dim: 300, bright: 120 },
+    ]);
   });
 
   it("tolerates missing arrays, missing flags, and non-objects", () => {
@@ -558,6 +783,27 @@ class FakeLive {
       else scene.lights = kept;
       return removed;
     }
+    if (type === "Tile" && action === "update") {
+      // Flag writes merge per scope, like the Scene update above
+      // (and like Foundry): writing flags.meroki completes the flag
+      // record without clobbering the foundry-live embed key.
+      const scene = this.sceneOf(opts.parentUuid ?? "");
+      const updated: FakeDoc[] = [];
+      for (const u of opts.updates ?? []) {
+        const tile = scene.tiles.find((t) => t._id === String(u._id));
+        if (!tile) continue;
+        const flags = u.flags as Record<string, Record<string, unknown>> | undefined;
+        if (flags) {
+          const current = (tile.flags as Record<string, Record<string, unknown>> | undefined) ?? {};
+          for (const [scope, values] of Object.entries(flags)) {
+            current[scope] = { ...(current[scope] ?? {}), ...values };
+          }
+          tile.flags = current;
+        }
+        updated.push(tile);
+      }
+      return updated;
+    }
     throw new Error(`FakeLive: unsupported ${type}:${action}`);
   }
 }
@@ -702,6 +948,164 @@ describe("buildTileRoom — keyed (fake live)", () => {
   });
 });
 
+describe("buildDressedTileRoom — the FR-16 live half (fake live)", () => {
+  // A clean 8x8 room: the hook plans 14 items (8 torches + 4 braziers
+  // + 2 candles), same as tests/dressing-hook.test.ts.
+  const dressedSpec: RoomSpec = { name: "Dressed Room", gridW: 8, gridH: 8, seed: 1 };
+
+  /** The meroki flag record a tile carries, or null. */
+  function merokiFlags(t: FakeDoc): Record<string, unknown> | null {
+    const flags = t.flags as Record<string, Record<string, unknown>> | undefined;
+    const scope = flags?.["meroki"];
+    return typeof scope === "object" && scope !== null ? (scope as Record<string, unknown>) : null;
+  }
+
+  it("builds the room dressed: 14 pairs, every dressing tile carrying the full click flag", async () => {
+    const live = new FakeLive();
+    const built = await buildDressedTileRoom(asLive(live), dressedSpec, pack, BASE);
+    expect(built.dressingPairs).toHaveLength(14);
+    const scene = sceneDoc(live, built.sceneId);
+    expect(scene.lights).toHaveLength(14);
+    const flagged = scene.tiles.filter((t) => merokiFlags(t) !== null);
+    expect(flagged).toHaveLength(14);
+    for (const pair of built.dressingPairs) {
+      const tile = scene.tiles.find((t) => t._id === pair.tileId);
+      expect(tile).toBeDefined();
+      expect(merokiFlags(tile!)).toEqual({
+        dressingId: pair.itemId,
+        lightId: pair.lightId,
+        kind: pair.tileFlags.kind,
+        alpha: pair.tileFlags.alpha,
+      });
+      // The pair's light id is a real created light.
+      expect(scene.lights.some((l) => l._id === pair.lightId)).toBe(true);
+    }
+    // The flag write happened as exactly one Tile update.
+    expect(live.calls.filter((c) => c === "Tile:update")).toHaveLength(1);
+  });
+
+  it("keyed build: the tile keeps its embed-key flag AND the meroki record (merge, not clobber)", async () => {
+    const live = new FakeLive();
+    const built = await buildDressedTileRoom(
+      asLive(live),
+      { ...dressedSpec, buildKey: KEY },
+      pack,
+      BASE,
+    );
+    expect(built.dressingPairs).toHaveLength(14);
+    const scene = sceneDoc(live, built.sceneId);
+    for (const pair of built.dressingPairs) {
+      const tile = scene.tiles.find((t) => t._id === pair.tileId)!;
+      const flags = tile.flags as Record<string, Record<string, unknown>>;
+      expect(typeof flags["foundry-live"]?.tileRoomKey).toBe("string");
+      expect(merokiFlags(tile)).toEqual({
+        dressingId: pair.itemId,
+        lightId: pair.lightId,
+        kind: pair.tileFlags.kind,
+        alpha: pair.tileFlags.alpha,
+      });
+    }
+  });
+
+  it("keyed re-run: same scene, same ids, no duplicate tiles, flags still complete", async () => {
+    const live = new FakeLive();
+    const spec = { ...dressedSpec, buildKey: KEY };
+    const first = await buildDressedTileRoom(asLive(live), spec, pack, BASE);
+    const tileCount = sceneDoc(live, first.sceneId).tiles.length;
+    const second = await buildDressedTileRoom(asLive(live), spec, pack, BASE);
+    expect(second.sceneId).toBe(first.sceneId);
+    expect(second.tileIds).toEqual(first.tileIds);
+    expect(second.dressingPairs).toHaveLength(14);
+    const scene = sceneDoc(live, first.sceneId);
+    expect(scene.tiles).toHaveLength(tileCount);
+    expect(scene.tiles.filter((t) => merokiFlags(t) !== null)).toHaveLength(14);
+  });
+});
+
+describe("rebuildDressedTileRoom — the dressed rebuild (fake live)", () => {
+  const dressedSpec: RoomSpec = { name: "Dressed Room", gridW: 8, gridH: 8, seed: 1 };
+
+  /** The meroki flag record a tile carries, or null. */
+  function merokiFlags(t: FakeDoc): Record<string, unknown> | null {
+    const flags = t.flags as Record<string, Record<string, unknown>> | undefined;
+    const scope = flags?.["meroki"];
+    return typeof scope === "object" && scope !== null ? (scope as Record<string, unknown>) : null;
+  }
+
+  /** Every pair's tile carries the full flag and its light is real. */
+  function expectPairsComplete(
+    live: FakeLive,
+    sceneId: string,
+    pairs: { tileId: string; lightId: string; itemId: string; tileFlags: { kind: string; alpha: number } }[],
+  ): void {
+    const scene = sceneDoc(live, sceneId);
+    expect(pairs.length).toBeGreaterThan(0);
+    for (const pair of pairs) {
+      const tile = scene.tiles.find((t) => t._id === pair.tileId);
+      expect(tile).toBeDefined();
+      expect(merokiFlags(tile!)).toEqual({
+        dressingId: pair.itemId,
+        lightId: pair.lightId,
+        kind: pair.tileFlags.kind,
+        alpha: pair.tileFlags.alpha,
+      });
+      expect(scene.lights.some((l) => l._id === pair.lightId)).toBe(true);
+    }
+    expect(scene.tiles.filter((t) => merokiFlags(t) !== null)).toHaveLength(pairs.length);
+  }
+
+  it("rebuild keeps the room dressed: pairs re-paired, flags on the new tiles", async () => {
+    const live = new FakeLive();
+    const first = await buildDressedTileRoom(asLive(live), dressedSpec, pack, BASE);
+    expect(first.dressingPairs).toHaveLength(14);
+    const rebuilt = await rebuildDressedTileRoom(
+      asLive(live),
+      first.sceneId,
+      dressedSpec,
+      pack,
+      BASE,
+      first,
+    );
+    expect(rebuilt.sceneId).toBe(first.sceneId);
+    // The rebuild deletes + recreates, so the tile ids change — but
+    // the room is dressed again, same plan, flags complete.
+    expect(rebuilt.tileIds).not.toEqual(first.tileIds);
+    expect(rebuilt.dressingPairs).toHaveLength(14);
+    expectPairsComplete(live, rebuilt.sceneId, rebuilt.dressingPairs);
+  });
+
+  it("widen rebuild re-plans the dressing and pairs it", async () => {
+    const live = new FakeLive();
+    const first = await buildDressedTileRoom(asLive(live), dressedSpec, pack, BASE);
+    const rebuilt = await rebuildDressedTileRoom(
+      asLive(live),
+      first.sceneId,
+      { ...dressedSpec, gridW: 10 },
+      pack,
+      BASE,
+      first,
+    );
+    expect(rebuilt.sceneId).toBe(first.sceneId);
+    // A wider room plans more wall torches — the count moves, the
+    // pairing must still be complete.
+    expect(rebuilt.dressingPairs.length).toBeGreaterThanOrEqual(14);
+    expectPairsComplete(live, rebuilt.sceneId, rebuilt.dressingPairs);
+  });
+
+  it("keyed dressed rebuild + later dressed build re-run converges", async () => {
+    const live = new FakeLive();
+    const spec = { ...dressedSpec, buildKey: KEY };
+    const first = await buildDressedTileRoom(asLive(live), spec, pack, BASE);
+    const rebuilt = await rebuildDressedTileRoom(asLive(live), first.sceneId, spec, pack, BASE, first);
+    expect(rebuilt.sceneId).toBe(first.sceneId);
+    const again = await buildDressedTileRoom(asLive(live), spec, pack, BASE);
+    expect(again.sceneId).toBe(first.sceneId);
+    expect(again.tileIds).toEqual(rebuilt.tileIds);
+    expect(again.dressingPairs).toHaveLength(rebuilt.dressingPairs.length);
+    expectPairsComplete(live, again.sceneId, again.dressingPairs);
+  });
+});
+
 describe("rebuildTileRoom — keyed (fake live)", () => {
   it("rebuild under the same key replaces embeds and a later build re-run converges", async () => {
     const live = new FakeLive();
@@ -804,6 +1208,19 @@ describe("build-exec — crash retry through executeBuild (fake live)", () => {
     expect(server.scenes).toHaveLength(1);
     const roomId = session1.current().dungeon.rooms[0].id;
     const sceneId = (built1.get(roomId) as { sceneId: string }).sceneId;
+    // The executor builds dressed (BRA-192 follow-up): the room's
+    // dressing tiles carry the full click flag and their lights are real.
+    const scene1 = sceneDoc(live, sceneId);
+    const flagged = scene1.tiles.filter((t) => {
+      const flags = t.flags as Record<string, Record<string, unknown>> | undefined;
+      return typeof flags?.["meroki"] === "object" && flags["meroki"] !== null;
+    });
+    expect(flagged.length).toBeGreaterThan(0);
+    for (const tile of flagged) {
+      const meroki = (tile.flags as Record<string, Record<string, unknown>>)["meroki"];
+      expect(typeof meroki.dressingId).toBe("string");
+      expect(scene1.lights.some((l) => l._id === meroki.lightId)).toBe(true);
+    }
     // Crash: the process restarts with a fresh session and an empty
     // built map, but the world persists. The GM re-issues the build.
     const session2 = new BuildSession();

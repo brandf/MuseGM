@@ -21,9 +21,9 @@
  *   request at all). Only the intents the composer already supports:
  *   room create, widen, door add/move (incl. secret doors), door
  *   verbs (open/close/lock/unlock/listen — BRA-234, the state lives
- *   on the door object in the spec), dressing add, fog add, regional
- *   overlay, corridor. Anything else is "unsupported", never a
- *   hallucinated build. `parseBuildRequests`
+ *   on the door object in the spec), dressing add, prop move/remove
+ *   (BRA-241), fog add, regional overlay, corridor. Anything else is
+ *   "unsupported", never a hallucinated build. `parseBuildRequests`
  *   is the compound form: "add a door here and widen the room" is
  *   two ops, applied in order, one confirmation line each.
  * - `applyOp` / `BuildSession` — the edit history. Layout ops are
@@ -52,6 +52,8 @@ import {
   applyOverlay,
   doorEntryCell,
   layoutRoom,
+  moveProp,
+  removeProp,
   widenRoom,
   TILE_PX,
   type DoorSpec,
@@ -84,6 +86,8 @@ export type BuildOp =
   | { type: "add-door"; wall: WallSide; at: number; secret?: boolean; target?: string }
   | { type: "move-door"; wall: WallSide; fromAt: number; toAt: number; target?: string }
   | { type: "add-dressing"; tile: string; where: DressingWhere; target?: string }
+  | { type: "move-prop"; tile: string; from: { gx: number; gy: number }; to: DressingWhere; target?: string }
+  | { type: "remove-prop"; tile: string; from: { gx: number; gy: number }; target?: string }
   | { type: "add-torches"; target?: string }
   | { type: "add-fog"; target?: string }
   | { type: "overlay"; region: OverlayRegion; variants: Record<string, string>; target?: string }
@@ -402,6 +406,288 @@ export function resolveDoor(
   };
 }
 
+// ---------------------------------------------------------------- props (BRA-241)
+
+/** The words that name a prop kind in chat, to the dressing tile
+ *  they mean — the same set the dressing branch adds. A word the
+ *  room actually holds as a dressing tile (a bookshelf, a treasure
+ *  pile) resolves too, even when it isn't in this map. */
+const PROP_TILE_WORDS: Record<string, string> = {
+  bones: "bones",
+  bone: "bones",
+  rubble: "rubble",
+  pillar: "pillar",
+  "ritual circle": "ritual-circle",
+  altar: "altar",
+  skeleton: "skeleton",
+  chest: "chest",
+};
+
+/** Corner words to the corner they mean — shared by the dressing
+ *  placement and the prop destination / disambiguator. */
+const CORNER_WORDS: Record<string, "nw" | "ne" | "sw" | "se"> = {
+  northwest: "nw", nw: "nw", northeast: "ne", ne: "ne",
+  southwest: "sw", sw: "sw", southeast: "se", se: "se",
+};
+
+/** A torch is light + sconce tile together — moving or removing one
+ *  sconce would leave its light behind, so a torch is never a prop
+ *  move/remove. */
+function isTorchWord(w: string): boolean {
+  return w === "torch" || w === "torches" || w === "sconce";
+}
+
+/** The room's props in chat words — "some bones at (0, 4), a chest
+ *  at (6, 4)" — or "nothing placed yet". */
+export function describeRoomProps(room: RoomSpec): string {
+  const props = room.dressing ?? [];
+  if (props.length === 0) return "nothing placed yet";
+  return props
+    .map((p) => `${p.tile === "bones" ? "some bones" : `a ${p.tile}`} at (${p.gx}, ${p.gy})`)
+    .join(", ");
+}
+
+/** Where a prop sits, in the creator's words — a corner, the middle,
+ *  or its cell. The size comes from the pack when given, else the
+ *  2x2 prop default. */
+export function describePropPlace(
+  tile: string,
+  gx: number,
+  gy: number,
+  room: RoomSpec,
+  pack?: Pack,
+): string {
+  const size = tileCells(tile, pack);
+  if (gx === 0 && gy === 0) return "the northwest corner";
+  if (gx === room.gridW - size && gy === 0) return "the northeast corner";
+  if (gx === 0 && gy === room.gridH - size) return "the southwest corner";
+  if (gx === room.gridW - size && gy === room.gridH - size) return "the southeast corner";
+  if (
+    gx === Math.floor((room.gridW - size) / 2) &&
+    gy === Math.floor((room.gridH - size) / 2)
+  ) {
+    return "the middle";
+  }
+  return `(${gx}, ${gy})`;
+}
+
+/** The cell a named corner means for a prop of the tile's size. */
+function cornerCell(
+  corner: string,
+  tile: string,
+  room: RoomSpec,
+): { gx: number; gy: number } {
+  const size = tileCells(tile);
+  const key = CORNER_WORDS[corner.toLowerCase()] ?? "se";
+  return {
+    gx: key === "nw" || key === "sw" ? 0 : room.gridW - size,
+    gy: key === "nw" || key === "ne" ? 0 : room.gridH - size,
+  };
+}
+
+/**
+ * The prop a line starts naming, after the verb ("move the chest…",
+ * "remove the bones…", "take the bones away"): the dressing tile +
+ * the rest of the line. A torch is a { torch: true } answer, never a
+ * tile — torches are light + sconce together. A word the room holds
+ * as a dressing tile resolves even when it isn't a known kind word
+ * ("move the bookshelf"). Returns null when the line names no prop.
+ */
+export function propTileAtStart(
+  text: string,
+  room?: RoomSpec,
+): { tile: string; after: string } | { torch: true; after: string } | null {
+  const s = text.trim().replace(/^(?:the\s+)?/i, "");
+  const lower = s.toLowerCase();
+  if (lower.startsWith("ritual circle")) {
+    return { tile: "ritual-circle", after: s.slice("ritual circle".length).trim() };
+  }
+  const m = /^([A-Za-z]+)\b(.*)$/s.exec(s);
+  if (!m) return null;
+  const word = m[1].toLowerCase();
+  const after = m[2].trim();
+  if (PROP_TILE_WORDS[word]) return { tile: PROP_TILE_WORDS[word], after };
+  if (isTorchWord(word)) return { torch: true, after };
+  if (room && (room.dressing ?? []).some((p) => p.tile === word)) {
+    return { tile: word, after };
+  }
+  return null;
+}
+
+function pluralProp(tile: string): string {
+  if (tile === "bones") return "piles of bones";
+  if (tile === "rubble") return "piles of rubble";
+  return `${tile}s`;
+}
+
+/** Which prop a move/remove line addresses, or a question. Never
+ *  guesses: no such prop says what the room holds; several of a kind
+ *  with no disambiguator list the cells. A disambiguator is an
+ *  explicit cell ("the bones at 2, 3"), a place in the line ("in the
+ *  northwest corner", "near the door", "in the middle"), or a
+ *  proximity anchor — the destination cell when the line has one,
+ *  the GM's ping otherwise — in which case the nearest one wins and
+ *  the confirmation line says which cell it came from. */
+export type PropTarget =
+  | { prop: Placement }
+  | { clarify: string };
+
+export function resolveProp(
+  tile: string,
+  qualifierText: string,
+  room: RoomSpec,
+  anchor?: { gx: number; gy: number },
+): PropTarget {
+  const candidates = (room.dressing ?? []).filter((p) => p.tile === tile);
+  const propName = tile === "bones" ? "the bones" : `the ${tile}`;
+  const listCandidates = () =>
+    candidates.map((p) => `${propName} at (${p.gx}, ${p.gy})`).join(", ");
+  if (candidates.length === 0) {
+    return {
+      clarify: `There's no ${tile === "bones" ? "bones" : tile} in this room — the room has: ${describeRoomProps(room)}.`,
+    };
+  }
+  if (candidates.length === 1) return { prop: candidates[0] };
+  // Explicit cell: "the bones at 2, 3" / "at cell 2, 3".
+  const cellM = /\bat\s+(?:cell\s+)?\(?(\d+)\s*,\s*(\d+)\)?/i.exec(qualifierText);
+  if (cellM) {
+    const gx = Number(cellM[1]);
+    const gy = Number(cellM[2]);
+    const hit = candidates.find((p) => p.gx === gx && p.gy === gy);
+    if (hit) return { prop: hit };
+    return {
+      clarify: `There's no ${propName} at (${gx}, ${gy}) — the room has ${listCandidates()}.`,
+    };
+  }
+  // A place in the line becomes the anchor: a corner, the middle, or
+  // the door's entry cell.
+  let effAnchor = anchor;
+  const cornerM =
+    /\bin\s+the\s+(northwest|northeast|southwest|southeast|nw|ne|sw|se)\s+corner\b/i.exec(
+      qualifierText,
+    );
+  if (cornerM) {
+    effAnchor = cornerCell(cornerM[1], tile, room);
+  } else if (/\bin\s+the\s+(middle|center|centre)\b/i.test(qualifierText)) {
+    const size = tileCells(tile);
+    effAnchor = {
+      gx: Math.floor((room.gridW - size) / 2),
+      gy: Math.floor((room.gridH - size) / 2),
+    };
+  } else if (/\b(?:near|by|next to)\s+(?:the\s+)?door\b/i.test(qualifierText)) {
+    const first = room.doors?.[0];
+    if (!first) {
+      return {
+        clarify: `There's no door in this room to be near — the room has ${listCandidates()}.`,
+      };
+    }
+    effAnchor = doorEntryCell(first.wall, first.at, room.gridW, room.gridH);
+  }
+  if (effAnchor) {
+    let bestDist = Infinity;
+    let best: Placement[] = [];
+    for (const c of candidates) {
+      const d = Math.abs(c.gx - effAnchor.gx) + Math.abs(c.gy - effAnchor.gy);
+      if (d < bestDist) {
+        bestDist = d;
+        best = [c];
+      } else if (d === bestDist) {
+        best.push(c);
+      }
+    }
+    if (best.length === 1) return { prop: best[0] };
+    // A tie is still ambiguous — the anchor didn't disambiguate.
+    return {
+      clarify: `Those ${pluralProp(tile)} are equally close — ${best.map((p) => `${propName} at (${p.gx}, ${p.gy})`).join(", ")}. Which one?`,
+    };
+  }
+  return {
+    clarify: `There are ${candidates.length} ${pluralProp(tile)} in this room — ${listCandidates()}. Which one?`,
+  };
+}
+
+/** A move-prop destination, from the text after the prop phrase:
+ *  "to the middle", "to the northwest corner", "near the door" /
+ *  "to the door", "here" (the ping), "to cell 3, 4", or a direction
+ *  ("left", "two squares north"). The LAST location phrase in the
+ *  line wins — "move the bones near the door to the middle" moves
+ *  the bones by the door, it doesn't move them near the door. A
+ *  direction word inside another phrase ("to the south door") is
+ *  not a direction. Returns null when the line names no destination
+ *  at all. */
+export type PropDestination =
+  | { to: DressingWhere; raw: string; index: number }
+  | { direction: "left" | "right" | "up" | "down"; steps: number; raw: string; index: number };
+
+export function parsePropDestination(
+  text: string,
+  room: RoomSpec,
+  ctx?: BuildParseContext,
+): PropDestination | null {
+  const found: { start: number; end: number; dest: PropDestination }[] = [];
+  const push = (m: RegExpExecArray | null, dest: PropDestination) => {
+    if (m) found.push({ start: m.index, end: m.index + m[0].length, dest });
+  };
+  let m: RegExpExecArray | null;
+  // Corner: "to the northwest corner" / "into the corner" (a bare
+  // corner is SE, the dressing default).
+  m = /\b(?:to|into)\s+(?:the\s+)?((?:northwest|northeast|southwest|southeast|nw|ne|sw|se)\s+)?corner\b/i.exec(text);
+  if (m) {
+    const corner = m[1] ? CORNER_WORDS[m[1].trim().toLowerCase()] : "se";
+    push(m, { to: { kind: "corner", corner }, raw: m[0], index: m.index });
+  }
+  // Middle / centre.
+  m = /\b(?:to|into)\s+(?:the\s+)?(middle|center|centre)\b/i.exec(text);
+  if (m) push(m, { to: { kind: "center" }, raw: m[0], index: m.index });
+  // Near / to the door.
+  m = /\b(?:near|by|next to|to)\s+(?:the\s+)?(?:(?:north|south|east|west)\s+)?door\b/i.exec(text);
+  if (m) push(m, { to: { kind: "entry" }, raw: m[0], index: m.index });
+  // Explicit cell: "to cell 3, 4" / "to 3, 4" / "to (3, 4)".
+  m = /\bto\s+(?:cell\s+)?\(?(\d+)\s*,\s*(\d+)\)?/i.exec(text);
+  if (m) {
+    push(m, {
+      to: { kind: "cell", gx: Number(m[1]), gy: Number(m[2]) },
+      raw: m[0],
+      index: m.index,
+    });
+  }
+  // Here: the pinged cell.
+  m = /\bhere\b/i.exec(text);
+  if (m && ctx?.here) {
+    const here = resolveHere(ctx.here.x, ctx.here.y, room);
+    push(m, { to: { kind: "cell", gx: here.gx, gy: here.gy }, raw: m[0], index: m.index });
+  }
+  // Direction: "left" / "right" / "up" / "down" / a cardinal — not
+  // next to "wall" ("to the south wall" is not a direction).
+  m = /\b(left|right|up|down|north|south|east|west)\b(?!\s+wall)/i.exec(text);
+  if (m) {
+    const dirWord = m[1].toLowerCase();
+    const direction =
+      dirWord === "left"
+        ? "left"
+        : dirWord === "right"
+          ? "right"
+          : dirWord === "up" || dirWord === "north"
+            ? "up"
+            : "down";
+    const byM = /\bby\s+(\d+)\b/i.exec(text.slice(m.index));
+    push(m, {
+      direction,
+      steps: byM ? Math.max(1, Number(byM[1])) : 1,
+      raw: m[0],
+      index: m.index,
+    });
+  }
+  if (found.length === 0) return null;
+  // A match inside another match's span is part of that phrase, not
+  // its own destination ("south" inside "to the south door").
+  const kept = found.filter(
+    (f) => !found.some((o) => o !== f && o.start <= f.start && f.end <= o.end),
+  );
+  kept.sort((a, b) => b.start - a.start);
+  return kept[0].dest;
+}
+
 // ---------------------------------------------------------------- resolving rooms + "here"
 
 function normalizeName(s: string): string {
@@ -598,6 +884,11 @@ const BUILD_NOUNS =
  *   question listing the doors; a secret door is "the secret door")
  *   "add some bones / rubble / a pillar / a chest [in the corner / in the middle / near the door]"
  *   "add some bones here" (the pinged cell, when ctx.here is set)
+ *   "move the chest to the middle" / "move the bones here" / "move the chest left" (BRA-241 —
+ *   prop move; several of a kind with no disambiguator asks which one — the nearest to the
+ *   destination or the ping wins, and the confirmation line says which cell it came from)
+ *   "remove the bones" / "remove the bones at 2, 3" / "take the bones away" (BRA-241 — prop
+ *   remove; torches are light + sconce together, never a prop move/remove)
  *   "add torches" / "add fog" / "more fog"
  *   "make the north half underwater" / "make this part underwater" (→ asks which part)
  *   "add a corridor going north for 100 meters"
@@ -822,6 +1113,172 @@ export function parseBuildRequest(
     };
   }
 
+  // Move a prop (BRA-241) — "move the chest to the middle", "move
+  // the bones here". Runs before move-door: "move the chest near the
+  // door" names a prop, not a door, and the door branch would steal
+  // it. A line that names no prop ("move the door") falls through to
+  // the door branch below.
+  if (/\bmove\b/i.test(s)) {
+    const target = resolveRoomTarget(s, ctx);
+    if (target && "clarify" in target) {
+      return { kind: "clarify", question: target.clarify };
+    }
+    const room = roomForTarget(ctx, target?.id);
+    if (!room) {
+      return {
+        kind: "clarify",
+        question: "No room to move a prop in yet — build a room first.",
+      };
+    }
+    const afterVerb = s.replace(/^\s*move\s+/i, "");
+    const named = propTileAtStart(afterVerb, room);
+    if (named) {
+      if ("torch" in named) {
+        return {
+          kind: "clarify",
+          question:
+            "A torch is a light and a sconce tile together — moving one would leave its light behind. I can add torches, but I can't move a single torch yet.",
+        };
+      }
+      const tileWord = named.tile === "bones" ? "bones" : named.tile;
+      // Existence first: a missing prop is "no such prop", not "where
+      // should it go" — the destination only matters once the prop
+      // is known to be there.
+      if (!(room.dressing ?? []).some((p) => p.tile === named.tile)) {
+        return {
+          kind: "clarify",
+          question: `There's no ${tileWord} in this room — the room has: ${describeRoomProps(room)}.`,
+        };
+      }
+      const dest = parsePropDestination(named.after, room, ctx);
+      if (!dest) {
+        return {
+          kind: "clarify",
+          question:
+            `Where should the ${tileWord} go — in a corner, in the middle, near the door, or to a cell?` +
+            (/\bhere\b/i.test(named.after) && !ctx?.here
+              ? " I don't have a ping to aim at, so ping the spot or name a place."
+              : ""),
+        };
+      }
+      // The destination cell is the proximity anchor when several of
+      // a kind match; a direction move has no destination cell, so
+      // only the ping can disambiguate it.
+      let anchor: { gx: number; gy: number } | undefined;
+      let to: DressingWhere;
+      if ("direction" in dest) {
+        to = { kind: "cell", gx: -1, gy: -1 }; // placeholder — the from cell is not picked yet
+        if (ctx?.here) {
+          const here = resolveHere(ctx.here.x, ctx.here.y, room);
+          anchor = { gx: here.gx, gy: here.gy };
+        }
+      } else {
+        to = dest.to;
+        if (to.kind === "cell") anchor = { gx: to.gx, gy: to.gy };
+        else if (to.kind === "corner") anchor = cornerCell(to.corner ?? "se", named.tile, room);
+        else if (to.kind === "center") {
+          const size = tileCells(named.tile);
+          anchor = {
+            gx: Math.floor((room.gridW - size) / 2),
+            gy: Math.floor((room.gridH - size) / 2),
+          };
+        } else if (to.kind === "entry") {
+          const first = room.doors?.[0];
+          if (!first) {
+            return {
+              kind: "clarify",
+              question: "There's no door in this room to put it near.",
+            };
+          }
+          anchor = doorEntryCell(first.wall, first.at, room.gridW, room.gridH);
+        }
+      }
+      const qualifierText =
+        named.after.slice(0, dest.index) + " " + named.after.slice(dest.index + dest.raw.length);
+      const resolved = resolveProp(named.tile, qualifierText, room, anchor);
+      if ("clarify" in resolved) {
+        return { kind: "clarify", question: resolved.clarify };
+      }
+      const prop = resolved.prop;
+      if ("direction" in dest) {
+        const dx =
+          dest.direction === "left" ? -dest.steps : dest.direction === "right" ? dest.steps : 0;
+        const dy =
+          dest.direction === "up" ? -dest.steps : dest.direction === "down" ? dest.steps : 0;
+        to = { kind: "cell", gx: prop.gx + dx, gy: prop.gy + dy };
+      }
+      return {
+        kind: "build",
+        op: {
+          type: "move-prop",
+          tile: named.tile,
+          from: { gx: prop.gx, gy: prop.gy },
+          to,
+          ...(target ? { target: target.id } : {}),
+        },
+      };
+    }
+    // No prop named — fall through to the door branch below.
+  }
+
+  // Remove a prop (BRA-241) — "remove the bones", "take the bones
+  // away", "clear the rubble". No destination: the op names the prop
+  // and the cell it sat in, so the confirmation line says what was
+  // removed.
+  if (
+    /\b(remove|clear)\b/i.test(s) ||
+    /\btake\b.*\baway\b/i.test(s) ||
+    /\bget rid of\b/i.test(s)
+  ) {
+    const target = resolveRoomTarget(s, ctx);
+    if (target && "clarify" in target) {
+      return { kind: "clarify", question: target.clarify };
+    }
+    const room = roomForTarget(ctx, target?.id);
+    if (!room) {
+      return {
+        kind: "clarify",
+        question: "No room to remove a prop from yet — build a room first.",
+      };
+    }
+    const afterVerb = s
+      .replace(/^\s*(?:remove|clear)\s+/i, "")
+      .replace(/^\s*take\s+/i, "")
+      .replace(/^\s*get rid of\s+/i, "");
+    const named = propTileAtStart(afterVerb, room);
+    if (named) {
+      if ("torch" in named) {
+        return {
+          kind: "clarify",
+          question:
+            "A torch is a light and a sconce tile together — removing one would leave its light behind. I can't remove a single torch yet.",
+        };
+      }
+      const anchor = ctx?.here
+        ? {
+            gx: resolveHere(ctx.here.x, ctx.here.y, room).gx,
+            gy: resolveHere(ctx.here.x, ctx.here.y, room).gy,
+          }
+        : undefined;
+      const resolved = resolveProp(named.tile, named.after, room, anchor);
+      if ("clarify" in resolved) {
+        return { kind: "clarify", question: resolved.clarify };
+      }
+      const prop = resolved.prop;
+      return {
+        kind: "build",
+        op: {
+          type: "remove-prop",
+          tile: named.tile,
+          from: { gx: prop.gx, gy: prop.gy },
+          ...(target ? { target: target.id } : {}),
+        },
+      };
+    }
+    // No prop named — "remove the door" and friends fall through to
+    // chat (there is no door-removal op).
+  }
+
   // Move a door. "Here" is the ping: the wall nearest it.
   if (/\bmove\b/i.test(s) && /\bdoor\b/i.test(s)) {
     const target = resolveRoomTarget(s, ctx);
@@ -889,16 +1346,7 @@ export function parseBuildRequest(
   // chest. "Here" is the ping: the dressing lands on the pinged cell
   // (an explicit corner/middle/near-the-door wins over the ping);
   // without a ping, "here" asks where, as before.
-  const DRESSING_TILES: Record<string, string> = {
-    bones: "bones",
-    bone: "bones",
-    rubble: "rubble",
-    pillar: "pillar",
-    "ritual circle": "ritual-circle",
-    altar: "altar",
-    skeleton: "skeleton",
-    chest: "chest",
-  };
+  const DRESSING_TILES = PROP_TILE_WORDS;
   const dressingMatch = new RegExp(
     `\\b(add|put|place)\\b.*\\b(${Object.keys(DRESSING_TILES).join("|")})\\b`,
     "i",
@@ -925,12 +1373,8 @@ export function parseBuildRequest(
       };
     }
     const cornerM = /\b(northwest|northeast|southwest|southeast|nw|ne|sw|se)\s+corner\b/i.exec(s);
-    const cornerMap: Record<string, "nw" | "ne" | "sw" | "se"> = {
-      northwest: "nw", nw: "nw", northeast: "ne", ne: "ne",
-      southwest: "sw", sw: "sw", southeast: "se", se: "se",
-    };
     const where: DressingWhere = /\bcorner\b/i.test(s)
-      ? { kind: "corner", corner: cornerM ? cornerMap[cornerM[1].toLowerCase()] : "se" }
+      ? { kind: "corner", corner: cornerM ? CORNER_WORDS[cornerM[1].toLowerCase()] : "se" }
       : /\b(middle|center|centre)\b/i.test(s)
         ? { kind: "center" }
         : /\b(near|by|next to)\b.{0,12}\bdoor\b/i.test(s)
@@ -1019,7 +1463,7 @@ export function parseBuildRequest(
     return {
       kind: "unsupported",
       reason:
-        "that isn't in the kit yet — I can build rooms, widen them, add or move doors, add dressing and fog, carve corridors, and undo",
+        "that isn't in the kit yet — I can build rooms, widen them, add or move doors, add dressing and fog, move or remove props, carve corridors, and undo",
     };
   }
   return null;
@@ -1578,6 +2022,53 @@ export function applyOp(
         changed: true,
       };
     }
+    case "move-prop": {
+      const room = targetRoom(state, op, "No room to move a prop in yet — build a room first.");
+      if (!pack) {
+        throw new Error("Moving a prop needs the tile pack — the executor passes it.");
+      }
+      // A named cell is the destination as named (validateSpec is the
+      // authority on bounds); a corner/middle/entry resolves against
+      // the room's actual size, like add-dressing.
+      const dest =
+        op.to.kind === "cell"
+          ? { gx: op.to.gx, gy: op.to.gy }
+          : resolvePlacement(op.to, op.tile, room, pack);
+      if (dest.gx === op.from.gx && dest.gy === op.from.gy) {
+        const subject = op.tile === "bones" ? "The bones are" : `The ${op.tile} is`;
+        return {
+          state,
+          summary: `${subject} already at ${describePropPlace(op.tile, op.from.gx, op.from.gy, room, pack)}.`,
+          changed: false,
+        };
+      }
+      // moveProp re-resolves the prop by tile + cell and validates the
+      // whole spec, so a prop that vanished between parse and apply
+      // is a plain-English error, never a silent wrong move.
+      const next: DungeonRoomSpec = {
+        ...moveProp(room, { tile: op.tile, gx: op.from.gx, gy: op.from.gy }, dest, pack),
+        id: room.id,
+      };
+      const name = op.tile === "bones" ? "the bones" : `the ${op.tile}`;
+      return {
+        state: withFocus(replaceRoom(state, next), op),
+        summary: `Moved ${name} from ${describePropPlace(op.tile, op.from.gx, op.from.gy, room, pack)} to ${describePropPlace(op.tile, dest.gx, dest.gy, room, pack)} in the ${room.name}.`,
+        changed: true,
+      };
+    }
+    case "remove-prop": {
+      const room = targetRoom(state, op, "No room to remove a prop from yet — build a room first.");
+      const next: DungeonRoomSpec = {
+        ...removeProp(room, { tile: op.tile, gx: op.from.gx, gy: op.from.gy }),
+        id: room.id,
+      };
+      const name = op.tile === "bones" ? "the bones" : `the ${op.tile}`;
+      return {
+        state: withFocus(replaceRoom(state, next), op),
+        summary: `Removed ${name} from ${describePropPlace(op.tile, op.from.gx, op.from.gy, room, pack)} in the ${room.name}.`,
+        changed: true,
+      };
+    }
     case "add-torches": {
       const room = targetRoom(state, op, "No room to light yet — build a room first.");
       const merged = mergeTorches(room);
@@ -1987,6 +2478,7 @@ export function formatBuildLine(summary: string, op: BuildOp): string {
       op.type === "lock-door" || op.type === "unlock-door" ? "🚪"
     : op.type === "listen-door" ? "👂"
     : op.type === "add-dressing" ? "✨"
+    : op.type === "move-prop" || op.type === "remove-prop" ? "📦"
     : op.type === "add-torches" ? "🕯️"
     : op.type === "add-fog" ? "🌫️"
     : op.type === "overlay" ? "💧"

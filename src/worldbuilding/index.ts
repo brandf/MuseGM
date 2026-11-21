@@ -74,6 +74,21 @@ export interface LightSpec {
   /** Hex color. Default: "#ff9a3c" (warm torchlight). */
   color?: string;
   /**
+   * Light strength 0..1. Default 0.5 — the Foundry default the old
+   * hardcode used. Dressing lights set their own alpha (torch and
+   * candle 0.4, brazier 0.5 — FR-16, BRA-192), so a relight restores
+   * exactly the light that was built instead of the default.
+   */
+  alpha?: number;
+  /**
+   * Build-time marker for an interactive dressing piece (FR-16):
+   * the dressing item id this light belongs to (e.g. "torch-n-4").
+   * It rides the spec through layoutRoom so the composer hook can
+   * pair the created AmbientLight _id back to its item — it is
+   * never sent to Foundry (lightCreateData drops it).
+   */
+  dressingId?: string;
+  /**
    * Display name for the light, e.g. "the braziers" or "the altar
    * candles" (FR-7, BRA-197). When set, the name is stamped into the
    * created AmbientLight's flags, and later steps/commands can address
@@ -237,7 +252,9 @@ export async function addWalls(
  * payload `addLights` sends, testable with no connection. A named
  * light is stamped with `flags["foundry-live"].lightName` (FR-7);
  * with an embed key it also carries `tileRoomKey` (BRA-202), the two
- * flags merged under one scope. A blank name stamps nothing.
+ * flags merged under one scope. A blank name stamps nothing. The
+ * spec's `alpha` is honoured (default 0.5); `dressingId` is a
+ * build-time marker only and is never sent.
  */
 export function lightCreateData(
   l: LightSpec,
@@ -257,7 +274,7 @@ export function lightCreateData(
       bright: l.bright,
       angle: l.angle ?? 360,
       color: l.color ?? "#ff9a3c",
-      alpha: 0.5,
+      alpha: l.alpha ?? 0.5,
     },
     hidden: false,
     ...(Object.keys(scope).length > 0 ? { flags: { [FLAG_SCOPE]: scope } } : {}),

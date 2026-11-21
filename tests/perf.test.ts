@@ -256,7 +256,15 @@ function fakeLive(overrides: Record<string, unknown> = {}) {
     getUsers: () => [{ _id: GM, name: "Gamemaster", role: 4, active: true }],
     getCombatState: () => null,
     getWorldSummary: () => ({ title: "TestBed", counts: {} }),
-    raw: () => ({ getJournals: () => [] }),
+    raw: () => ({
+      getJournals: () => [],
+      getWorldData: () => ({
+        scenes: [{ _id: "scene-1", name: "Entry Hall", tokens: [], lights: [], tiles: [], walls: [] }],
+        packs: [],
+      }),
+      getScenes: () => [],
+      searchActors: async (_q: unknown) => ({ actors: [] }),
+    }),
     on: (_fn: unknown) => () => {},
     sendChat: async (content: string, opts: Record<string, unknown> = {}) => {
       sent.push({ content, opts });
@@ -376,29 +384,45 @@ describe("runMonitor latency wiring (fake live, --once)", () => {
     expect(summary.latency.byKind.find((k) => k.kind === "detect")?.p50Ms).toBe(500);
   });
 
-  it("a whispered script records first-effect + per-step latencies in the log", async () => {
+  it("a fired staged beat records first-effect + per-step latencies in the log", async () => {
+    // Stage-then-fire (BRA-244): the script whisper only stages —
+    // no effect lands, so no first-effect is recorded for it. The
+    // budget runs from the GM's "fire" to the first effect, so the
+    // first-effect and per-step records carry the fire message's id.
     const clock = fakeClock();
-    const whisper = msg({
+    const scriptMsg = msg({
       id: "w20",
       author: GM,
       content: `play this:\n\`\`\`json\n${JSON.stringify(CHAT_SCRIPT)}\n\`\`\``,
       whisper: [OWN],
       timestamp: 999_000,
     });
+    const fireMsg = msg({
+      id: "w21",
+      author: GM,
+      content: "fire",
+      whisper: [OWN],
+      timestamp: 999_500,
+    });
+    const queue = [scriptMsg, fireMsg];
+    let calls = 0;
     const live = fakeLive({
-      waitForChat: async () => ({
-        timedOut: false,
-        newMessages: [whisper],
-        lastSeen: whisper.id,
-      }),
+      waitForChat: async () => {
+        calls += 1;
+        if (queue.length === 0) return { timedOut: true, newMessages: [], lastSeen: null };
+        const m = queue.shift()!;
+        return { timedOut: false, newMessages: [m], lastSeen: m.id };
+      },
     });
     const logs: Record<string, unknown>[] = [];
     const summary = await runMonitor(live as unknown as FoundryLive, {
-      once: true,
+      once: false,
       clock: clock.now,
       onLog: (l) => logs.push(l as Record<string, unknown>),
+      shouldStop: () => calls >= 2,
     });
-    expect(summary.whispersHandled).toBe(1);
+    expect(summary.whispersHandled).toBe(2);
+    expect(summary.stagesHandled).toBe(2);
     // The first effect lands in the background timeline, after the
     // loop's shutdown summary is taken — so it is in the log lines,
     // not necessarily in summary.latency. That is the documented
@@ -420,9 +444,9 @@ describe("runMonitor latency wiring (fake live, --once)", () => {
       logs.some((l) => l.event === "latency" && l.kind === "cutscene-wait"),
     );
     const step = logs.find((l) => l.event === "latency" && l.kind === "cutscene-step")!;
-    expect(step.label).toBe("w20:0");
+    expect(step.label).toBe("w21:0");
     const wait = logs.find((l) => l.event === "latency" && l.kind === "cutscene-wait")!;
-    expect(wait.label).toBe("w20:1");
+    expect(wait.label).toBe("w21:1");
     expect(wait.budgetMs).toBeNull();
   });
 
@@ -450,7 +474,7 @@ describe("runMonitor latency wiring (fake live, --once)", () => {
       onLog: (l) => logs.push(l as Record<string, unknown>),
     });
     expect(summary.whispersHandled).toBe(1);
-    await waitFor(() => live.sent.some((m) => m.content.includes("doesn't validate")));
+    await waitFor(() => live.sent.some((m) => m.content.includes("doesn't stage")));
     expect(
       logs.filter((l) => l.event === "latency" && l.kind === "whisper-first-effect"),
     ).toHaveLength(0);

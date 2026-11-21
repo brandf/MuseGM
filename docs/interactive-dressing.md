@@ -3,9 +3,13 @@
 FR-16: a room built by the composer has its torches and candles placed,
 lit, and clickable without any hand work. Clicking toggles the light
 and posts a one-line flavor note in chat. The generator
-(`src/session/dressing.ts`) is built and unit-tested; this note covers
-the part that is not built yet — the click wiring at the table, and the
-composer hook that runs the dressing pass on every room it builds.
+(`src/session/dressing.ts`), the composer hook
+(`applyDressingToSpec` / `layoutRoomWithDressing` /
+`resolveDressingPairing`) and the click module
+(`modules/meroki-dressing/`) are built and unit-tested; this note
+covers the wiring as built, and the one small live half left — the
+`buildTileRoom` calls that create the tiles/lights and write the
+pairing back — plus what still needs a live session.
 
 ## What the generator produces
 
@@ -17,57 +21,50 @@ toggle: off = `hidden: true` + `config.alpha: 0`; on = `hidden: false`
 + the item's own alpha — a relight restores exactly the same light.
 `dressingToRoomSpec(plan)` maps a plan onto the composer hook's inputs
 (torches, lights, dressing placements; items without a tile are listed
-in `skipped`, never faked).
+in `skipped`, never faked). `applyDressingToSpec(spec, plan)` merges a
+plan into a room spec; `layoutRoomWithDressing(spec, pack, serverBase,
+opts)` plans, merges and lays out in one call; `resolveDressingPairing`
+pairs the created Tile and AmbientLight `_id`s back to their items
+after the live build.
 
-## The click-wiring decision (not made yet — decide live)
+## The click-wiring decision (decided — Route A, Nov 20)
 
-Three candidate routes. Recommendation: **Route A** (small module,
-following the Meroki Pins pattern), because it is the only route where
-the click itself is the trigger — no extra step for the players.
+**Route A** (small module, following the Meroki Pins pattern) — the
+module is `modules/meroki-dressing/` (v0.1.0, Foundry 14). The click
+itself is the trigger: a passive handler on the canvas fires on a
+plain left-click that lands on a visible dressing tile with no visible
+token under the same point (a token standing on a candle cell wins —
+the click selects the token and the candle stays lit). No arming step:
+the design note's open question is answered passive, because the flag
+— not the tool — is the guard; arming would add a step to every
+torch the players touch.
 
-### Route A — a small Foundry module ("Meroki Dressing")
+Why A over the others: B (generated macro) makes the GM the middleman
+for every torch and clutters the macro directory — it breaks the
+"players go around clicking torches" feeling. C (chat command) is
+typing, not clicking, and "the torch" is ambiguous in a room with
+seven of them. Only A lets a player walk up to a torch and click it.
 
-A module like `meroki-pins`: it registers a canvas interaction that
-fires when a player clicks a dressing tile. The tile carries
-`flags.meroki = { dressingId, lightId }` (set at build time); the
-module reads the flag, flips the paired AmbientLight (`hidden` +
-`config.alpha`, the same update `toggleDressing` returns), and posts
-the chat line. Dave installs it once, like the Pins module.
+Two things the design note did not foresee, both answered in the
+module:
 
-- Pro: the click is the interaction — nothing else to learn or type.
-- Con: needs a module Dave installs and trusts; the click handler is
-  the one piece with no offline verification (see below).
+- **Players cannot update lights.** Foundry only lets the GM change
+  scene embeds, so a player's click can never flip the light
+  directly. The module sends the toggle over a socket message
+  (`module.meroki-dressing`) and the designated GM's client — the
+  active GM with the lowest user id, so exactly one GM executes —
+  flips the light and posts the chat line. No GM connected means a
+  warning, not a silent no-op.
+- **The current state comes from the light document** (`hidden` =
+  unlit), not from a flag — so a click after a cutscene dim or a
+  monitor toggle reads the real state instead of a stale one.
 
-### Route B — a generated macro the GM runs
-
-The composer generates a macro per room ("Toggle torch at (3,2)")
-that flips the light and posts the line. The GM clicks the macro, or
-drags it to the hotbar.
-
-- Pro: no module install; macros are core Foundry.
-- Con: the players cannot click the torch themselves — the GM is the
-  middleman, which breaks the "players go around clicking torches"
-  feeling. A macro per torch also clutters the macro directory.
-
-### Route C — the monitor watches for a chat command
-
-A player types "light the torch" (or "blow out the candle") in Foundry
-chat; the monitor parses it the way it parses roll requests, resolves
-the nearest dressing item to the speaker's token, and toggles it.
-
-- Pro: no install, no macro; reuses the monitor's existing routing.
-- Con: typing is not clicking; "the torch" is ambiguous when a room
-  has seven of them (nearest-to-token resolves it, but the player has
-  to know to stand next to one).
-
-**Open questions for the live session:** does the click handler live
-in a module Dave installs (Route A), or is the chat command good
-enough for v1 (Route C)? If Route A: does the module use a toolbar
-tool the player arms (the Pins pattern — one click arms, next click
-places) or a passive click handler that fires on any dressing tile
-without arming? The passive handler is nicer (no arming step) but
-must not swallow clicks meant for tokens — it only fires when the
-click lands on a tile carrying the `flags.meroki.dressingId` flag.
+The tile flag is the whole record the module needs:
+`flags.meroki = { dressingId, lightId, kind, alpha }`. Layout time
+stamps `{ dressingId }`; the pairing step completes it with the
+light `_id`, kind and alpha. A tile with a dressingId but no lightId
+was built before pairing ran — the module warns and does nothing
+instead of toggling the wrong light.
 
 ## What is verified vs what needs a live session
 
@@ -79,54 +76,98 @@ click lands on a tile carrying the `flags.meroki.dressingId` flag.
   lighting fix used live on Nov 19, and the same update path
   `animateLight` uses.
 - The toggle math: off = hidden + alpha 0, on = shown + the item's
-  own alpha (28 unit checks).
+  own alpha (28 unit checks in `tests/dressing.test.ts`).
 - The placement rules: torch spacing, door-cell exclusion, no
   overlaps, braziers only in large rooms, candle table/floor fallback.
-- The pack tile: `sconce` exists (100px, dressing layer). Candle and
-  brazier tiles do NOT exist yet — the plan records them in
-  `tileGaps` instead of faking a tile.
+- The pack tiles: `sconce`, `candle` and `brazier` all exist now
+  (100px, dressing layer, standalone prop sprites — never baked into
+  a floor tile). The pack is 48 tiles, 0 gaps; the old 46 PNGs are
+  byte-identical after the regeneration.
+- The alpha gap is closed: `LightSpec` carries an `alpha` field and
+  `lightCreateData` honours it (default 0.5 — the old hardcode's
+  value), so dressing lights are created with their own alpha
+  (torch/candle 0.4, brazier 0.5) instead of a post-create update.
+  The post-create route was rejected: one create with the right
+  alpha is a single round-trip and the light is never briefly wrong.
+- The composer hook: `layoutRoomWithDressing` plans, merges and lays
+  out in one call; `resolveDressingPairing` pairs the created _ids
+  back to their items and lists every unpaired item instead of
+  guessing (`tests/dressing-hook.test.ts`).
+- The module code reads correctly against the v14 API docs/types
+  (see the VERIFIED vs ASSUMED list in
+  `modules/meroki-dressing/scripts/meroki-dressing.js`) — but no
+  module code runs offline, so the handler itself is live-only.
 
 **Needs a live session (Dave's Foundry on):**
 
 - The click handler actually firing in Foundry (Route A): does a
   click on a dressing tile reach the module, does the flag lookup
-  work, does the light flip visibly, does the chat line post?
-- The composer hook: `buildTileRoom` runs the dressing pass, the
-  tiles + lights land, and the light `_id`s come back and get written
-  into the items' `lightId` (so a later toggle knows which doc to
-  update).
-- The alpha gap: `LightSpec` carries no alpha and `addLights`
-  hardcodes `alpha: 0.5`, but the dressing lights want 0.4 (torch,
-  candle) and 0.5 (brazier). The hook must set each light's alpha in
-  a post-create update — or `LightSpec`/`addLights` must grow an
-  `alpha` field. Decide when the hook is built.
-- The candle/brazier tiles: generate them (procedural, like the
-  sconce) or the rooms dress with torches only until they exist.
+  work, does the light flip visibly, does the chat line post? The
+  full live-check list is at the bottom of
+  `modules/meroki-dressing/scripts/meroki-dressing.js` — including
+  the player-click socket round-trip, the two-GM single-executor
+  rule, and the token guard.
+- The live half of the hook (see below): `buildTileRoom` runs the
+  dressing pass, the tiles + lights land, and the pairing writes the
+  completed flags back onto the tiles.
 - The cutscene cross-check: a `light` step with a named light (the
   torch's `lightId`) dims the room for the ambush, then the mage's
   bloom brings it back — the same light, driven by two systems.
 
-## The composer hook (when it is built)
+## The composer hook (built — Nov 20)
 
-In `tiles.ts`, after `layoutRoom` returns and the scene is created:
+The pure half lives in `src/session/dressing.ts`:
 
-1. `planDressing(spec, { seed: spec.seed })` — one pass per room.
-2. `dressingToRoomSpec(plan)` gives torches/lights/dressing; merge
-   them into the spec before `layoutRoom` (torches into
-   `spec.torches`, lights into `spec.lights`, dressing into
-   `spec.dressing`) — or lay them out after, from the plan directly.
-   Merging before is simpler: the existing layout path creates the
-   tiles and lights, and `addLights` returns the `_id`s in creation
-   order, so the hook can pair each returned `_id` with its item.
-3. Write the pairing back: each item's `lightId` + the tile's
-   `flags.meroki = { dressingId, lightId }` on the Tile document.
-   The tile flag is what Route A reads on click; without it the
-   module cannot tell a torch tile from a bones tile.
-4. Items in `skipped` (no tile yet) still get their light — a candle
-   without a tile is still a clickable light, just an invisible one
-   until its tile exists. Or skip the light too, and let the room
-   dress with torches only. Decide at hook time; either way, record
-   the choice in the plan, not in a comment.
+1. `layoutRoomWithDressing(spec, pack, serverBase, opts)` — one call
+   is the whole hook: `planDressing(spec, opts.plan)` plans the room,
+   `applyDressingToSpec` merges the plan into a new spec, `layoutRoom`
+   lays it out. It returns `{ plan, spec, layout }`.
+2. `applyDressingToSpec(spec, plan)` merges lights (one per item,
+   named by kind, with its own alpha and `dressingId`) into
+   `spec.lights` and dressing placements (with the item id as both
+   prop `id` and `dressingId`) into `spec.dressing`. It does NOT
+   merge the torch cells into `spec.torches`: the plan's torch lights
+   are already in `lights`, and merging the shorthand too would give
+   every torch two lights. It throws, listing every problem, when the
+   plan is invalid for the room, names another room, still has tile
+   gaps, or collides with a prop id the room already has. A plan with
+   tile gaps rejects the whole room — a fresh plan can never have
+   gaps (the pack is complete), so a gap is always a stale plan, and
+   building a half-dressed room around it would hide the staleness.
+   (`dressingToRoomSpec` still returns a `skipped` list for direct
+   callers; the hook is strict and never reaches it with a gap.)
+3. `layoutRoom` stamps `flags.meroki = { dressingId }` on every
+   dressing tile whose placement carries a `dressingId`
+   (`src/worldbuilding/tiles-layout.ts`). The light `_id`, kind and
+   alpha join the flag in the pairing step — the `_id` does not exist
+   at layout time.
+4. `resolveDressingPairing(plan, layout, tileIds, lightIds)` pairs
+   the created ids back to their items after the live build: the join
+   key is the dressing id (layout tiles carry it in
+   `flags.meroki.dressingId`, layout lights in
+   `LightSpec.dressingId`). It returns `{ pairs, errors }` — a tile
+   without a light, a light without a tile, a duplicate dressing id,
+   or an id array that does not line up with its layout array are
+   all listed, never paired by position alone and never silently
+   dropped. Each pair carries the full flag record the live half
+   writes onto the tile (`tileFlags`).
+
+The live half is a small change to `buildTileRoom`
+(`src/worldbuilding/tiles.ts`, not yet made — the lead owns it):
+
+```ts
+const { plan, spec: dressed, layout } = layoutRoomWithDressing(spec, pack, serverBase);
+// ... build the scene from `layout` as today (tiles, walls, lights) ...
+const { pairs, errors } = resolveDressingPairing(plan, layout, tileIds, lightIds);
+if (errors.length > 0) throw new Error(`Dressing pairing failed: ${errors.join(" ")}`);
+// Write each pair's tileFlags onto its tile:
+//   modifyDocument("Tile", "update", { updates: pairs.map(p => ({ _id: p.tileId, flags: { meroki: p.tileFlags } })), parentUuid })
+```
+
+Flag updates merge per scope, so writing `flags.meroki` completes
+the `{ dressingId }` the layout stamped — it does not clobber it.
+The same hook serves the floor planner and any CLI that builds rooms:
+plan, merge, lay out, build, pair, write the flags back.
 
 ## The cutscene engine and dressing
 

@@ -106,6 +106,37 @@ describe("validateCutscene", () => {
     expect(badSel.ok).toBe(false);
   });
 
+  it("light: accepts {name}, and rejects blank names, two selectors, and from + name", () => {
+    const byName = validateCutscene(
+      validScript({ steps: [{ kind: "light", light: { name: "the braziers" }, dim: 0 }] }),
+    );
+    expect(byName.ok).toBe(true);
+    const blank = validateCutscene(
+      validScript({ steps: [{ kind: "light", light: { name: "   " }, dim: 0 }] }),
+    );
+    expect(blank.ok).toBe(false);
+    if (!blank.ok) expect(blank.errors.join(" ")).toContain("non-empty string");
+    const both = validateCutscene(
+      validScript({ steps: [{ kind: "light", light: { id: "abc", name: "the braziers" }, dim: 0 }] }),
+    );
+    expect(both.ok).toBe(false);
+    if (!both.ok) expect(both.errors.join(" ")).toContain("exactly one");
+    const fromName = validateCutscene(
+      validScript({
+        steps: [{ kind: "light", light: { name: "the braziers" }, dim: 0, from: { dim: 300 } }],
+      }),
+    );
+    expect(fromName.ok).toBe(false);
+    if (!fromName.ok) expect(fromName.errors.join(" ")).toContain("does not apply to a group");
+    // {id} + from is still fine — from is how the id/at path seeds the fade.
+    const idFrom = validateCutscene(
+      validScript({
+        steps: [{ kind: "light", light: { id: "abc" }, dim: 0, from: { dim: 300 } }],
+      }),
+    );
+    expect(idFrom.ok).toBe(true);
+  });
+
   it("swapTile: exactly one of tile/cell, and a non-empty to", () => {
     const both = validateCutscene(
       validScript({ steps: [{ kind: "swapTile", tile: "abc", cell: { x: 1, y: 2 }, to: "a.png" }] }),

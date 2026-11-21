@@ -150,7 +150,7 @@ sentence; tokens animate smoothly; the table watches a scene, not a
 build.
 
 **Status:** built offline Nov 20, unit-tested, live test pending.
-BRA-231 (Nov 20): staging gate built — `stageCutscene` validates + resolves against a world snapshot, beat store with fire/edit/drop, `playStagedCutscene` hash-checks before playing. Monitor routing (stage → whisper preview to GM → fire/edit/drop on the GM's one-word reply) is the follow-up, not yet built.
+BRA-231 (Nov 20): staging gate built — `stageCutscene` validates + resolves against a world snapshot, beat store with fire/edit/drop, `playStagedCutscene` hash-checks before playing. BRA-244 (Nov 20): monitor routing built — whispered scripts stage and wait for the GM's one-word "fire"/"edit"/"drop" (preview whispered, staging awaited); the FR-18 latency budget now runs from "fire" to first effect.
 `src/session/cutscene.ts` (versioned script schema, strict validation —
 every error listed, never a silent skip; formation expansion;
 `playCutscene` via the sequence runner) + `src/session/formations.ts`
@@ -200,7 +200,7 @@ mage's casting light is a light animation, not a new static light.
 light switch; the creator can name a light ("the center light") and
 change it in one message.
 
-**Status:** [~] built + unit-tested offline Nov 20 — timed transitions (cutscene light step) + named lights (src/session/lights.ts registry, LightSpec.name stamped at build, animateNamedLights); live test pending. [~] monitor chat routing built (BRA-240, Nov 20); cutscene light-step {name} is still a follow-up.
+**Status:** [~] built + unit-tested offline Nov 20 — timed transitions (cutscene light step) + named lights (src/session/lights.ts registry, LightSpec.name stamped at build, animateNamedLights); live test pending. [~] monitor chat routing built (BRA-240, Nov 20); cutscene light-step {name} built Nov 20 (BRA-239).
 
 ### FR-8 — Undo / tweak
 
@@ -660,17 +660,17 @@ image landing in chat at the moment of the emergence.
 | 19-tile pack (0 gaps, incl. spear prop) | Built |
 | Trap & zone triggers | Built |
 | Chat-driven iterative building loop | Built, unit-tested (Nov 20); live test pending |
-| Theme packs + re-skin | Not built |
-| Multi-floor + gated reveal | Not built |
-| Zone → cutscene link | Not built |
+| Theme packs + re-skin | Built, unit-tested (Nov 20); live test pending |
+| Multi-floor + gated reveal | Built, unit-tested (Nov 20); live test pending |
+| Zone → cutscene link | Built, unit-tested (Nov 20); live test pending |
 | Cutscene script schema + timeline player | Built, unit-tested (Nov 20) |
 | Formation helpers (ring, line, wedge) | Built, unit-tested (Nov 20) |
-| Timed light transitions + named lights | Transitions built (light step); named lights still use id/proximity |
+| Timed light transitions + named lights | Built, unit-tested (Nov 20); live test pending — named lights + cutscene light-step {name} included |
 | Scripted tile swaps (FR-13 swapTile) | Built, unit-tested (Nov 20) |
 | Edit history / undo | Built, unit-tested (Nov 20); live test pending |
-| Props in the room spec | Not built |
+| Props in the room spec | Built, unit-tested (Nov 20); live test pending — place/move/remove ops + cutscene prop recording included |
 | High-level floor generation (FR-15) | Planner + preview + manifest built, unit-tested; live wiring pending |
-| Interactive dressing: clickable torches/candles (FR-16) | Generator built, unit-tested (Nov 20); click wiring + composer hook pending |
+| Interactive dressing: clickable torches/candles (FR-16) | Built, unit-tested (Nov 20); live test pending — generator + click module + composer hook (pure half + buildDressedTileRoom live half) |
 | Sound: effects + background music (FR-17) | Not built — design only, asset question open |
 | Mid-session emergent sequences (FR-18) | Built, unit-tested (Nov 20) — round clock + rush + lights-out + wall-break + emerge + reveal image; monitor whisper handling + live test pending |
 

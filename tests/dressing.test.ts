@@ -96,15 +96,15 @@ describe("planDressing — candles", () => {
     }
   });
 
-  test("candle and brazier tiles are honestly missing, not faked", () => {
+  test("candle and brazier tiles exist now — nothing is faked or skipped", () => {
     const plan = planDressing(room({ gridW: 8, gridH: 8 }), {});
     const candle = plan.items.find((i) => i.kind === "candle")!;
     const brazier = plan.items.find((i) => i.kind === "brazier")!;
-    expect(candle.tile).toBeNull();
-    expect(candle.tileNeeded).toBe("candle");
-    expect(brazier.tile).toBeNull();
-    expect(brazier.tileNeeded).toBe("brazier");
-    expect([...plan.tileGaps].sort()).toEqual(["brazier", "candle"]);
+    expect(candle.tile).toBe("candle");
+    expect(candle.tileNeeded).toBeUndefined();
+    expect(brazier.tile).toBe("brazier");
+    expect(brazier.tileNeeded).toBeUndefined();
+    expect(plan.tileGaps).toEqual([]);
   });
 });
 
@@ -281,8 +281,7 @@ describe("validateDressingPlan", () => {
       kind: "brazier" as const,
       gx: 0,
       gy: 0,
-      tile: null,
-      tileNeeded: "brazier",
+      tile: "brazier",
       placement: "floor" as const,
       light: { x: 50, y: 50, dim: 400, bright: 200, color: "#ff8c2e", alpha: 0.5 },
       lightId: null,
@@ -299,6 +298,28 @@ describe("validateDressingPlan", () => {
     };
     expect(validateDressingPlan(bad, spec).join(" ")).toMatch(/braziers need/);
   });
+
+  test("catches a null tile — a stale plan from before the candle/brazier tiles", () => {
+    const spec = room({ gridW: 8, gridH: 8 });
+    const plan = planDressing(spec, {});
+    const candle = plan.items.find((i) => i.kind === "candle")!;
+    const bad: DressingPlan = {
+      ...plan,
+      items: plan.items.map((i) => (i.id === candle.id ? { ...i, tile: null, tileNeeded: "candle" } : i)),
+    };
+    expect(validateDressingPlan(bad, spec).join(" ")).toMatch(/must use tile "candle"/);
+  });
+
+  test("catches a stale tileNeeded on an item that has a real tile", () => {
+    const spec = room({ gridW: 8, gridH: 8 });
+    const plan = planDressing(spec, {});
+    const brazier = plan.items.find((i) => i.kind === "brazier")!;
+    const bad: DressingPlan = {
+      ...plan,
+      items: plan.items.map((i) => (i.id === brazier.id ? { ...i, tileNeeded: "brazier" } : i)),
+    };
+    expect(validateDressingPlan(bad, spec).join(" ")).toMatch(/stale tileNeeded/);
+  });
 });
 
 describe("dressingToRoomSpec", () => {
@@ -313,9 +334,22 @@ describe("dressingToRoomSpec", () => {
     const out = dressingToRoomSpec(plan);
     expect(out.torches).toHaveLength(7);
     expect(out.lights).toHaveLength(plan.items.length);
-    // Only torches have tiles today; candles are skipped, not faked.
-    expect(out.dressing).toHaveLength(7);
-    expect(out.skipped).toHaveLength(2);
+    // Every item has a tile now — nothing is skipped, nothing faked.
+    expect(out.dressing).toHaveLength(9);
+    expect(out.skipped).toHaveLength(0);
+    // Each light carries its own alpha, its kind's group name and its
+    // dressing id, so the hook can pair the created _id back to it.
+    const candleLight = out.lights.find((l) => l.dressingId === "candle-table-3-2")!;
+    expect(candleLight.alpha).toBe(0.4);
+    expect(candleLight.name).toBe("the candles");
+    expect(candleLight.color).toBe("#ffc46b");
+    const brazierLights = out.lights.filter((l) => l.name === "the braziers");
+    expect(brazierLights).toHaveLength(0); // 8x6 room: no braziers
+    // Each placement carries the item id as both prop id and
+    // dressing id — move/remove address it, layoutRoom flags it.
+    const candlePlacement = out.dressing.find((d) => d.tile === "candle")!;
+    expect(candlePlacement.id).toBe("candle-table-3-2");
+    expect(candlePlacement.dressingId).toBe("candle-table-3-2");
   });
 });
 

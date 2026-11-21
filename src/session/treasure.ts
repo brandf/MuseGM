@@ -29,6 +29,7 @@
  * PF2e rulebook "Treasure by Level" table — do not present it as one.
  */
 import { rngFromSeed, splitCoins } from "./loot.js";
+import type { FoundryLive } from "../live.js";
 
 /** Kinds of treasure items. */
 export type TreasureKind =
@@ -703,4 +704,227 @@ export function formatTreasure(hoard: TreasureHoard): string {
     lines.push(`  • Loose coins: ${coinParts.join(", ")} (${hoard.coinsGp} gp)`);
   }
   return lines.join("\n");
+}
+
+// ---------------------------------------------------------------- live layer
+
+/**
+ * PF2e item type for each treasure kind. Signature items are unique named
+ * homebrew items, so they land as "treasure" — the GM re-types one in
+ * Foundry if they want it equipped; the description carries what it is
+ * and what it does, so nothing about the item is lost in the mapping.
+ */
+function pf2eTypeFor(kind: TreasureKind): string {
+  switch (kind) {
+    case "weapon":
+      return "weapon";
+    case "armor":
+      return "armor";
+    case "consumable":
+      return "consumable";
+    case "equipment":
+      return "equipment";
+    case "gem":
+    case "art":
+    case "signature":
+    default:
+      return "treasure";
+  }
+}
+
+/**
+ * HTML description for a treasure item doc: the provenance story, plus
+ * the homebrew ability labeled as homebrew for signature items. This is
+ * what players read on the sheet — the story must survive the trip
+ * into Foundry, not just live in the chat line.
+ */
+export function treasureItemDescription(item: TreasureItem): string {
+  const parts = [`<p>${item.story}</p>`];
+  if (item.kind === "signature" && item.ability) {
+    parts.push(`<p><b>Ability (homebrew):</b> ${item.ability}</p>`);
+  }
+  return parts.join("");
+}
+
+/** One Foundry Item doc for a treasure item, ready for modifyDocument. */
+export interface TreasureItemDoc {
+  name: string;
+  type: string;
+  /** Set only when `art` is a URL the Foundry server can fetch. */
+  img?: string;
+  system: {
+    quantity: number;
+    price: { value: number; denomination: "gp" };
+    description: { value: string };
+  };
+}
+
+/**
+ * Map a hoard to the Foundry Item docs fillTreasureChest creates, in
+ * placement order: the "Coins" item first (when the hoard has loose
+ * coins — a PF2e loot actor has no coin purse, same as loot.ts), then
+ * every hoard item. Pure — no connection needed.
+ *
+ * Art: `img` is set only when the signature item's `art` is an http(s)
+ * URL. A local art path stays on disk until the GM uploads it (see the
+ * live checklist) — never point a live item at a path the server cannot
+ * fetch, or the item shows a broken image.
+ */
+export function treasureToItemDocs(hoard: TreasureHoard): TreasureItemDoc[] {
+  const docs: TreasureItemDoc[] = [];
+  if (hoard.coinsGp > 0) {
+    docs.push({
+      name: "Coins",
+      type: "treasure",
+      system: {
+        quantity: 1,
+        price: { value: hoard.coinsGp, denomination: "gp" },
+        description: {
+          value: `<p>Loose coins from the hoard (${hoard.coinsGp} gp).</p>`,
+        },
+      },
+    });
+  }
+  for (const item of hoard.items) {
+    const doc: TreasureItemDoc = {
+      name: item.name,
+      type: pf2eTypeFor(item.kind),
+      system: {
+        quantity: item.quantity,
+        price: { value: item.valueGp, denomination: "gp" },
+        description: { value: treasureItemDescription(item) },
+      },
+    };
+    if (item.art && /^https?:\/\//.test(item.art)) doc.img = item.art;
+    docs.push(doc);
+  }
+  return docs;
+}
+
+/** One item that could not be placed, with the reason — never silent. */
+export interface TreasurePlacementFailure {
+  name: string;
+  reason: string;
+}
+
+/**
+ * Result of placing a hoard in a chest. `failed` is empty on success;
+ * on any failure it names every item that did not land and why.
+ */
+export interface TreasurePlacement {
+  chestActorId: string;
+  /** _ids of the Item docs created, in placement order. */
+  placedItemIds: string[];
+  /** Names placed, in placement order (parallels placedItemIds). */
+  placedNames: string[];
+  /** Items that could not be placed, each with the reason. */
+  failed: TreasurePlacementFailure[];
+  /** Total gp value placed (items + coins). */
+  placedValueGp: number;
+}
+
+/**
+ * Fill a chest's loot actor with a generated hoard, following the chest
+ * route in src/worldbuilding/index.ts (a `loot`-type Actor holding Item
+ * docs; players open the token and take items onto their own sheets —
+ * see loot.ts openChest). Same transport as loot.ts fillChest
+ * (modifyDocument Item create, parentUuid `Actor.<chestActorId>`), plus
+ * the story/ability description on every doc so players can read what
+ * they found.
+ *
+ * Failure is always reported, never silent: if the create throws, every
+ * item is listed in `failed` with the error; if Foundry creates fewer
+ * docs than requested, the missing ones are listed with the counts.
+ */
+export async function fillTreasureChest(
+  live: FoundryLive,
+  chestActorId: string,
+  hoard: TreasureHoard,
+): Promise<TreasurePlacement> {
+  const docs = treasureToItemDocs(hoard);
+  const report = (
+    placedItemIds: string[],
+    placedNames: string[],
+    failed: TreasurePlacementFailure[],
+    placedValueGp: number,
+  ): TreasurePlacement => ({
+    chestActorId,
+    placedItemIds,
+    placedNames,
+    failed,
+    placedValueGp,
+  });
+  if (!chestActorId) {
+    return report(
+      [],
+      [],
+      docs.map((d) => ({
+        name: d.name,
+        reason: "no chest actor id given — nowhere to place the hoard",
+      })),
+      0,
+    );
+  }
+  if (docs.length === 0) {
+    return report(
+      [],
+      [],
+      [{ name: "(hoard)", reason: "hoard has no items and no coins — nothing to place" }],
+      0,
+    );
+  }
+
+  let created: Record<string, unknown>[];
+  try {
+    created = await live.modifyDocument("Item", "create", {
+      data: docs,
+      parentUuid: `Actor.${chestActorId}`,
+    });
+  } catch (err) {
+    const reason = err instanceof Error ? err.message : String(err);
+    return report(
+      [],
+      [],
+      docs.map((d) => ({ name: d.name, reason })),
+      0,
+    );
+  }
+
+  // Partial create: Foundry created fewer docs than requested, or a doc
+  // came back without an _id. The missing ones are failures with the
+  // counts, never silently dropped.
+  const placedItemIds: string[] = [];
+  const placedNames: string[] = [];
+  const failed: TreasurePlacementFailure[] = [];
+  let placedValueGp = 0;
+  docs.forEach((doc, i) => {
+    const id = String(
+      (created[i] as Record<string, unknown> | undefined)?._id ?? "",
+    );
+    if (id) {
+      placedItemIds.push(id);
+      placedNames.push(doc.name);
+      placedValueGp += doc.system.price.value * doc.system.quantity;
+    } else {
+      failed.push({
+        name: doc.name,
+        reason:
+          created.length <= i
+            ? `Foundry created ${created.length} of ${docs.length} items; this one was not created`
+            : "Foundry returned no _id for the created item",
+      });
+    }
+  });
+  return report(placedItemIds, placedNames, failed, placedValueGp);
+}
+
+/** Generate a hoard and fill a chest with it in one call. */
+export async function generateAndFillTreasureChest(
+  live: FoundryLive,
+  chestActorId: string,
+  opts: TreasureOptions,
+): Promise<{ hoard: TreasureHoard; placement: TreasurePlacement }> {
+  const hoard = generateTreasure(opts);
+  const placement = await fillTreasureChest(live, chestActorId, hoard);
+  return { hoard, placement };
 }

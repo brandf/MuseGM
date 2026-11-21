@@ -14,8 +14,20 @@ export {};
  *   monitor never invents stats or rolls.
  * - A GM whisper to Meroki is an instruction, not chatter: an embedded
  *   cutscene script or a named sequence ("mice and the ogre") is
- *   validated and played; a whispered build or question is answered
- *   back as a whisper. Anything else gets a whispered clarification.
+ *   STAGED — validated and resolved against a live snapshot, then a
+ *   preview goes back by whisper and the GM's one-word reply ("fire" /
+ *   "edit" / "drop") plays it, re-opens it, or discards it. Nothing
+ *   plays until the GM nods. A whispered build or question is answered
+ *   back as a whisper; a whispered rules question ("what does
+ *   flat-footed do?") is answered from the installed books, with
+ *   citations — never a fabricated ruling. Anything else gets a
+ *   whispered clarification.
+ * - Clocks (BRA-275): a GM chat line naming a clock ("start a
+ *   6-segment clock: the pursuit", "tick the ritual clock", "stop the
+ *   omen clock") starts it, ticks it, or drops it, with one
+ *   confirmation line carrying the clock's new state. Every running
+ *   clock also ticks once per new combat round, with a chat line per
+ *   tick. The clock store persists across restarts.
  * - Session modes (BRA-233): one session carries a mode — hands-on
  *   (FR-1), co-design (FR-15), improvise (FR-18) — set at startup
  *   with --mode or switched mid-session in one chat message from the
@@ -30,6 +42,7 @@ export {};
  *                              [--timeout 30] [--once] [--dry-run]
  *                              [--pack <manifest.json>] [--server-base <path>]
  *                              [--mode <hands-on|co-design|improvise>]
+ *                              [--clock-state <path>]
  *
  * Logs are JSON lines on stderr ({event, ...}); --once prints a summary
  * JSON object on stdout and exits. Ctrl-C stops the loop cleanly
@@ -51,7 +64,7 @@ function has(name: string): boolean {
 
 if (has("--help") || has("-h")) {
   process.stdout.write(
-    `usage: bun run src/cli/monitor.ts [--alias Meroki] [--debounce 3] [--timeout 30] [--once] [--dry-run] [--pack <manifest.json>] [--server-base <path>] [--mode <hands-on|co-design|improvise>]\n` +
+    `usage: bun run src/cli/monitor.ts [--alias Meroki] [--debounce 3] [--timeout 30] [--once] [--dry-run] [--pack <manifest.json>] [--server-base <path>] [--mode <hands-on|co-design|improvise>] [--clock-state <path>]\n` +
       `\n` +
       `  --alias <name>   display name in chat (default Meroki)\n` +
       `  --debounce <s>   burst-merge window per wait cycle (default 3)\n` +
@@ -64,15 +77,23 @@ if (has("--help") || has("-h")) {
       `                   co-design (FR-15, floor briefs), improvise (FR-18, mid-session\n` +
       `                   sequences). Persists across restarts; the GM can switch it\n` +
       `                   mid-session in one chat message ("take the brief from here").\n` +
+      `  --clock-state <path>  clock state file (default $FOUNDRY_CLOCK_STATE or\n` +
+      `                   .clock-state.json). Clocks persist across restarts.\n` +
       `\n` +
       `The monitor starts from the newest chat message (it never re-answers\n` +
       `history) and picks up open Meroki Pins dropped while it was offline.\n` +
       `Build requests in chat ("build an 8x6 room", "add a door", "undo\n` +
       `that") route to the build loop; ambiguous ones get a clarifying\n` +
       `question in chat, out-of-scope ones get "I can't do that yet".\n` +
-      `A GM whisper to Meroki is an instruction: paste a cutscene script\n` +
-      `or name a sequence ("mice and the ogre") and it plays; a whispered\n` +
-      `build or question is answered back as a whisper to the GM.\n`,
+      `Clock lines in chat ("start a 6-segment clock: the pursuit",\n` +
+      `"tick the ritual clock", "stop the omen clock") route to the\n` +
+      `clocks module; every running clock also ticks once per new\n` +
+      `combat round. A GM whisper to Meroki is an instruction: paste a\n` +
+      `cutscene script or name a sequence ("mice and the ogre") and it\n` +
+      `stages — the preview comes back by whisper, and "fire" plays it,\n` +
+      `"edit" re-opens it, "drop" discards it. A whispered rules\n` +
+      `question is answered from the installed books, with citations.\n` +
+      `A whispered build or question is answered back as a whisper.\n`,
   );
   process.exit(0);
 }
@@ -101,6 +122,7 @@ async function main(): Promise<void> {
   const dryRun = has("--dry-run");
   const packPath = arg("--pack");
   const serverBase = arg("--server-base");
+  const clockStatePath = arg("--clock-state");
   const mode = modeArg as "hands-on" | "co-design" | "improvise" | undefined;
 
   const live = await FoundryLive.connect();
@@ -120,6 +142,7 @@ async function main(): Promise<void> {
       packPath,
       serverBase,
       mode,
+      clockStatePath,
       shouldStop: () => stopping,
     });
     if (once) {

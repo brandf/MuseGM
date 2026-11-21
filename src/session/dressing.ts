@@ -9,10 +9,15 @@
  * one-line flavor note in chat. A human placing all of that by hand
  * would take forever; a script generates it in one pass.
  *
- * Pure functions only — no Foundry, no network. The live layer (the
- * composer hook that turns a plan into Tile + AmbientLight documents,
- * and the click handler that calls `toggleDressing`) is a later step;
- * see docs/interactive-dressing.md.
+ * Pure functions only — no Foundry, no network. The composer hook
+ * (applyDressingToSpec / layoutRoomWithDressing) runs the dressing
+ * pass per room and merges it into the spec; the pairing helper
+ * (resolveDressingPairing) pairs the created Tile and AmbientLight
+ * _ids back to their items after the live build, so the click module
+ * can find the light to flip. The one step this module does NOT do is
+ * the Foundry calls themselves (create tiles/lights, write the flags
+ * back) — that is the small live half in buildTileRoom, sketched in
+ * docs/interactive-dressing.md.
  *
  * Light language (FR-7 + the Lich's Lair lighting fix, Nov 19):
  * warm torch amber #ff9a3c, alpha 0.4. A candle is a smaller, paler
@@ -20,20 +25,27 @@
  * the light document carries the state (hidden on/off + alpha), so a
  * relight restores exactly the same light.
  *
- * Tile honesty: the pack has a torch tile ("sconce", 100px, dressing
- * layer) but NO candle or brazier tile yet. Candle and brazier items
- * carry `tile: null` + `tileNeeded` and the plan lists them in
- * `tileGaps` — the composer hook cannot build them until those tiles
- * exist, and this module never fakes a tile for them.
+ * Tile honesty: every kind has a real pack tile now — torch "sconce",
+ * candle "candle", brazier "brazier" (tiles/procedural/
+ * generate_tiles.py, 48 tiles, 0 gaps). A plan whose item has no tile
+ * still lists it in `tileGaps` and the hook skips it — never faked.
+ * The alpha gap is closed the same way: LightSpec carries an `alpha`
+ * field now (BRA-192), so the hook's lights are created with their
+ * own alpha instead of a post-create update.
  */
 import { mulberry32 } from "../worldbuilding/maze.js";
 import {
   isMazeWallCell,
+  layoutRoom,
   mazeGridsFor,
   TILE_PX,
+  type Pack,
+  type RoomLayout,
   type RoomSpec,
   type WallSide,
 } from "../worldbuilding/tiles-layout.js";
+import type { LightSpec } from "../worldbuilding/index.js";
+import type { ThemeSpec } from "../worldbuilding/themes.js";
 import { isValidHexColor } from "./lights.js";
 
 export type DressingKind = "torch" | "candle" | "brazier";
@@ -120,11 +132,11 @@ export const DRESSING_CHAT_LINES: Record<
   },
 };
 
-/** Pack tile per kind — null where the pack has no tile yet. */
-export const DRESSING_TILES: Record<DressingKind, string | null> = {
+/** Pack tile per kind — every kind has a real tile now (BRA-192). */
+export const DRESSING_TILES: Record<DressingKind, string> = {
   torch: "sconce",
-  candle: null,
-  brazier: null,
+  candle: "candle",
+  brazier: "brazier",
 };
 
 /** A room counts as large (braziers in the corners) at this size. */
@@ -179,14 +191,15 @@ function makeItem(
   state: DressingState,
 ): DressingItem {
   const preset = DRESSING_LIGHTS[kind];
-  const tile = DRESSING_TILES[kind];
+  // Every kind has a real pack tile (BRA-192) — no tileNeeded, no
+  // null. A plan carrying a null tile is a stale plan; validation
+  // rejects it rather than building around it.
   return {
     id,
     kind,
     gx,
     gy,
-    tile,
-    ...(tile === null ? { tileNeeded: kind } : {}),
+    tile: DRESSING_TILES[kind],
     placement,
     light: {
       x: gx * TILE_PX + TILE_PX / 2,
@@ -395,16 +408,20 @@ export function validateDressingPlan(plan: DressingPlan, roomSpec: RoomSpec): st
         errors.push(`Brazier ${item.id} in a ${gridW}x${gridH} room — braziers need ${BRAZIER_MIN_SIZE}x${BRAZIER_MIN_SIZE} or larger.`);
       }
     }
-    // Tile contract: torches use the sconce; candle/brazier have no
-    // tile yet and must say so (never a faked tile).
-    if (item.kind === "torch" && item.tile !== "sconce") {
-      errors.push(`Torch ${item.id} must use tile "sconce", got ${JSON.stringify(item.tile)}.`);
+    // Tile contract: every kind has a real pack tile (BRA-192) — the
+    // item must name its kind's tile and carry no tileNeeded. A null
+    // tile (or a stale tileNeeded) is a plan from before the
+    // candle/brazier tiles existed; the plan is rejected, never
+    // built around with a faked tile.
+    if (item.tile !== DRESSING_TILES[item.kind]) {
+      errors.push(
+        `${item.kind} ${item.id} must use tile "${DRESSING_TILES[item.kind]}", got ${JSON.stringify(item.tile)}.`,
+      );
     }
-    if ((item.kind === "candle" || item.kind === "brazier") && item.tile !== null) {
-      errors.push(`${item.kind} ${item.id} must have tile null (pack has no ${item.kind} tile), got ${JSON.stringify(item.tile)}.`);
-    }
-    if ((item.kind === "candle" || item.kind === "brazier") && item.tileNeeded !== item.kind) {
-      errors.push(`${item.kind} ${item.id} must record tileNeeded "${item.kind}".`);
+    if (item.tileNeeded !== undefined) {
+      errors.push(
+        `${item.kind} ${item.id} records tileNeeded "${item.tileNeeded}" — the pack has a ${item.kind} tile now, so a stale tileNeeded means a stale plan.`,
+      );
     }
     // The light itself.
     const l = item.light;
@@ -464,43 +481,231 @@ export const DRESSING_KIND_GROUP_NAME: Record<DressingKind, string> = {
 /**
  * What the composer hook adds to a RoomSpec from a plan: torch cells
  * (the `torches` shorthand), one LightSpec per item, and a dressing
- * placement per item that has a tile. Items without a tile (candle,
- * brazier until the pack has them) are left out of `dressing` and
- * listed in `skipped` — the hook must not build what it cannot draw.
+ * placement per item that has a tile. Items without a tile are left
+ * out of `dressing` and listed in `skipped` — the hook must not build
+ * what it cannot draw. (With the pack complete, `skipped` is empty;
+ * the field stays so a future pack gap fails the same loud way.)
  *
  * Each light is named for its kind (DRESSING_KIND_GROUP_NAME) — so a
  * whole kind can be addressed by name once built ("dim the
  * braziers"). The name rides the LightSpec into the room spec and is
- * stamped into the created AmbientLight's flags by `addLights`.
- *
- * Known gap: LightSpec carries no alpha (addLights hardcodes 0.5), so
- * the hook must set each light's alpha in a post-create update — see
- * docs/interactive-dressing.md.
+ * stamped into the created AmbientLight's flags by `addLights`. Each
+ * light also carries its item's `alpha` (LightSpec.alpha, BRA-192)
+ * and its `dressingId`, so the hook can pair the created _id back to
+ * the item. Each dressing placement carries the item id twice: as
+ * its prop `id` (so move/remove can address it like any prop) and as
+ * `dressingId` (so layoutRoom stamps flags.meroki.dressingId on the
+ * tile).
  */
 export function dressingToRoomSpec(plan: DressingPlan): {
   torches: { gx: number; gy: number }[];
-  lights: { x: number; y: number; dim: number; bright: number; color: string; name: string }[];
-  dressing: { tile: string; gx: number; gy: number }[];
+  lights: LightSpec[];
+  dressing: { tile: string; gx: number; gy: number; id: string; dressingId: string }[];
   skipped: string[];
 } {
   const torches = plan.items
     .filter((i) => i.kind === "torch")
     .map((i) => ({ gx: i.gx, gy: i.gy }));
-  const lights = plan.items.map((i) => ({
+  const lights: LightSpec[] = plan.items.map((i) => ({
     x: i.light.x,
     y: i.light.y,
     dim: i.light.dim,
     bright: i.light.bright,
     color: i.light.color,
+    alpha: i.light.alpha,
     name: DRESSING_KIND_GROUP_NAME[i.kind],
+    dressingId: i.id,
   }));
-  const dressing: { tile: string; gx: number; gy: number }[] = [];
+  const dressing: { tile: string; gx: number; gy: number; id: string; dressingId: string }[] = [];
   const skipped: string[] = [];
   for (const item of plan.items) {
-    if (item.tile !== null) dressing.push({ tile: item.tile, gx: item.gx, gy: item.gy });
-    else skipped.push(item.id);
+    if (item.tile !== null) {
+      dressing.push({ tile: item.tile, gx: item.gx, gy: item.gy, id: item.id, dressingId: item.id });
+    } else skipped.push(item.id);
   }
   return { torches, lights, dressing, skipped };
+}
+
+/** Options for the composer hook (layoutRoomWithDressing). */
+export interface DressingHookOptions {
+  /** planDressing options — seed, spacing, tables, braziers. */
+  plan?: PlanDressingOptions;
+  /** An explicit theme (one-word name or ThemeSpec) — passed through
+   *  to layoutRoom; with neither, the room builds in its own theme. */
+  theme?: string | ThemeSpec;
+}
+
+/**
+ * The composer hook, pure half: merge a dressing plan into a room
+ * spec and return the new spec (the input is untouched). Lights join
+ * `spec.lights` (one per item, named by kind, with its own alpha and
+ * dressingId) and dressing placements join `spec.dressing` — the
+ * existing layout path then creates the tiles and lights, and
+ * `addLights` returns the _ids in creation order, so the live half
+ * can pair each returned _id with its item (resolveDressingPairing).
+ *
+ * Throws, listing every problem, when the plan is invalid for this
+ * room, when it names another room, or when it still has tile gaps —
+ * a plan that cannot build is never merged silently. Also throws when
+ * a dressing item id collides with a prop id the room already has.
+ */
+export function applyDressingToSpec(
+  spec: RoomSpec,
+  plan: DressingPlan,
+): { spec: RoomSpec; items: DressingItem[] } {
+  const errors = validateDressingPlan(plan, spec);
+  if (plan.tileGaps.length > 0) {
+    errors.push(
+      `Plan has tile gaps: ${plan.tileGaps.join(", ")} — generate the pack tiles first, the hook never builds what it cannot draw.`,
+    );
+  }
+  if (errors.length > 0) {
+    throw new Error(`Cannot dress room "${spec.name}": ${errors.join(" ")}`);
+  }
+  const existingIds = new Set((spec.dressing ?? []).map((p) => p.id).filter((id): id is string => !!id));
+  for (const item of plan.items) {
+    if (existingIds.has(item.id)) {
+      throw new Error(
+        `Cannot dress room "${spec.name}": dressing item "${item.id}" collides with a prop id the room already has.`,
+      );
+    }
+  }
+  const { lights, dressing } = dressingToRoomSpec(plan);
+  // NOTE: torches are NOT merged into spec.torches. The plan's torch
+  // lights are already in `lights` — merging the shorthand too would
+  // give every torch two lights (one theme torch from the shorthand,
+  // one named dressing light). dressingToRoomSpec still returns the
+  // torch cells for callers that need positions without lights.
+  return {
+    spec: {
+      ...spec,
+      lights: [...(spec.lights ?? []), ...lights],
+      dressing: [...(spec.dressing ?? []), ...dressing],
+    },
+    items: plan.items,
+  };
+}
+
+/**
+ * Run the dressing pass per room and lay it out: planDressing, merge
+ * into the spec, layoutRoom. One call is the whole composer hook —
+ * the caller (buildTileRoom, the floor planner, a CLI) builds the
+ * returned layout, then pairs the created ids with
+ * resolveDressingPairing. Pure — no Foundry, no network.
+ */
+export function layoutRoomWithDressing(
+  spec: RoomSpec,
+  pack: Pack,
+  serverBase: string,
+  opts: DressingHookOptions = {},
+): { plan: DressingPlan; spec: RoomSpec; layout: RoomLayout } {
+  const plan = planDressing(spec, opts.plan ?? {});
+  const { spec: dressed } = applyDressingToSpec(spec, plan);
+  return { plan, spec: dressed, layout: layoutRoom(dressed, pack, serverBase, opts.theme) };
+}
+
+/** One dressing item, fully built: its tile _id and its light _id. */
+export interface DressingPair {
+  itemId: string;
+  tileId: string;
+  lightId: string;
+  /**
+   * The flag record the live half writes onto the tile:
+   * flags.meroki = { dressingId, lightId, kind, alpha } — the whole
+   * record the click module needs, so a tile built before the module
+   * existed still toggles once its flag is completed.
+   */
+  tileFlags: { dressingId: string; lightId: string; kind: DressingKind; alpha: number };
+}
+
+/** The flag scope the dressing tiles carry. */
+export const DRESSING_FLAG_SCOPE = "meroki";
+
+/** Read the dressing id a layout tile carries, or null. */
+function tileDressingId(tile: RoomLayout["tiles"][number]): string | null {
+  const scope = tile.flags?.[DRESSING_FLAG_SCOPE];
+  if (typeof scope !== "object" || scope === null) return null;
+  const id = (scope as Record<string, unknown>).dressingId;
+  return typeof id === "string" && id.length > 0 ? id : null;
+}
+
+/**
+ * Pair the created ids back to their items, after the live build.
+ * `tileIds` / `lightIds` are the _ids buildTileRoom returned, in
+ * layout order (tileIds[i] is layout.tiles[i]'s _id, lightIds[i] is
+ * layout.lights[i]'s). The join key is the dressing id: layout tiles
+ * carry it in flags.meroki.dressingId, layout lights carry it in
+ * LightSpec.dressingId.
+ *
+ * Returns every pair plus every problem found (empty = fully paired)
+ * — a tile without a light, a light without a tile, a duplicate
+ * dressing id, or an id array that does not line up with its layout
+ * array. Never pairs by position alone and never silently drops an
+ * item: the live half throws when errors is non-empty. The caller
+ * also needs the plan for the kind/alpha in tileFlags — pass it in.
+ */
+export function resolveDressingPairing(
+  plan: DressingPlan,
+  layout: RoomLayout,
+  tileIds: string[],
+  lightIds: string[],
+): { pairs: DressingPair[]; errors: string[] } {
+  const errors: string[] = [];
+  if (tileIds.length !== layout.tiles.length) {
+    errors.push(
+      `tileIds has ${tileIds.length} entries for ${layout.tiles.length} layout tiles — the build did not return one _id per tile.`,
+    );
+  }
+  if (lightIds.length !== layout.lights.length) {
+    errors.push(
+      `lightIds has ${lightIds.length} entries for ${layout.lights.length} layout lights — the build did not return one _id per light.`,
+    );
+  }
+  const byId = new Map(plan.items.map((i) => [i.id, i]));
+  const tileByItem = new Map<string, string>();
+  for (let i = 0; i < layout.tiles.length; i++) {
+    const dressingId = tileDressingId(layout.tiles[i]);
+    if (!dressingId) continue;
+    if (!byId.has(dressingId)) {
+      errors.push(`Layout tile ${i} carries dressingId "${dressingId}", which is not an item in this plan.`);
+      continue;
+    }
+    if (tileByItem.has(dressingId)) {
+      errors.push(`Two layout tiles carry dressingId "${dressingId}" — one item, one tile.`);
+      continue;
+    }
+    tileByItem.set(dressingId, tileIds[i] ?? "");
+  }
+  const lightByItem = new Map<string, string>();
+  for (let i = 0; i < layout.lights.length; i++) {
+    const dressingId = layout.lights[i].dressingId;
+    if (!dressingId) continue;
+    if (!byId.has(dressingId)) {
+      errors.push(`Layout light ${i} carries dressingId "${dressingId}", which is not an item in this plan.`);
+      continue;
+    }
+    if (lightByItem.has(dressingId)) {
+      errors.push(`Two layout lights carry dressingId "${dressingId}" — one item, one light.`);
+      continue;
+    }
+    lightByItem.set(dressingId, lightIds[i] ?? "");
+  }
+  const pairs: DressingPair[] = [];
+  for (const item of plan.items) {
+    const tileId = tileByItem.get(item.id);
+    const lightId = lightByItem.get(item.id);
+    if (!tileId) errors.push(`Item ${item.id} (${item.kind}) has no tile in the layout — its tile was not built.`);
+    if (!lightId) errors.push(`Item ${item.id} (${item.kind}) has no light in the layout — its light was not built.`);
+    if (tileId && lightId) {
+      pairs.push({
+        itemId: item.id,
+        tileId,
+        lightId,
+        tileFlags: { dressingId: item.id, lightId, kind: item.kind, alpha: item.light.alpha },
+      });
+    }
+  }
+  return { pairs, errors };
 }
 
 /** One-line summary per item, for the CLI and the chat. */

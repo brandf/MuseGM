@@ -108,15 +108,15 @@ const tilePath = (name: string) =>
   path.resolve(import.meta.dir, "../tiles", manifest.tiles.find((t) => t.name === name)!.file);
 
 describe("the three-kind pack", () => {
-  it("is 46 tiles: 28 base + 14 props + 4 macro, 0 gaps", () => {
-    expect(manifest.tiles).toHaveLength(46);
+  it("is 48 tiles: 28 base + 16 props + 4 macro, 0 gaps", () => {
+    expect(manifest.tiles).toHaveLength(48);
     expect(manifest.gaps).toHaveLength(0);
-    expect(pack.size).toBe(46);
+    expect(pack.size).toBe(48);
     const kinds = manifest.tiles.reduce<Record<string, number>>((acc, t) => {
       acc[t.kind] = (acc[t.kind] ?? 0) + 1;
       return acc;
     }, {});
-    expect(kinds).toEqual({ base: 28, prop: 14, macro: 4 });
+    expect(kinds).toEqual({ base: 28, prop: 16, macro: 4 });
   });
 
   it("every entry has a kind, a real PNG on disk at its declared square size", () => {
@@ -184,7 +184,7 @@ describe("macro pieces in the composer", () => {
 
   it("every dressing tile is in listPropTiles", () => {
     const props = listPropTiles(pack);
-    expect(props).toHaveLength(18);
+    expect(props).toHaveLength(20);
     for (const entry of manifest.tiles) {
       if (entry.layer === "dressing") expect(props).toContain(entry.name);
     }

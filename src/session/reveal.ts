@@ -11,11 +11,13 @@
  * Two delivery modes, one step:
  *   - "chat": the image posts inline in a chat message (an <img> in
  *     the message HTML — Foundry renders it in the chat log).
- *   - "popout": the nicer screen popup. NOT reachable from the MCP
- *     path — opening client UI needs a client-side module, which does
- *     not exist yet. A popout step is accepted by validation but the
- *     live handler falls back to the chat post and says so in the step
- *     result, so a script never silently pretends a popup happened.
+ *   - "popout": the nicer screen popup, via the meroki-reveal client
+ *     module (modules/meroki-reveal/): the live handler emits a
+ *     module-socket message and the module pops the image full-screen
+ *     on every connected client. The chat post still happens first —
+ *     it is the degraded path for a player without the module, so a
+ *     reveal is never nothing. If the socket emit fails, the step
+ *     result reports popout:false and the reason.
  *
  * Verified vs live: the prompt builder, the validation, and the HTML
  * are pure and unit-tested here. Whether Foundry renders the inline

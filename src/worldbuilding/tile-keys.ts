@@ -56,12 +56,15 @@ export function parseTileEmbedKey(
   return { buildKey: m[1], kind: m[2] as TileEmbedKind, index: Number(m[3]) };
 }
 
-/** One embed on the scene that carries a tile-room key. Tiles also
- *  carry their match fields (position + look, read from the raw doc),
+/** One embed on the scene that carries a tile-room key. Tiles carry
+ *  their match fields (position + look, read from the raw doc),
  *  which is what converge matches on — flat layout indices shift
  *  whenever the layout changes (a widen, a re-skin), so an index is
- *  not an identity. Walls and lights are still matched by index;
- *  their shift bug is a BRA-202 follow-up, not this item. */
+ *  not an identity. Walls and lights carry theirs too (BRA-243):
+ *  a wall's endpoints + door flag, a light's position + config +
+ *  name. Fields a doc does not carry (or carries with the wrong
+ *  type) are simply absent — such an embed matches nothing and is
+ *  deleted + recreated, the safe convergent choice. */
 export interface KeyedEmbed {
   key: string;
   id: string;
@@ -71,6 +74,21 @@ export interface KeyedEmbed {
   y?: number;
   src?: string;
   rotation?: number;
+  /** Walls: segment endpoints (canonical order — the smaller end
+   *  first) + door flag (0 plain, 1 door, 2 secret). */
+  x1?: number;
+  y1?: number;
+  x2?: number;
+  y2?: number;
+  door?: number;
+  /** Lights: config radii + angle/color/alpha, and the display name
+   *  (flags["foundry-live"].lightName, FR-7) when the light has one. */
+  dim?: number;
+  bright?: number;
+  angle?: number;
+  color?: string;
+  alpha?: number;
+  name?: string;
 }
 
 /** What a raw scene doc says about one keyed build's embeds. */
@@ -121,9 +139,14 @@ export function extractTileRoomEmbeds(scene: unknown): TileRoomEmbeds {
       // field is only attached when the doc actually carries it with
       // the right type — a malformed doc matches nothing and is
       // deleted + recreated, which is the safe convergent choice.
+      // Walls and lights carry theirs the same way (BRA-243): a
+      // wall's `c` endpoints + `door` flag, a light's position +
+      // `config` + display name. Deliberately NOT matched: a wall's
+      // `ds` (door state — the GM opening a door must not read as a
+      // changed wall) and a light's `hidden` (state, not look).
+      const raw = entry as Record<string, unknown>;
+      const num = (v: unknown): number | undefined => (typeof v === "number" ? v : undefined);
       if (field === "tiles") {
-        const raw = entry as Record<string, unknown>;
-        const num = (v: unknown): number | undefined => (typeof v === "number" ? v : undefined);
         const sort = num(raw["sort"]);
         const elevation = num(raw["elevation"]);
         const x = num(raw["x"]);
@@ -142,6 +165,47 @@ export function extractTileRoomEmbeds(scene: unknown): TileRoomEmbeds {
         if (y !== undefined) embed.y = y;
         if (rotation !== undefined) embed.rotation = rotation;
         if (src !== undefined) embed.src = src;
+      } else if (field === "walls") {
+        const c = raw["c"];
+        if (
+          Array.isArray(c) &&
+          c.length === 4 &&
+          c.every((v) => typeof v === "number")
+        ) {
+          const [ax, ay, bx, by] = c as number[];
+          // Canonical endpoint order (the smaller end first) — a
+          // wall is an undirected segment, so a doc that lists the
+          // ends the other way round is the same wall.
+          const [x1, y1, x2, y2] =
+            ax < bx || (ax === bx && ay <= by) ? [ax, ay, bx, by] : [bx, by, ax, ay];
+          embed.x1 = x1;
+          embed.y1 = y1;
+          embed.x2 = x2;
+          embed.y2 = y2;
+        }
+        const door = num(raw["door"]);
+        if (door !== undefined) embed.door = door;
+      } else if (field === "lights") {
+        const x = num(raw["x"]);
+        const y = num(raw["y"]);
+        if (x !== undefined) embed.x = x;
+        if (y !== undefined) embed.y = y;
+        const config = raw["config"];
+        if (typeof config === "object" && config !== null) {
+          const cfg = config as Record<string, unknown>;
+          const dim = num(cfg["dim"]);
+          const bright = num(cfg["bright"]);
+          const angle = num(cfg["angle"]);
+          const alpha = num(cfg["alpha"]);
+          const color = typeof cfg["color"] === "string" ? (cfg["color"] as string) : undefined;
+          if (dim !== undefined) embed.dim = dim;
+          if (bright !== undefined) embed.bright = bright;
+          if (angle !== undefined) embed.angle = angle;
+          if (alpha !== undefined) embed.alpha = alpha;
+          if (color !== undefined) embed.color = color;
+        }
+        const lightName = scope?.[FLAG_FIELDS.lightName];
+        if (typeof lightName === "string" && lightName.length > 0) embed.name = lightName;
       }
       out.push(embed);
     }
@@ -173,13 +237,93 @@ export interface PlannedTile {
   rotation: number;
 }
 
-/** Planned embeds for one room layout: the tiles themselves (matched
- *  by position + look), and the wall/light counts (matched by index,
- *  as before). */
+/** One wall the layout wants, for converge matching: endpoints +
+ *  door flag. A wall matches a scene embed only when every field
+ *  agrees — a wall that moved, or gained a door, is a different wall. */
+export interface PlannedWall {
+  x1: number;
+  y1: number;
+  x2: number;
+  y2: number;
+  /** 0 = plain wall, 1 = door, 2 = secret door. */
+  door: number;
+}
+
+/**
+ * Normalize a layout wall into its converge form: the door flag
+ * defaults to 0, and the endpoints are ordered canonically (the
+ * smaller end first) — a wall is an undirected segment, so a layout
+ * that lists the ends the other way round is the same wall.
+ */
+export function plannedWallOf(w: {
+  x1: number;
+  y1: number;
+  x2: number;
+  y2: number;
+  door?: number;
+}): PlannedWall {
+  const [x1, y1, x2, y2] =
+    w.x1 < w.x2 || (w.x1 === w.x2 && w.y1 <= w.y2)
+      ? [w.x1, w.y1, w.x2, w.y2]
+      : [w.x2, w.y2, w.x1, w.y1];
+  return { x1, y1, x2, y2, door: w.door ?? 0 };
+}
+
+/** One light the layout wants, for converge matching: position +
+ *  config + name. A light matches a scene embed only when every
+ *  field agrees — two lights at the same cell with different names
+ *  are different lights. */
+export interface PlannedLight {
+  x: number;
+  y: number;
+  dim: number;
+  bright: number;
+  angle: number;
+  color: string;
+  alpha: number;
+  /** Display name (FR-7 group name) when the light has one. */
+  name?: string;
+}
+
+/**
+ * Normalize a layout light into its converge form: the Foundry
+ * defaults `lightCreateData` applies (angle 360, warm amber
+ * #ff9a3c, alpha 0.5) and a blank name is no name. A dressingId is
+ * deliberately NOT a match field — it is a build-time marker that
+ * never reaches the Foundry doc, so converge cannot read it back;
+ * two dressing lights at one cell with the same config and name tie
+ * on position + look, and the tie rule in planTileRoomConverge
+ * (an error, not a silent duplicate) applies to them.
+ */
+export function plannedLightOf(l: {
+  x: number;
+  y: number;
+  dim: number;
+  bright: number;
+  angle?: number;
+  color?: string;
+  alpha?: number;
+  name?: string;
+}): PlannedLight {
+  const name = typeof l.name === "string" && l.name.trim().length > 0 ? l.name.trim() : undefined;
+  return {
+    x: l.x,
+    y: l.y,
+    dim: l.dim,
+    bright: l.bright,
+    angle: l.angle ?? 360,
+    color: l.color ?? "#ff9a3c",
+    alpha: l.alpha ?? 0.5,
+    ...(name !== undefined ? { name } : {}),
+  };
+}
+
+/** Planned embeds for one room layout: tiles, walls and lights, all
+ *  matched by position + look, never by flat layout index. */
 export interface PlannedEmbeds {
   tiles: PlannedTile[];
-  walls: number;
-  lights: number;
+  walls: PlannedWall[];
+  lights: PlannedLight[];
 }
 
 /** What a keyed re-run must do to converge the scene to the plan. */
@@ -210,12 +354,30 @@ export interface TileRoomConvergePlan {
  * all — are never touched: the GM's hand-placed walls are not ours
  * to delete.
  *
- * Tiles match by position + look (sort, elevation, x, y, texture
- * src, rotation), never by flat layout index: a widen or a re-skin
- * shifts the indices of everything after it, and index matching
- * would keep a prop tile where a wall tile now belongs (ghost prop,
- * missing wall). Walls and lights still match by index — their shift
- * bug is a BRA-202 follow-up, not this item.
+ * Tiles, walls and lights all match by position + look, never by
+ * flat layout index: a widen or a re-skin shifts the indices of
+ * everything after it, and index matching would keep a prop tile
+ * where a wall tile now belongs (ghost prop, missing wall — the
+ * BRA-218 regression), or keep a wall where a door now belongs.
+ * Walls match on endpoints + door flag; lights on position +
+ * config + name.
+ *
+ * The per-embed key is the primary match AMONG field matches: when
+ * several present embeds match one planned slot on position + look
+ * (a crash duplicate left behind by a partial build), the one whose
+ * key index is this planned index wins. A key alone never keeps an
+ * embed — an embed whose key index agrees but whose fields do not
+ * is in the wrong place or of the wrong look, and is surplus. That
+ * is the only safe reading of "key first": key-over-fields would
+ * reintroduce the shift bug this matching exists to fix.
+ *
+ * A tie between two PLANNED slots is an error, not a silent
+ * duplicate: when a planned wall/light has field-matching present
+ * embeds but every one is already claimed by an earlier planned
+ * slot, creating it would duplicate the embed already on the scene,
+ * so the plan throws, listing the tied candidates. Two identical
+ * planned walls or lights are a spec/layout bug — give them
+ * different positions, looks, or names.
  */
 export function planTileRoomConverge(
   planned: PlannedEmbeds,
@@ -256,40 +418,75 @@ export function planTileRoomConverge(
     }
     return { create, deleteIds, keep };
   };
-  const planKind = (
-    count: number,
+  /**
+   * Match one kind (walls or lights) by position + look. The
+   * `matches` predicate compares every match field; `describe`
+   * renders a planned slot for the tie error. Duplicates on the
+   * scene side are surplus (the first field match wins, the rest
+   * are deleted, as for tiles); duplicates on the plan side throw.
+   */
+  const planMatched = <T>(
+    items: T[],
     presentList: KeyedEmbed[],
+    kind: "wall" | "light",
+    matches: (e: KeyedEmbed, p: T) => boolean,
+    describe: (p: T) => string,
   ): { create: number[]; deleteIds: string[]; keep: (string | null)[] } => {
-    const byIndex = new Map<number, string>();
-    const deleteIds: string[] = [];
-    for (const { key, id } of presentList) {
-      const parsed = parseTileEmbedKey(key);
-      if (!parsed || parsed.buildKey !== buildKey) continue;
-      if (parsed.index < count && !byIndex.has(parsed.index)) {
-        byIndex.set(parsed.index, id);
-      } else {
-        // Same key, past the plan's end (spec shrank) — or a
-        // duplicate index, which a previous partial failure left
-        // behind. Either way it is surplus to this plan.
-        deleteIds.push(id);
-      }
-    }
+    const fieldMatches = (p: T): KeyedEmbed[] =>
+      presentList.filter((e) => {
+        const parsed = parseTileEmbedKey(e.key);
+        return parsed !== null && parsed.buildKey === buildKey && parsed.kind === kind && matches(e, p);
+      });
+    const used = new Set<string>();
     const create: number[] = [];
     const keep: (string | null)[] = [];
-    for (let i = 0; i < count; i++) {
-      const id = byIndex.get(i);
-      if (id === undefined) {
+    for (let i = 0; i < items.length; i++) {
+      const candidates = fieldMatches(items[i]).filter((e) => !used.has(e.id));
+      if (candidates.length === 0) {
+        const tied = fieldMatches(items[i]);
+        if (tied.length > 0) {
+          throw new Error(
+            `Converge tie: planned ${kind} ${i} (${describe(items[i])}) matches ${tied.length} embed(s) already claimed by earlier planned ${kind}s (${tied.map((e) => e.id).join(", ")}) — two identical ${kind}s cannot both live on the scene. Give them different positions, looks, or names.`,
+          );
+        }
         create.push(i);
         keep.push(null);
-      } else {
-        keep.push(id);
+        continue;
       }
+      // Key-first among field matches (see the docstring above):
+      // the embed whose key index is this planned index wins over a
+      // crash duplicate. Field agreement is still required.
+      const byKey = candidates.find((e) => parseTileEmbedKey(e.key)?.index === i);
+      const match = byKey ?? candidates[0];
+      used.add(match.id);
+      keep.push(match.id);
+    }
+    const deleteIds: string[] = [];
+    for (const e of presentList) {
+      const parsed = parseTileEmbedKey(e.key);
+      if (!parsed || parsed.buildKey !== buildKey || parsed.kind !== kind) continue;
+      if (!used.has(e.id)) deleteIds.push(e.id);
     }
     return { create, deleteIds, keep };
   };
   const tiles = planTiles(planned.tiles, present.tiles);
-  const walls = planKind(planned.walls, present.walls);
-  const lights = planKind(planned.lights, present.lights);
+  const walls = planMatched(
+    planned.walls,
+    present.walls,
+    "wall",
+    (e, w) => e.x1 === w.x1 && e.y1 === w.y1 && e.x2 === w.x2 && e.y2 === w.y2 && e.door === w.door,
+    (w) => `(${w.x1},${w.y1})-(${w.x2},${w.y2}) door=${w.door}`,
+  );
+  const lights = planMatched(
+    planned.lights,
+    present.lights,
+    "light",
+    (e, l) =>
+      e.x === l.x && e.y === l.y && e.dim === l.dim && e.bright === l.bright &&
+      e.angle === l.angle && e.color === l.color && e.alpha === l.alpha &&
+      (e.name ?? undefined) === (l.name ?? undefined),
+    (l) => `(${l.x},${l.y}) dim=${l.dim} bright=${l.bright} color=${l.color} alpha=${l.alpha}${l.name ? ` name="${l.name}"` : ""}`,
+  );
   return {
     createTiles: tiles.create,
     createWalls: walls.create,

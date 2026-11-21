@@ -8,8 +8,14 @@ into a room that is the love nest room"*, and Meroki builds it.
 
 - Adds a **Meroki Pin** toggle tool to the **Notes** toolbar (left side of
   the screen, the map-notes group).
+- Right-click the canvas and pick **Drop a Meroki Pin here** from the
+  context menu — the dialog opens at the right-clicked spot. Right-click
+  still pings as usual; the menu is an extra entry, not a replacement.
 - Click the tool, click the map, type the request. A gold map pin appears
   at that spot, backed by a journal entry named `Meroki Pin: <first words>`.
+- After a pin is placed from the toolbar tool, the tool disarms and the
+  controls switch back to the Notes tool automatically. A pin dropped
+  from the context menu leaves the controls alone (nothing was armed).
 - The journal entry's page holds the request text. Both the entry and the
   pin carry `flags.meroki.request`, so Muse can find them.
 - Muse (the Meroki monitor, running outside Foundry) watches for new pins,
@@ -63,31 +69,50 @@ the entry and the pin (and may append its reply to the journal page).
 A pin with `status: "done"` is finished; dropping a new pin starts a new
 request. Muse never edits the request text itself.
 
-## Known rough edges (v1, untested live yet)
+## Known rough edges (v1.1, untested live yet)
 
 - **Live install/test is pending** — this was built offline while Dave's
   Foundry was down. First install needs a live check: drop a test pin,
   confirm the pin + journal entry land, and confirm the monitor sees the
-  broadcast. See BACKLOG.md.
-- **Right-click menu is v1.1.** The original idea was a right-click
-  context-menu entry on the canvas, but right-click is already ping/pan
-  and the v14 `ContextMenu` API could not be verified offline. The
-  toolbar tool is the v1 path; the menu entry gets added once the API is
-  verified against the 14.370 client bundle.
+  broadcast. See BACKLOG.md. The live checklist for v1.1:
+  - Right-click the canvas: the menu opens AND the ping still pulses.
+  - The menu entry opens the dialog at the right-clicked spot (coords).
+  - Drop Pin from the toolbar tool: the toggle visually switches off
+    and the controls go back to the Notes tool.
+  - Drop Pin from the menu: the controls do NOT switch (nothing was
+    armed, nothing to disarm).
+  - `DialogV2.wait` resolves as documented (drop → entry id, cancel →
+    "cancel", X/Esc → null, empty text → warning + no pin).
+  - The menu entry is hidden when no scene is active.
+- **Right-click menu + DialogV2 verified against docs, not the bundle.**
+  The 14.370 client bundle is not on disk on the build VM, so the
+  `ContextMenu` constructor shape, the `DialogV2.wait` button-callback
+  signature, and `ui.controls.activate` were verified against the
+  official Foundry VTT v14 API docs and the
+  `@league-of-foundry-developers/foundry-vtt-types` 13.346 type
+  definitions (both read 2026-11-21; details in the script header).
+  The offline test suite (`tests/meroki-pins-module.test.ts`, 17 checks)
+  verifies the module's wiring against stubbed globals with those exact
+  shapes — it cannot verify Foundry's side. If the live checks above
+  fail, the failure is in the docs-vs-bundle gap, not the wiring.
 - **Core note dialog may also open.** If the Notes tool itself is the
   active tool when you arm the pin, Foundry may open its own note dialog
   on the same click. Just close it — the Meroki pin is still created.
   Arming from the Select tool avoids it entirely.
-- **Dialog is V1.** The pin dialog uses Foundry's V1 `Dialog` (deprecated
-  but still shipped in v14). Migrating to `DialogV2` is a v1.1 item once
-  its button-callback signature is verified against the bundle.
-- **Tool stays armed visually.** After a pin is placed, switch tools
-  manually — v1 does not programmatically switch the active tool back.
+- **Empty text closes the dialog.** Clicking Drop Pin with an empty
+  request warns and closes the dialog (a DialogV2 button submits on
+  click; a callback cannot veto closing). Same behavior as the old V1
+  dialog. Just drop a new pin.
+- **Dialog is DialogV2.** The pin dialog uses
+  `foundry.applications.api.DialogV2.wait` since v1.1. If DialogV2 is
+  missing (older Foundry than 14), the module shows an error instead of
+  opening the dialog — there is no V1 fallback.
 
 ## Files
 
-- `module.json` — manifest (id `meroki-pins`, version 0.1.0, core 14).
-- `scripts/meroki-pins.js` — the whole module: toolbar tool, one-shot
-  click-to-place, dialog, JournalEntry + Note creation. API
-  uncertainties are marked inline as VERIFIED vs ASSUMED.
+- `module.json` — manifest (id `meroki-pins`, version 0.2.0, core 14).
+- `scripts/meroki-pins.js` — the whole module: toolbar tool, context-menu
+  entry, one-shot click-to-place, DialogV2 dialog, JournalEntry + Note
+  creation, tool switch-back after placement. API uncertainties are
+  marked inline as VERIFIED vs ASSUMED.
 - `README.md` — this file.

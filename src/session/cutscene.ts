@@ -131,7 +131,7 @@ export interface CutsceneScript {
 
 const SEQUENCE_KINDS = new Set([
   "place", "deleteToken", "move", "pause", "chat", "roll", "damage", "heal", "effect",
-  "ping", "cursor", "waitChat", "face", "light", "prop", "reveal", "wait", "swapTile",
+  "ping", "cursor", "waitChat", "face", "light", "prop", "reveal", "dismissReveal", "wait", "swapTile",
   "waitRound", "lightsOut", "breakWall",
 ]);
 
@@ -160,6 +160,7 @@ const STEP_FIELDS: Record<string, Set<string>> = {
   light: new Set(["kind", "sceneId", "light", "dim", "bright", "color", "alpha", "durationMs", "steps", "from", "note"]),
   prop: new Set(["kind", "sceneId", "src", "x", "y", "width", "height", "rotation", "elevation", "sort", "alpha", "hidden", "key", "note"]),
   reveal: new Set(["kind", "what", "id", "sceneId", "image", "caption", "mode", "alias", "note"]),
+  dismissReveal: new Set(["kind", "id", "note"]),
   wait: new Set(["kind", "timeout", "debounce", "match", "note"]),
   swapTile: new Set(["kind", "sceneId", "tile", "cell", "to", "note"]),
   formation: new Set(["kind", "shape", "count", "actor", "center", "from", "to", "apex", "directionDeg", "spreadDeg", "spacing", "radius", "enterFrom", "speed", "staggerMs", "namePrefix", "prop", "sceneId", "note"]),
@@ -326,13 +327,41 @@ export function validateCutscene(
           numField(errors, raw, i, "y", { required: true });
         }
         break;
-      case "light":
-        if (!isRecord(raw.light) || (!("id" in raw.light) && !("at" in raw.light))) {
-          errors.push(`Step ${i} (light): "light" must be {id} or {at: {x, y}}.`);
-        } else if ("at" in raw.light && !isPoint(raw.light.at)) {
-          errors.push(`Step ${i} (light): "light.at" must be {x, y}.`);
-        } else if ("id" in raw.light && typeof raw.light.id !== "string") {
-          errors.push(`Step ${i} (light): "light.id" must be a string.`);
+      case "light": {
+        // BRA-239: the selector is exactly one of {id}, {at}, {name}.
+        // A name addresses a GROUP (BRA-197) — the player animates
+        // it via animateNamedLights, from each light's current state.
+        // A single `from` cannot describe a group in different
+        // states, so `from` + `name` is rejected here (and in the
+        // player, for direct runSequence callers).
+        const l = raw.light;
+        if (!isRecord(l)) {
+          errors.push(`Step ${i} (light): "light" must be {id}, {at: {x, y}}, or {name}.`);
+        } else {
+          for (const key of Object.keys(l)) {
+            if (key !== "id" && key !== "at" && key !== "name") {
+              errors.push(`Step ${i} (light): unknown selector field "${key}" (want exactly one of id, at, name).`);
+            }
+          }
+          const present = (["id", "at", "name"] as const).filter((k) => k in l);
+          if (present.length === 0) {
+            errors.push(`Step ${i} (light): "light" must be {id}, {at: {x, y}}, or {name}.`);
+          } else if (present.length > 1) {
+            errors.push(
+              `Step ${i} (light): give exactly one of "id", "at", or "name", not ${present.map((p) => `"${p}"`).join(" + ")}.`,
+            );
+          } else if (present[0] === "at" && !isPoint(l.at)) {
+            errors.push(`Step ${i} (light): "light.at" must be {x, y}.`);
+          } else if (present[0] === "id" && (typeof l.id !== "string" || l.id.length === 0)) {
+            errors.push(`Step ${i} (light): "light.id" must be a non-empty string.`);
+          } else if (present[0] === "name" && (typeof l.name !== "string" || l.name.trim().length === 0)) {
+            errors.push(`Step ${i} (light): "light.name" must be a non-empty string.`);
+          }
+          if (present[0] === "name" && raw.from !== undefined) {
+            errors.push(
+              `Step ${i} (light): a named light step animates from each light's current state — "from" does not apply to a group.`,
+            );
+          }
         }
         numField(errors, raw, i, "dim", { min: 0 });
         numField(errors, raw, i, "bright", { min: 0 });
@@ -343,6 +372,7 @@ export function validateCutscene(
         numField(errors, raw, i, "durationMs", { min: 1 });
         numField(errors, raw, i, "steps", { min: 1, integer: true });
         break;
+      }
       case "prop":
         strField(errors, raw, i, "src", true);
         numField(errors, raw, i, "x", { required: true });
@@ -383,6 +413,11 @@ export function validateCutscene(
         }
         break;
       }
+      case "dismissReveal":
+        // BRA-236: close the popout on every client. `id` names one
+        // popout; omitted = close whatever is open.
+        strField(errors, raw, i, "id");
+        break;
       case "swapTile": {
         const hasTile = typeof raw.tile === "string" && raw.tile.length > 0;
         const hasCell = isPoint(raw.cell);
@@ -850,6 +885,12 @@ export interface PlayCutsceneResult extends SequenceResult {
  * expand formations (token centers resolve against live scene state),
  * then run the timeline through runSequence. Returns the per-step log.
  *
+ * Named light steps ({name}) animate the whole group from each
+ * light's current state (BRA-239). When `opts.roomSpec` is given,
+ * played `prop` steps are recorded into that spec via placeProp
+ * (BRA-242) and handed back through `onSpec` — without it, props
+ * play but do not survive a rebuild.
+ *
  * This is the implicit stage-first path: playing an unstaged script
  * stages it inline (validate + expand + resolve) before anything
  * moves. The explicit gate is src/session/staging.ts — stage the
@@ -875,6 +916,7 @@ export async function playCutscene(
     continueOnError: opts.continueOnError,
     onStep: opts.onStep,
     runKey: opts.runKey,
+    roomSpec: opts.roomSpec,
   });
   return { ...result, name: script.name, expandedSteps: steps.length };
 }

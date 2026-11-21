@@ -278,6 +278,339 @@ describe("parseBuildRequest — dressing, fog, overlay, corridor", () => {
   });
 });
 
+// ---------------------------------------------------------------- move / remove props (BRA-241)
+
+describe("parseBuildRequest + applyOp — move / remove props (BRA-241)", () => {
+  /** The pack with real layers: moveProp validates the spec, and a
+   *  dressing placement must name a dressing-layer tile. */
+  function propPack(): Pack {
+    const dressing = new Set([
+      "rubble", "bones", "pillar", "sconce", "ritual-circle", "spear", "skeleton", "chest", "altar",
+    ]);
+    const atmosphere = new Set(["fog-wisp-small", "fog-wisp-large", "fog-pool"]);
+    const defs: [string, number][] = [
+      ["floor-plain", 100], ["floor-cracked", 100], ["floor-rubble", 100], ["floor-dark", 100],
+      ["wall-straight", 100], ["wall-corner", 100], ["wall-door", 100],
+      ["fog-wisp-small", 200], ["fog-wisp-large", 400], ["fog-pool", 400],
+      ["rubble", 200], ["bones", 200], ["pillar", 200], ["sconce", 100],
+      ["ritual-circle", 200], ["spear", 200], ["skeleton", 200], ["chest", 200], ["altar", 200],
+    ];
+    const tiles = defs.map(([name, sizePx]) => ({
+      name,
+      file: `pack/${name}.png`,
+      sizePx,
+      layer: (dressing.has(name)
+        ? "dressing"
+        : atmosphere.has(name)
+          ? "atmosphere"
+          : "floor") as "floor" | "dressing" | "atmosphere",
+      tags: [] as string[],
+    }));
+    return packFromManifest({ version: 1, tilePx: 100, tiles, gaps: [] });
+  }
+
+  const PROP_PACK = propPack();
+
+  /** 8x6 Entry Hall: chest in the SE corner, bones in the SW and NE
+   *  corners — two of a kind, so every disambiguation rule is
+   *  exercised. */
+  const PROP_ROOM = room({
+    dressing: [
+      { tile: "chest", gx: 6, gy: 4 },
+      { tile: "bones", gx: 0, gy: 4 },
+      { tile: "bones", gx: 6, gy: 0 },
+    ],
+  });
+  const PROP_CTX: BuildParseContext = {
+    room: PROP_ROOM,
+    rooms: [{ ...PROP_ROOM, id: "entry-hall" }],
+  };
+
+  it("move the chest to the middle", () => {
+    const r = buildOf(parseBuildRequest("move the chest to the middle", PROP_CTX));
+    expect(r.op).toEqual({
+      type: "move-prop",
+      tile: "chest",
+      from: { gx: 6, gy: 4 },
+      to: { kind: "center" },
+    });
+  });
+
+  it("move the bones to the middle asks — the middle is equally far from both", () => {
+    const r = parseBuildRequest("move the bones to the middle", PROP_CTX);
+    expect(r?.kind).toBe("clarify");
+    expect((r as { question: string }).question).toMatch(/equally close/);
+  });
+
+  it("move the bones in the southwest corner to the middle picks the SW bones", () => {
+    const r = buildOf(
+      parseBuildRequest("move the bones in the southwest corner to the middle", PROP_CTX),
+    );
+    expect(r.op).toEqual({
+      type: "move-prop",
+      tile: "bones",
+      from: { gx: 0, gy: 4 },
+      to: { kind: "center" },
+    });
+  });
+
+  it("move the bones near the door to the middle moves the bones by the door", () => {
+    const r = buildOf(
+      parseBuildRequest("move the bones near the door to the middle", PROP_CTX),
+    );
+    expect(r.op).toEqual({
+      type: "move-prop",
+      tile: "bones",
+      from: { gx: 0, gy: 4 },
+      to: { kind: "center" },
+    });
+  });
+
+  it("move the bones here picks the bones nearest the ping", () => {
+    const ctx: BuildParseContext = {
+      ...PROP_CTX,
+      here: { roomId: "entry-hall", x: 650, y: 50 },
+    };
+    const r = buildOf(parseBuildRequest("move the bones here", ctx));
+    expect(r.op).toEqual({
+      type: "move-prop",
+      tile: "bones",
+      from: { gx: 6, gy: 0 },
+      to: { kind: "cell", gx: 6, gy: 0 },
+      target: "entry-hall", // "here" targets the pinged room, like add-door here
+    });
+  });
+
+  it("move the chest left / north by 2", () => {
+    expect(buildOf(parseBuildRequest("move the chest left", PROP_CTX)).op).toEqual({
+      type: "move-prop",
+      tile: "chest",
+      from: { gx: 6, gy: 4 },
+      to: { kind: "cell", gx: 5, gy: 4 },
+    });
+    expect(buildOf(parseBuildRequest("move the chest north by 2", PROP_CTX)).op).toEqual({
+      type: "move-prop",
+      tile: "chest",
+      from: { gx: 6, gy: 4 },
+      to: { kind: "cell", gx: 6, gy: 2 },
+    });
+  });
+
+  it("move the chest to cell 2, 3", () => {
+    expect(buildOf(parseBuildRequest("move the chest to cell 2, 3", PROP_CTX)).op).toEqual({
+      type: "move-prop",
+      tile: "chest",
+      from: { gx: 6, gy: 4 },
+      to: { kind: "cell", gx: 2, gy: 3 },
+    });
+  });
+
+  it("move the chest near the door / to the south door", () => {
+    expect(buildOf(parseBuildRequest("move the chest near the door", PROP_CTX)).op).toEqual({
+      type: "move-prop",
+      tile: "chest",
+      from: { gx: 6, gy: 4 },
+      to: { kind: "entry" },
+    });
+    // "to the south door" is the door, not a move south.
+    expect(buildOf(parseBuildRequest("move the bones to the south door", PROP_CTX)).op).toEqual({
+      type: "move-prop",
+      tile: "bones",
+      from: { gx: 0, gy: 4 },
+      to: { kind: "entry" },
+    });
+  });
+
+  it("move the chest with no destination asks where", () => {
+    const r = parseBuildRequest("move the chest", PROP_CTX);
+    expect(r?.kind).toBe("clarify");
+    expect((r as { question: string }).question).toMatch(/Where should the chest go/);
+  });
+
+  it("move the altar says there is no altar, listing the room", () => {
+    const r = parseBuildRequest("move the altar", PROP_CTX);
+    expect(r?.kind).toBe("clarify");
+    expect((r as { question: string }).question).toMatch(/There's no altar in this room/);
+    expect((r as { question: string }).question).toMatch(/a chest at \(6, 4\)/);
+  });
+
+  it("move the chest to the south wall asks — a wall is not a direction", () => {
+    const r = parseBuildRequest("move the chest to the south wall", PROP_CTX);
+    expect(r?.kind).toBe("clarify");
+  });
+
+  it("move the torch refuses — light and sconce move together", () => {
+    const r = parseBuildRequest("move the torch", PROP_CTX);
+    expect(r?.kind).toBe("clarify");
+    expect((r as { question: string }).question).toMatch(/leave its light behind/);
+  });
+
+  it("move the door still parses as a door move, not a prop move", () => {
+    const r = buildOf(parseBuildRequest("move the south door to cell 5", PROP_CTX));
+    expect(r.op).toEqual({
+      type: "move-door",
+      wall: "south",
+      fromAt: 3,
+      toAt: 5,
+    });
+  });
+
+  it("remove the bones asks when two match; at a cell picks one", () => {
+    const r = parseBuildRequest("remove the bones", PROP_CTX);
+    expect(r?.kind).toBe("clarify");
+    expect((r as { question: string }).question).toMatch(/2 piles of bones/);
+    expect(buildOf(parseBuildRequest("remove the bones at 0, 4", PROP_CTX)).op).toEqual({
+      type: "remove-prop",
+      tile: "bones",
+      from: { gx: 0, gy: 4 },
+    });
+  });
+
+  it("remove the chest / take the bones away / clear the rubble", () => {
+    expect(buildOf(parseBuildRequest("remove the chest", PROP_CTX)).op).toEqual({
+      type: "remove-prop",
+      tile: "chest",
+      from: { gx: 6, gy: 4 },
+    });
+    expect(
+      buildOf(parseBuildRequest("remove the bones at cell 6, 0", PROP_CTX)).op,
+    ).toEqual({
+      type: "remove-prop",
+      tile: "bones",
+      from: { gx: 6, gy: 0 },
+    });
+    const withRubble = room({
+      dressing: [{ tile: "rubble", gx: 2, gy: 2 }],
+    });
+    const ctx: BuildParseContext = {
+      room: withRubble,
+      rooms: [{ ...withRubble, id: "entry-hall" }],
+    };
+    expect(buildOf(parseBuildRequest("clear the rubble", ctx)).op).toEqual({
+      type: "remove-prop",
+      tile: "rubble",
+      from: { gx: 2, gy: 2 },
+    });
+    expect(buildOf(parseBuildRequest("take the rubble away", ctx)).op).toEqual({
+      type: "remove-prop",
+      tile: "rubble",
+      from: { gx: 2, gy: 2 },
+    });
+  });
+
+  it("remove the torch refuses, like move", () => {
+    const r = parseBuildRequest("remove the torch", PROP_CTX);
+    expect(r?.kind).toBe("clarify");
+    expect((r as { question: string }).question).toMatch(/leave its light behind/);
+  });
+
+  it("move the chest to the middle and add fog compounds", () => {
+    const r = parseBuildRequests("move the chest to the middle and add fog", PROP_CTX);
+    expect(r?.kind).toBe("build");
+    if (r?.kind !== "build") throw new Error("expected a compound build");
+    expect(r.ops).toHaveLength(2);
+    expect(r.ops[0].type).toBe("move-prop");
+    expect(r.ops[1]).toEqual({ type: "add-fog" });
+  });
+
+  it("move-prop applies, and undo returns the chest to its corner", () => {
+    const s = new BuildSession({
+      rooms: [{ ...PROP_ROOM, id: "entry-hall" }],
+      links: [],
+    });
+    const applied = s.apply(
+      {
+        type: "move-prop",
+        tile: "chest",
+        from: { gx: 6, gy: 4 },
+        to: { kind: "center" },
+      },
+      "move the chest to the middle",
+      { pack: PROP_PACK },
+    );
+    expect(applied.changed).toBe(true);
+    expect(applied.summary).toBe(
+      "Moved the chest from the southeast corner to the middle in the Entry Hall.",
+    );
+    const moved = s.current().dungeon.rooms[0].dressing ?? [];
+    expect(moved.find((p) => p.tile === "chest")).toMatchObject({ gx: 3, gy: 2 });
+    expect(formatBuildLine(applied.summary, {
+      type: "move-prop",
+      tile: "chest",
+      from: { gx: 6, gy: 4 },
+      to: { kind: "center" },
+    })).toMatch(/^📦 /);
+    s.undo();
+    expect(s.current().dungeon.rooms[0].dressing ?? []).toContainEqual(
+      expect.objectContaining({ tile: "chest", gx: 6, gy: 4 }),
+    );
+    s.redo();
+    expect(s.current().dungeon.rooms[0].dressing ?? []).toContainEqual(
+      expect.objectContaining({ tile: "chest", gx: 3, gy: 2 }),
+    );
+  });
+
+  it("remove-prop applies, and undo restores the bones", () => {
+    const s = new BuildSession({
+      rooms: [{ ...PROP_ROOM, id: "entry-hall" }],
+      links: [],
+    });
+    const applied = s.apply(
+      { type: "remove-prop", tile: "bones", from: { gx: 0, gy: 4 } },
+      "remove the bones at 0, 4",
+      { pack: PROP_PACK },
+    );
+    expect(applied.changed).toBe(true);
+    expect(applied.summary).toBe(
+      "Removed the bones from the southwest corner in the Entry Hall.",
+    );
+    expect(s.current().dungeon.rooms[0].dressing ?? []).toHaveLength(2);
+    s.undo();
+    expect(s.current().dungeon.rooms[0].dressing ?? []).toHaveLength(3);
+    s.redo();
+    expect(s.current().dungeon.rooms[0].dressing ?? []).toHaveLength(2);
+  });
+
+  it("move-prop to the same cell is a no-op", () => {
+    const { summary, changed } = applyOp(
+      stateWithRoom(PROP_ROOM),
+      { type: "move-prop", tile: "chest", from: { gx: 6, gy: 4 }, to: { kind: "corner", corner: "se" } },
+      { pack: PROP_PACK },
+    );
+    expect(changed).toBe(false);
+    expect(summary).toBe("The chest is already at the southeast corner.");
+  });
+
+  it("move-prop for a missing prop throws, naming the cell", () => {
+    expect(() =>
+      applyOp(
+        stateWithRoom(PROP_ROOM),
+        { type: "move-prop", tile: "bones", from: { gx: 1, gy: 1 }, to: { kind: "center" } },
+        { pack: PROP_PACK },
+      ),
+    ).toThrow(/No "bones" at \(1,1\)/);
+  });
+
+  it("move-prop out of the room throws", () => {
+    expect(() =>
+      applyOp(
+        stateWithRoom(PROP_ROOM),
+        { type: "move-prop", tile: "chest", from: { gx: 6, gy: 4 }, to: { kind: "cell", gx: 7, gy: 5 } },
+        { pack: PROP_PACK },
+      ),
+    ).toThrow();
+  });
+
+  it("move-prop without a pack throws plainly", () => {
+    expect(() =>
+      applyOp(
+        stateWithRoom(PROP_ROOM),
+        { type: "move-prop", tile: "chest", from: { gx: 6, gy: 4 }, to: { kind: "center" } },
+      ),
+    ).toThrow(/needs the tile pack/);
+  });
+});
+
 // ---------------------------------------------------------------- session: apply / undo / redo
 
 describe("BuildSession — history is a list of specs", () => {

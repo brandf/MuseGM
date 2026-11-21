@@ -36,6 +36,14 @@
  * Tile unit: 100px = 1 grid square (grid size 100). Floor/wall tiles
  * are 100x100; dressing is 200x200 (2x2 squares); fog is 200x200 or
  * 400x400. The composer places everything in scene pixel coordinates.
+ *
+ * Props and fog are free sprites: a placement may sit at fractional
+ * cells (x = gx*100), so a chest can sit half a square off the grid.
+ * A placement may also declare an explicit footprint (w/h in cells) —
+ * a macro piece laid as a run, e.g. wall-curved at 3x1 is a 300x100
+ * curved wall run. Rooms may be L-shaped (a corner cut out) and may
+ * carry interior diagonal walls — see RoomSpec.cutout and
+ * RoomSpec.diagonals.
  */
 import * as fs from "node:fs";
 import * as path from "node:path";
@@ -77,6 +85,24 @@ export interface PackEntry {
   sizePx: number;
   layer: TileLayer;
   tags: string[];
+  /** Pack kind (Nov 20 redesign): base | macro | prop. */
+  kind?: "base" | "macro" | "prop";
+  /** Real pixel width/height of the art. Square tiles omit these and
+   *  default to sizePx — the manifest stays square-only until a
+   *  non-square piece is generated, and the composer reads the real
+   *  shape here instead of assuming width == height == sizePx. */
+  widthPx?: number;
+  heightPx?: number;
+}
+
+/** Pixel width of a pack entry — its real shape, not the square sizePx. */
+export function tileWidthPx(entry: PackEntry): number {
+  return entry.widthPx ?? entry.sizePx;
+}
+
+/** Pixel height of a pack entry — its real shape, not the square sizePx. */
+export function tileHeightPx(entry: PackEntry): number {
+  return entry.heightPx ?? entry.sizePx;
 }
 
 /** tiles/manifest.json as parsed. */
@@ -124,7 +150,11 @@ export interface DoorSpec {
 /** One dressing/fog placement: top-left cell of the tile.
  *  Dressing placements are the room's props (FR-6): a prop's stable
  *  identity is its `id` when present (assigned by placeProp), else
- *  its tile + cell. Fog placements don't use `id`. */
+ *  its tile + cell. Fog placements don't use `id`.
+ *
+ *  Props are free sprites: gx/gy may be fractional (a chest at
+ *  (2.5, 3.5) sits half a square off the grid — x = gx*100), and w/h
+ *  may declare an explicit footprint in cells. */
 export interface Placement {
   tile: string;
   gx: number;
@@ -140,6 +170,44 @@ export interface Placement {
    *  ids existed (e.g. by the build loop's add-dressing op) have none
    *  and are addressed by tile + cell instead. */
   id?: string;
+  /**
+   * Interactive dressing marker (FR-16, BRA-192): the dressing item
+   * id this placement belongs to (e.g. "torch-n-4"). When set,
+   * layoutRoom stamps `flags.meroki = { dressingId }` on the Tile
+   * document, and the composer hook's pairing step adds the light
+   * _id, kind and alpha after the light is created — the click
+   * module reads that flag to find the light to flip. Only the
+   * dressing hook sets this; a hand-placed prop never carries it.
+   */
+  dressingId?: string;
+  /** Explicit footprint in cells (default: the tile's own size). A
+   *  macro piece can be laid as a run — e.g. wall-curved at w:3, h:1
+   *  is a 300x100 curved wall run. The art is stretched to the
+   *  footprint, so only use a footprint the art was drawn for. */
+  w?: number;
+  h?: number;
+}
+
+/** Footprint of a placement in cells: its explicit w/h, else the
+ *  tile's own size. */
+export function placementFootprint(p: Placement, entry: PackEntry): { w: number; h: number } {
+  return {
+    w: p.w ?? tileWidthPx(entry) / TILE_PX,
+    h: p.h ?? tileHeightPx(entry) / TILE_PX,
+  };
+}
+
+/** Integer cells a footprint rect overlaps: a sprite at (2.5, 3.5) of
+ *  2x2 cells overlaps cells 2..4 x 3..5 — the cells it visibly covers,
+ *  so maze-wall and cutout checks stay exact off-grid. */
+function placementCells(gx: number, gy: number, w: number, h: number): { gx: number; gy: number }[] {
+  const cells: { gx: number; gy: number }[] = [];
+  for (let cy = Math.floor(gy); cy < Math.ceil(gy + h); cy++) {
+    for (let cx = Math.floor(gx); cx < Math.ceil(gx + w); cx++) {
+      cells.push({ gx: cx, gy: cy });
+    }
+  }
+  return cells;
 }
 
 /**
@@ -193,6 +261,76 @@ export interface FloorOverlay {
   variants: Record<string, string>;
 }
 
+/** Which corner of the room a cutout is anchored at. */
+export type CutoutCorner = "nw" | "ne" | "se" | "sw";
+
+/** An L-shaped room: a rectangle cut out of one corner. The cutout is
+ *  a void — no floor, no props, no doors — and the wall ring follows
+ *  the L outline, so the room has one inner corner. The cutout is
+ *  corner-relative (not absolute cells), so widenRoom keeps it correct
+ *  without touching it. */
+export interface RoomCutout {
+  corner: CutoutCorner;
+  /** Cutout width/height in cells. Each must leave at least 2 cells of
+   *  leg on its side, so no floor cell ever borders the boundary on
+   *  two opposite sides (one tile per cell stays expressible). */
+  w: number;
+  h: number;
+}
+
+/** Cell rect of a room's cutout, or null for a rectangular room. */
+export function cutoutRect(spec: RoomSpec): { gx: number; gy: number; w: number; h: number } | null {
+  const c = spec.cutout;
+  if (!c) return null;
+  switch (c.corner) {
+    case "nw": return { gx: 0, gy: 0, w: c.w, h: c.h };
+    case "ne": return { gx: spec.gridW - c.w, gy: 0, w: c.w, h: c.h };
+    case "se": return { gx: spec.gridW - c.w, gy: spec.gridH - c.h, w: c.w, h: c.h };
+    case "sw": return { gx: 0, gy: spec.gridH - c.h, w: c.w, h: c.h };
+  }
+}
+
+/** Is this cell inside the room's cutout (the void of an L-shaped room)? */
+export function isCutoutCell(spec: RoomSpec, gx: number, gy: number): boolean {
+  const r = cutoutRect(spec);
+  return r !== null && gx >= r.gx && gx < r.gx + r.w && gy >= r.gy && gy < r.gy + r.h;
+}
+
+/** Which sides of a floor cell border the void — the room's outer edge
+ *  or the cutout of an L-shaped room. A cell with one side gets a
+ *  straight wall tile; two adjacent sides, a corner tile. */
+function boundaryDirs(spec: RoomSpec, gx: number, gy: number): WallSide[] {
+  const dirs: WallSide[] = [];
+  if (gy === 0 || isCutoutCell(spec, gx, gy - 1)) dirs.push("north");
+  if (gy === spec.gridH - 1 || isCutoutCell(spec, gx, gy + 1)) dirs.push("south");
+  if (gx === 0 || isCutoutCell(spec, gx - 1, gy)) dirs.push("west");
+  if (gx === spec.gridW - 1 || isCutoutCell(spec, gx + 1, gy)) dirs.push("east");
+  return dirs;
+}
+
+/** The cell a door/opening on a wall side sits in. */
+function doorCell(wall: WallSide, at: number, gridW: number, gridH: number): { gx: number; gy: number } {
+  switch (wall) {
+    case "north": return { gx: at, gy: 0 };
+    case "south": return { gx: at, gy: gridH - 1 };
+    case "west": return { gx: 0, gy: at };
+    case "east": return { gx: gridW - 1, gy: at };
+  }
+}
+
+/** A diagonal wall inside a room: the wall-diagonal tile (a band
+ *  corner to corner, face on one side) plus a diagonal collision wall.
+ *  Rotation 0 is the art as drawn — band NW→SE, face to the
+ *  south-west; 90 turns it to NE→SW (face north-west), 180 to SE→NW
+ *  (face north-east), 270 to SW→NE (face south-east). */
+export interface DiagonalWallSpec {
+  /** Top-left cell of the 1x1 diagonal wall. */
+  gx: number;
+  gy: number;
+  /** Clockwise degrees: 0, 90, 180 or 270. Default 0. */
+  rotation?: number;
+}
+
 export interface RoomSpec {
   name: string;
   /** Room width in grid squares (100px each). Minimum 3. */
@@ -229,6 +367,14 @@ export interface RoomSpec {
   mazes?: MazeRegionSpec[];
   /** Regional theme overlays (FR-13). */
   overlays?: FloorOverlay[];
+  /** L-shaped room: a corner cut out of the rectangle (a void — no
+   *  floor, no props, no doors). The wall ring follows the L outline.
+   *  Absent = the room is a rectangle. */
+  cutout?: RoomCutout;
+  /** Interior diagonal walls: the wall-diagonal tile plus a diagonal
+   *  collision wall. Interior only — a diagonal cannot sit on the
+   *  room's wall ring, a maze wall cell, or in the cutout. */
+  diagonals?: DiagonalWallSpec[];
   /** Room description posted to chat when the room is built. */
   description?: string;
   /**
@@ -406,6 +552,23 @@ function validateSpec(spec: RoomSpec, pack: Pack): void {
   if (!Number.isInteger(gridW) || !Number.isInteger(gridH) || gridW < 1 || gridH < 1) {
     throw new Error(`Room must be at least 1x1 grid squares, got ${gridW}x${gridH}.`);
   }
+  // L-shaped room: the cutout must leave at least 2 cells of leg on
+  // each side, so no floor cell ever borders the boundary on two
+  // opposite sides (one tile per cell stays expressible).
+  const cutout = spec.cutout;
+  if (cutout) {
+    if (cutout.corner !== "nw" && cutout.corner !== "ne" && cutout.corner !== "se" && cutout.corner !== "sw") {
+      throw new Error(`Cutout corner must be nw, ne, se or sw, got ${JSON.stringify(cutout.corner)}.`);
+    }
+    if (!Number.isInteger(cutout.w) || !Number.isInteger(cutout.h) || cutout.w < 1 || cutout.h < 1) {
+      throw new Error(`Cutout must be at least 1x1 cells, got ${cutout.w}x${cutout.h}.`);
+    }
+    if (cutout.w > gridW - 2 || cutout.h > gridH - 2) {
+      throw new Error(
+        `Cutout ${cutout.w}x${cutout.h} in a ${gridW}x${gridH} room leaves a leg under 2 cells — an L-shaped room needs at least 2 cells on each leg (cutout at most ${gridW - 2}x${gridH - 2}).`,
+      );
+    }
+  }
   const doors = spec.doors ?? [];
   for (const d of doors) {
     const n = cellsAlong(d.wall, gridW, gridH);
@@ -413,6 +576,22 @@ function validateSpec(spec: RoomSpec, pack: Pack): void {
       throw new Error(
         `Door on ${d.wall} at cell ${d.at} is out of range 1..${n - 2} (doors may not sit in a corner).`,
       );
+    }
+    if (cutout) {
+      const cell = doorCell(d.wall, d.at, gridW, gridH);
+      if (isCutoutCell(spec, cell.gx, cell.gy)) {
+        throw new Error(
+          `Door on ${d.wall} at cell ${d.at} sits in the room's ${cutout.corner} cutout — doors live on the L outline, not in the void.`,
+        );
+      }
+      // A door cell on an L inner corner would need two wall faces
+      // (the door tile plus the cutout-facing band) — one tile cannot
+      // show both, so the door must move to a straight stretch.
+      if (boundaryDirs(spec, cell.gx, cell.gy).length > 1) {
+        throw new Error(
+          `Door on ${d.wall} at cell ${d.at} sits on an inner-corner cell of the L-shaped room — move it to a straight stretch of wall.`,
+        );
+      }
     }
   }
   const seenDoors = new Set(doors.map((d) => `${d.wall}:${d.at}`));
@@ -422,6 +601,14 @@ function validateSpec(spec: RoomSpec, pack: Pack): void {
     const n = cellsAlong(o.wall, gridW, gridH);
     if (!Number.isInteger(o.at) || o.at < 0 || o.at > n - 1) {
       throw new Error(`Opening on ${o.wall} at cell ${o.at} is out of range 0..${n - 1}.`);
+    }
+    if (cutout) {
+      const cell = doorCell(o.wall, o.at, gridW, gridH);
+      if (isCutoutCell(spec, cell.gx, cell.gy)) {
+        throw new Error(
+          `Opening on ${o.wall} at cell ${o.at} sits in the room's ${cutout.corner} cutout — openings live on the L outline, not in the void.`,
+        );
+      }
     }
     if (seenDoors.has(`${o.wall}:${o.at}`)) {
       throw new Error(`Opening on ${o.wall} at cell ${o.at} collides with a door in the same cell.`);
@@ -442,6 +629,18 @@ function validateSpec(spec: RoomSpec, pack: Pack): void {
     if (r.gx < 1 || r.gy < 1 || r.gx + r.w > gridW - 1 || r.gy + r.h > gridH - 1) {
       throw new Error(
         `Maze region at (${r.gx},${r.gy}) ${r.w}x${r.h} must sit strictly inside a ${gridW}x${gridH} room (one cell of margin from the edge).`,
+      );
+    }
+    // A maze region may not overlap the cutout — its cells would be
+    // void, and the maze walls would face nothing.
+    const cr = cutoutRect(spec);
+    if (
+      cr &&
+      cr.gx < r.gx + r.w && r.gx < cr.gx + cr.w &&
+      cr.gy < r.gy + r.h && r.gy < cr.gy + cr.h
+    ) {
+      throw new Error(
+        `Maze region at (${r.gx},${r.gy}) ${r.w}x${r.h} overlaps the room's ${cutout!.corner} cutout at (${cr.gx},${cr.gy}) ${cr.w}x${cr.h} — move the maze or shrink the cutout.`,
       );
     }
   }
@@ -499,9 +698,20 @@ function validateSpec(spec: RoomSpec, pack: Pack): void {
       }
       throw new Error(`Fog tile "${p.tile}" is a ${entry.layer} tile, not an atmosphere tile.`);
     }
-    const cells = entry.sizePx / TILE_PX;
-    if (!Number.isInteger(p.gx) || !Number.isInteger(p.gy) || p.gx < 0 || p.gy < 0 ||
-        p.gx + cells > gridW || p.gy + cells > gridH) {
+    const { w: fw, h: fh } = placementFootprint(p, entry);
+    if (p.w !== undefined && (!Number.isInteger(p.w) || p.w < 1)) {
+      throw new Error(`${kind} tile "${p.tile}": footprint width must be a whole number of cells >= 1, got ${p.w}.`);
+    }
+    if (p.h !== undefined && (!Number.isInteger(p.h) || p.h < 1)) {
+      throw new Error(`${kind} tile "${p.tile}": footprint height must be a whole number of cells >= 1, got ${p.h}.`);
+    }
+    // Props and fog are free sprites: gx/gy may be fractional (x =
+    // gx*100), so only the footprint must fit the room — no integer
+    // cell requirement.
+    if (
+      !Number.isFinite(p.gx) || !Number.isFinite(p.gy) || p.gx < 0 || p.gy < 0 ||
+      p.gx + fw > gridW || p.gy + fh > gridH
+    ) {
       throw new Error(
         `${kind} tile "${p.tile}" at (${p.gx},${p.gy}) does not fit in a ${gridW}x${gridH} room.`,
       );
@@ -510,12 +720,16 @@ function validateSpec(spec: RoomSpec, pack: Pack): void {
       throw new Error(`Alpha for "${p.tile}" must be 0..1, got ${p.alpha}.`);
     }
     // No placement may sit on a maze wall cell — a pillar inside a
-    // solid maze wall would be invisible and unreachable.
-    for (let dy = 0; dy < cells; dy++) {
-      for (let dx = 0; dx < cells; dx++) {
-        if (isMazeWallCell(grids, p.gx + dx, p.gy + dy)) {
-          throw new Error(`${kind} tile "${p.tile}" at (${p.gx},${p.gy}) sits on a maze wall cell.`);
-        }
+    // solid maze wall would be invisible and unreachable — or in the
+    // cutout of an L-shaped room, where there is no floor under it.
+    // The check runs over the integer cells the footprint overlaps, so
+    // it stays exact for off-grid sprites.
+    for (const c of placementCells(p.gx, p.gy, fw, fh)) {
+      if (isMazeWallCell(grids, c.gx, c.gy)) {
+        throw new Error(`${kind} tile "${p.tile}" at (${p.gx},${p.gy}) sits on a maze wall cell.`);
+      }
+      if (isCutoutCell(spec, c.gx, c.gy)) {
+        throw new Error(`${kind} tile "${p.tile}" at (${p.gx},${p.gy}) sits in the room's cutout — props cannot float in the void.`);
       }
     }
   };
@@ -533,12 +747,57 @@ function validateSpec(spec: RoomSpec, pack: Pack): void {
       seen.add(p.id);
     }
   }
+  // Dressing ids are the click module's address — a duplicate would
+  // pair two tiles to one light, so the spec is rejected the same way.
+  {
+    const seen = new Set<string>();
+    for (const p of spec.dressing ?? []) {
+      if (!p.dressingId) continue;
+      if (seen.has(p.dressingId)) {
+        throw new Error(`Duplicate dressing id "${p.dressingId}" in room spec — each dressing item needs its own id.`);
+      }
+      seen.add(p.dressingId);
+    }
+  }
   for (const t of spec.torches ?? []) {
     if (t.gx < 0 || t.gx >= gridW || t.gy < 0 || t.gy >= gridH) {
       throw new Error(`Torch at (${t.gx},${t.gy}) is outside a ${gridW}x${gridH} room.`);
     }
+    if (isCutoutCell(spec, t.gx, t.gy)) {
+      throw new Error(`Torch at (${t.gx},${t.gy}) sits in the room's cutout — torches hang on floor cells.`);
+    }
     if (isMazeWallCell(grids, t.gx, t.gy)) {
       throw new Error(`Torch at (${t.gx},${t.gy}) sits on a maze wall cell.`);
+    }
+  }
+  // Diagonal walls: interior 1x1 cells, one per cell, rotation 0/90/
+  // 180/270. A diagonal replaces a straight wall tile in its cell, so
+  // the cell must be a plain interior floor cell — not on the wall
+  // ring, not a maze wall, not in the cutout.
+  const seenDiagonals = new Set<string>();
+  for (const dg of spec.diagonals ?? []) {
+    if (!Number.isInteger(dg.gx) || !Number.isInteger(dg.gy) || dg.gx < 0 || dg.gy < 0 || dg.gx >= gridW || dg.gy >= gridH) {
+      throw new Error(`Diagonal wall at (${dg.gx},${dg.gy}) is outside a ${gridW}x${gridH} room.`);
+    }
+    const rot = dg.rotation ?? 0;
+    if (rot !== 0 && rot !== 90 && rot !== 180 && rot !== 270) {
+      throw new Error(`Diagonal wall rotation must be 0, 90, 180 or 270, got ${dg.rotation}.`);
+    }
+    const key = `${dg.gx},${dg.gy}`;
+    if (seenDiagonals.has(key)) {
+      throw new Error(`Two diagonal walls in cell (${dg.gx},${dg.gy}) — one diagonal per cell.`);
+    }
+    seenDiagonals.add(key);
+    if (isCutoutCell(spec, dg.gx, dg.gy)) {
+      throw new Error(`Diagonal wall at (${dg.gx},${dg.gy}) sits in the room's cutout — diagonals live on floor cells.`);
+    }
+    if (isMazeWallCell(grids, dg.gx, dg.gy)) {
+      throw new Error(`Diagonal wall at (${dg.gx},${dg.gy}) sits on a maze wall cell.`);
+    }
+    if (boundaryDirs(spec, dg.gx, dg.gy).length > 0) {
+      throw new Error(
+        `Diagonal wall at (${dg.gx},${dg.gy}) sits on the room's wall ring — diagonals are interior walls, not perimeter walls.`,
+      );
     }
   }
 }
@@ -548,14 +807,17 @@ function tileDoc(
   serverBase: string,
   gx: number,
   gy: number,
-  opts: { elevation: number; sort: number; rotation?: number; alpha?: number; hidden?: boolean },
+  opts: { elevation: number; sort: number; rotation?: number; alpha?: number; hidden?: boolean; width?: number; height?: number },
 ): TileDoc {
   return {
     texture: { src: `${serverBase}/${path.basename(entry.file)}` },
     x: gx * TILE_PX,
     y: gy * TILE_PX,
-    width: entry.sizePx,
-    height: entry.sizePx,
+    // Width and height are independent: a non-square piece (or an
+    // explicit run footprint) places at its real shape, never forced
+    // square by sizePx.
+    width: opts.width ?? tileWidthPx(entry),
+    height: opts.height ?? tileHeightPx(entry),
     elevation: opts.elevation,
     sort: opts.sort,
     rotation: opts.rotation ?? 0,
@@ -630,6 +892,151 @@ function mazeCollisionWalls(
   return walls;
 }
 
+/** Pixel coords of one cell edge (a collision-wall segment). */
+function cellEdgeCoords(dir: WallSide, gx: number, gy: number): { x1: number; y1: number; x2: number; y2: number } {
+  switch (dir) {
+    case "north": return { x1: gx * TILE_PX, y1: gy * TILE_PX, x2: (gx + 1) * TILE_PX, y2: gy * TILE_PX };
+    case "south": return { x1: gx * TILE_PX, y1: (gy + 1) * TILE_PX, x2: (gx + 1) * TILE_PX, y2: (gy + 1) * TILE_PX };
+    case "west": return { x1: gx * TILE_PX, y1: gy * TILE_PX, x2: gx * TILE_PX, y2: (gy + 1) * TILE_PX };
+    case "east": return { x1: (gx + 1) * TILE_PX, y1: gy * TILE_PX, x2: (gx + 1) * TILE_PX, y2: (gy + 1) * TILE_PX };
+  }
+}
+
+/** Corner-tile rotation for a cell whose wall faces are these two
+ *  adjacent sides (the corner image is drawn with bands at TOP and
+ *  LEFT, i.e. the north-west corner). */
+function cornerRotationForDirs(dirs: WallSide[]): number {
+  const key = [...dirs].sort().join("+");
+  switch (key) {
+    case "north+west": return 0;
+    case "east+north": return 90;
+    case "east+south": return 180;
+    case "south+west": return 270;
+    default: throw new Error(`Corner tile needs two adjacent wall sides, got: ${dirs.join(", ")}.`);
+  }
+}
+
+/**
+ * Wall ring + perimeter collision walls for an L-shaped room: every
+ * floor cell whose neighbour is outside the room or in the cutout gets
+ * a wall tile — one straight tile per single-sided cell, one corner
+ * tile per inner/outer corner cell — and the matching collision
+ * segments, merged into runs. Doors replace the straight tile on their
+ * cell; openings remove the edge (and its tile when the cell has no
+ * other wall side). Validation has already rejected doors on
+ * two-sided cells and anything in the cutout, so every cell here has
+ * at most two adjacent boundary sides.
+ */
+function lShapeRing(
+  spec: RoomSpec,
+  grids: { region: MazeRegionSpec; grid: MazeGrid }[],
+  serverBase: string,
+  doorAt: Map<string, "door" | "secret">,
+  openAt: Set<string>,
+  cornerEntry: PackEntry,
+  straightEntry: PackEntry,
+  doorEntry: PackEntry,
+): { tiles: TileDoc[]; walls: WallSpec[] } {
+  const { gridW, gridH } = spec;
+  const tiles: TileDoc[] = [];
+  const walls: WallSpec[] = [];
+  const hEdges = new Map<number, [number, number][]>();
+  const vEdges = new Map<number, [number, number][]>();
+  const addH = (yPx: number, x1: number, x2: number) => {
+    const list = hEdges.get(yPx) ?? [];
+    list.push([x1, x2]);
+    hEdges.set(yPx, list);
+  };
+  const addV = (xPx: number, y1: number, y2: number) => {
+    const list = vEdges.get(xPx) ?? [];
+    list.push([y1, y2]);
+    vEdges.set(xPx, list);
+  };
+  // What a cell edge answers to — only outer edges answer: a cutout
+  // edge is not a door or an opening, it is just wall.
+  const edgeKind = (dir: WallSide, gx: number, gy: number): "door" | "secret" | "open" | null => {
+    if (dir === "north" && gy === 0) {
+      if (openAt.has(`north:${gx}`)) return "open";
+      return doorAt.get(`north:${gx}`) ?? null;
+    }
+    if (dir === "south" && gy === gridH - 1) {
+      if (openAt.has(`south:${gx}`)) return "open";
+      return doorAt.get(`south:${gx}`) ?? null;
+    }
+    if (dir === "west" && gx === 0) {
+      if (openAt.has(`west:${gy}`)) return "open";
+      return doorAt.get(`west:${gy}`) ?? null;
+    }
+    if (dir === "east" && gx === gridW - 1) {
+      if (openAt.has(`east:${gy}`)) return "open";
+      return doorAt.get(`east:${gy}`) ?? null;
+    }
+    return null;
+  };
+  for (let gy = 0; gy < gridH; gy++) {
+    for (let gx = 0; gx < gridW; gx++) {
+      if (isCutoutCell(spec, gx, gy)) continue;
+      // Maze wall cells get their own tiles (below) — the ring only
+      // walls the room's outline.
+      if (isMazeWallCell(grids, gx, gy)) continue;
+      // Effective boundary sides: the outline minus opened edges.
+      const dirs = boundaryDirs(spec, gx, gy).filter((dir) => edgeKind(dir, gx, gy) !== "open");
+      if (dirs.length === 0) continue;
+      if (dirs.length > 2) {
+        throw new Error(
+          `L-shaped room: cell (${gx},${gy}) needs wall faces on ${dirs.join(", ")} — one tile cannot show them all. Widen the room's legs.`,
+        );
+      }
+      if (dirs.length === 2) {
+        const key = [...dirs].sort().join("+");
+        if (key !== "north+west" && key !== "east+north" && key !== "east+south" && key !== "south+west") {
+          throw new Error(
+            `L-shaped room: cell (${gx},${gy}) needs wall faces on opposite sides (${dirs.join(" and ")}) — one tile cannot show both. Widen the room's legs.`,
+          );
+        }
+      }
+      // Tile: a door cell shows the door tile (a secret door shows the
+      // straight tile, like the rectangular ring); a corner cell shows
+      // the corner tile; anything else, the straight tile.
+      const doorKind = dirs.length === 1 ? edgeKind(dirs[0], gx, gy) : null;
+      if (doorKind === "door") {
+        tiles.push(tileDoc(doorEntry, serverBase, gx, gy, {
+          elevation: 0, sort: LAYER_SORT.wall, rotation: wallRotation(dirs[0]),
+        }));
+      } else if (dirs.length === 2) {
+        tiles.push(tileDoc(cornerEntry, serverBase, gx, gy, {
+          elevation: 0, sort: LAYER_SORT.wall, rotation: cornerRotationForDirs(dirs),
+        }));
+      } else {
+        tiles.push(tileDoc(straightEntry, serverBase, gx, gy, {
+          elevation: 0, sort: LAYER_SORT.wall, rotation: wallRotation(dirs[0]),
+        }));
+      }
+      // Collision: a door edge is its own segment (door 1, secret 2);
+      // plain edges merge into runs (the door cell's segment is absent
+      // from the maps, so runs break at doors).
+      for (const dir of dirs) {
+        const kind = edgeKind(dir, gx, gy);
+        const { x1, y1, x2, y2 } = cellEdgeCoords(dir, gx, gy);
+        if (kind === "door" || kind === "secret") {
+          walls.push({ x1, y1, x2, y2, door: kind === "door" ? 1 : 2 });
+        } else if (dir === "north" || dir === "south") {
+          addH(y1, x1, x2);
+        } else {
+          addV(x1, y1, y2);
+        }
+      }
+    }
+  }
+  for (const [y, segs] of hEdges) {
+    for (const [x1, x2] of mergeRuns(segs)) walls.push({ x1, y1: y, x2, y2: y, door: 0 });
+  }
+  for (const [x, segs] of vEdges) {
+    for (const [y1, y2] of mergeRuns(segs)) walls.push({ x1: x, y1, x2: x, y2: y2, door: 0 });
+  }
+  return { tiles, walls };
+}
+
 /**
  * Pure composition: turn a room spec + pack into the exact Tile, Wall
  * and Light documents for the room. No Foundry involved — unit-testable.
@@ -680,6 +1087,8 @@ export function layoutRoom(
   for (let gy = 0; gy < gridH; gy++) {
     for (let gx = 0; gx < gridW; gx++) {
       if (isMazeWallCell(grids, gx, gy)) continue;
+      // An L-shaped room's cutout is void — no floor tile there.
+      if (isCutoutCell(spec, gx, gy)) continue;
       let name = floorNames[Math.floor(rng() * floorNames.length)];
       for (const o of spec.overlays ?? []) {
         if (gx >= o.gx && gx < o.gx + o.w && gy >= o.gy && gy < o.gy + o.h && o.variants[name] !== undefined) {
@@ -715,32 +1124,42 @@ export function layoutRoom(
       `Theme "${resolved.id}" is missing a wall tile ("${resolved.wall.corner}", "${resolved.wall.straight}" or "${resolved.wall.door}").`,
     );
   }
-  const placedCorners = new Set<string>();
-  for (const [corner, gx, gy] of corners) {
-    const cornerOpen =
-      (corner === "nw" && (openAt.has("north:0") || openAt.has("west:0"))) ||
-      (corner === "ne" && (openAt.has(`north:${gridW - 1}`) || openAt.has("east:0"))) ||
-      (corner === "se" && (openAt.has(`south:${gridW - 1}`) || openAt.has(`east:${gridH - 1}`))) ||
-      (corner === "sw" && (openAt.has("south:0") || openAt.has(`west:${gridH - 1}`)));
-    if (cornerOpen) continue;
-    // In a 1-wide room the two corners of an end wall are the same cell.
-    if (placedCorners.has(`${gx},${gy}`)) continue;
-    placedCorners.add(`${gx},${gy}`);
-    tiles.push(tileDoc(cornerEntry, serverBase, gx, gy, {
-      elevation: 0, sort: LAYER_SORT.wall, rotation: cornerRotation(corner),
-    }));
-  }
-  for (const side of ["north", "south", "east", "west"] as WallSide[]) {
-    const n = cellsAlong(side, gridW, gridH);
-    for (let at = 1; at <= n - 2; at++) {
-      if (openAt.has(`${side}:${at}`)) continue;
-      const { gx, gy, rotation } = wallCell(side, at, gridW, gridH);
-      const kind = doorAt.get(`${side}:${at}`);
-      // A secret door looks like a plain wall — the straight tile, not
-      // the door tile — so the party can't spot it from the map.
-      tiles.push(tileDoc(kind === "door" ? doorEntry : straightEntry, serverBase, gx, gy, {
-        elevation: 0, sort: LAYER_SORT.wall, rotation,
+  // The perimeter collision walls: the L-shaped ring builds them (the
+  // outline is not four sides), otherwise they are built per side
+  // below, in the collision-walls section.
+  let perimeterWalls: WallSpec[] | null = null;
+  if (spec.cutout) {
+    const ring = lShapeRing(spec, grids, serverBase, doorAt, openAt, cornerEntry, straightEntry, doorEntry);
+    tiles.push(...ring.tiles);
+    perimeterWalls = ring.walls;
+  } else {
+    const placedCorners = new Set<string>();
+    for (const [corner, gx, gy] of corners) {
+      const cornerOpen =
+        (corner === "nw" && (openAt.has("north:0") || openAt.has("west:0"))) ||
+        (corner === "ne" && (openAt.has(`north:${gridW - 1}`) || openAt.has("east:0"))) ||
+        (corner === "se" && (openAt.has(`south:${gridW - 1}`) || openAt.has(`east:${gridH - 1}`))) ||
+        (corner === "sw" && (openAt.has("south:0") || openAt.has(`west:${gridH - 1}`)));
+      if (cornerOpen) continue;
+      // In a 1-wide room the two corners of an end wall are the same cell.
+      if (placedCorners.has(`${gx},${gy}`)) continue;
+      placedCorners.add(`${gx},${gy}`);
+      tiles.push(tileDoc(cornerEntry, serverBase, gx, gy, {
+        elevation: 0, sort: LAYER_SORT.wall, rotation: cornerRotation(corner),
       }));
+    }
+    for (const side of ["north", "south", "east", "west"] as WallSide[]) {
+      const n = cellsAlong(side, gridW, gridH);
+      for (let at = 1; at <= n - 2; at++) {
+        if (openAt.has(`${side}:${at}`)) continue;
+        const { gx, gy, rotation } = wallCell(side, at, gridW, gridH);
+        const kind = doorAt.get(`${side}:${at}`);
+        // A secret door looks like a plain wall — the straight tile, not
+        // the door tile — so the party can't spot it from the map.
+        tiles.push(tileDoc(kind === "door" ? doorEntry : straightEntry, serverBase, gx, gy, {
+          elevation: 0, sort: LAYER_SORT.wall, rotation,
+        }));
+      }
     }
   }
 
@@ -779,6 +1198,35 @@ export function layoutRoom(
     }
   }
 
+  // Diagonal walls: the wall-diagonal tile (band corner to corner,
+  //  face on one side) plus a diagonal collision wall, collected here
+  //  and added to the collision walls below. The tile name is derived
+  //  from the theme's straight wall — wall-straight becomes
+  //  wall-diagonal — and a theme with no diagonal tile fails loudly
+  //  instead of borrowing another theme's stone.
+  const diagonalWalls: WallSpec[] = [];
+  for (const dg of spec.diagonals ?? []) {
+    const diagonalName = resolved.wall.straight.replace("straight", "diagonal");
+    const diagonalEntry =
+      diagonalName === resolved.wall.straight ? undefined : pack.get(diagonalName);
+    if (!diagonalEntry) {
+      throw new Error(
+        `Theme "${resolved.id}" has no diagonal wall tile ("${diagonalName}") — the pack's diagonal wall is "wall-diagonal". Generate the pack first, or build the room in the dungeon theme.`,
+      );
+    }
+    const rot = dg.rotation ?? 0;
+    tiles.push(tileDoc(diagonalEntry, serverBase, dg.gx, dg.gy, {
+      elevation: 0, sort: LAYER_SORT.wall, rotation: rot,
+    }));
+    const x0 = dg.gx * TILE_PX;
+    const y0 = dg.gy * TILE_PX;
+    const x1 = (dg.gx + 1) * TILE_PX;
+    const y1 = (dg.gy + 1) * TILE_PX;
+    // Rotation 0/180 is the NW→SE diagonal; 90/270 is NE→SW.
+    if (rot === 0 || rot === 180) diagonalWalls.push({ x1: x0, y1: y0, x2: x1, y2: y1, door: 0 });
+    else diagonalWalls.push({ x1, y1: y0, x2: x0, y2: y1, door: 0 });
+  }
+
   // Dressing: bones, rubble, pillars — under the tokens, above the floor.
   // The theme remaps dressing names (a spec that says "bones" gets the
   // theme's equivalent when one exists); with no remap the tile is used
@@ -788,9 +1236,17 @@ export function layoutRoom(
     const tileName = resolved.dressing[p.tile] ?? p.tile;
     const entry = pack.get(tileName);
     if (!entry) throw new Error(`Unknown dressing tile "${tileName}" (theme "${resolved.id}").`);
-    tiles.push(tileDoc(entry, serverBase, p.gx, p.gy, {
+    const { w: fw, h: fh } = placementFootprint(p, entry);
+    const doc = tileDoc(entry, serverBase, p.gx, p.gy, {
       elevation: 0, sort: LAYER_SORT.dressing, rotation: p.rotation, alpha: p.alpha, hidden: p.hidden,
-    }));
+      width: fw * TILE_PX, height: fh * TILE_PX,
+    });
+    // Interactive dressing (FR-16): the tile carries its item id so
+    // the click module can find it — the light _id, kind and alpha
+    // join the flag in the hook's pairing step, after the light is
+    // created (the _id does not exist at layout time).
+    if (p.dressingId) doc.flags = { meroki: { dressingId: p.dressingId } };
+    tiles.push(doc);
   }
 
   // Atmosphere: fog wisps float above everything (elevation 1), so they
@@ -801,26 +1257,33 @@ export function layoutRoom(
     const tileName = resolved.atmosphere[p.tile] ?? p.tile;
     const entry = pack.get(tileName);
     if (!entry) throw new Error(`Unknown fog tile "${tileName}" (theme "${resolved.id}").`);
+    const { w: fw, h: fh } = placementFootprint(p, entry);
     tiles.push(tileDoc(entry, serverBase, p.gx, p.gy, {
       elevation: FOG_ELEVATION, sort: 0, rotation: p.rotation, alpha: p.alpha, hidden: p.hidden,
+      width: fw * TILE_PX, height: fh * TILE_PX,
     }));
   }
 
   // Collision walls: the perimeter, split around the door cells. A door
   // cell becomes a door segment (door: 1); a secret door cell becomes a
   // secret segment (door: 2); an opening cell gets no wall at all; the
-  // rest are plain walls. Then the merged maze walls.
+  // rest are plain walls. Then the diagonal walls and the merged maze walls.
   const walls: WallSpec[] = [];
-  for (const side of ["north", "south", "east", "west"] as WallSide[]) {
-    const n = cellsAlong(side, gridW, gridH);
-    const doorsHere = doors.filter((d) => d.wall === side && !d.secret).map((d) => d.at);
-    const secretHere = doors.filter((d) => d.wall === side && d.secret).map((d) => d.at);
-    const openHere = openings.filter((o) => o.wall === side).map((o) => o.at);
-    for (const [first, last, kind] of splitWall(n, doorsHere, openHere, secretHere)) {
-      if (kind === "open") continue;
-      walls.push({ ...wallCoords(side, first, last, width, height), door: kind === "door" ? 1 : kind === "secret" ? 2 : 0 });
+  if (perimeterWalls) {
+    walls.push(...perimeterWalls);
+  } else {
+    for (const side of ["north", "south", "east", "west"] as WallSide[]) {
+      const n = cellsAlong(side, gridW, gridH);
+      const doorsHere = doors.filter((d) => d.wall === side && !d.secret).map((d) => d.at);
+      const secretHere = doors.filter((d) => d.wall === side && d.secret).map((d) => d.at);
+      const openHere = openings.filter((o) => o.wall === side).map((o) => o.at);
+      for (const [first, last, kind] of splitWall(n, doorsHere, openHere, secretHere)) {
+        if (kind === "open") continue;
+        walls.push({ ...wallCoords(side, first, last, width, height), door: kind === "door" ? 1 : kind === "secret" ? 2 : 0 });
+      }
     }
   }
+  walls.push(...diagonalWalls);
   walls.push(...mazeCollisionWalls(spec, grids));
 
   // Lights: torch shorthand (the theme's light palette) + explicit
@@ -1344,6 +1807,10 @@ export function widenRoom(spec: RoomSpec, side: WallSide, by: number): RoomSpec 
     lights: spec.lights?.map((l) => ({ ...l, x: l.x + dx * TILE_PX, y: l.y + dy * TILE_PX })),
     mazes: spec.mazes?.map((m) => ({ ...m, gx: m.gx + dx, gy: m.gy + dy })),
     overlays: spec.overlays?.map((o) => ({ ...o, gx: o.gx + dx, gy: o.gy + dy })),
+    // Diagonals shift with the room like any other placement. The
+    // cutout is corner-relative, so it needs no shift — it stays
+    // anchored to the same corner at the same size.
+    diagonals: spec.diagonals?.map((d) => ({ ...d, gx: d.gx + dx, gy: d.gy + dy })),
   };
 }
 
@@ -1455,6 +1922,8 @@ export interface PropEntry {
   rotation?: number;
   alpha?: number;
   hidden?: boolean;
+  w?: number;
+  h?: number;
 }
 
 export function listProps(spec: RoomSpec): PropEntry[] {
@@ -1466,6 +1935,8 @@ export function listProps(spec: RoomSpec): PropEntry[] {
     ...(p.rotation !== undefined ? { rotation: p.rotation } : {}),
     ...(p.alpha !== undefined ? { alpha: p.alpha } : {}),
     ...(p.hidden !== undefined ? { hidden: p.hidden } : {}),
+    ...(p.w !== undefined ? { w: p.w } : {}),
+    ...(p.h !== undefined ? { h: p.h } : {}),
   }));
 }
 
@@ -1498,7 +1969,7 @@ function nextPropId(spec: RoomSpec): string {
  */
 export function placeProp(
   spec: RoomSpec,
-  input: { tile: string; gx: number; gy: number; rotation?: number; alpha?: number; hidden?: boolean },
+  input: { tile: string; gx: number; gy: number; rotation?: number; alpha?: number; hidden?: boolean; w?: number; h?: number },
   pack: Pack,
 ): RoomSpec {
   const known = listPropTiles(pack);
@@ -1520,6 +1991,8 @@ export function placeProp(
         ...(input.rotation !== undefined ? { rotation: input.rotation } : {}),
         ...(input.alpha !== undefined ? { alpha: input.alpha } : {}),
         ...(input.hidden !== undefined ? { hidden: input.hidden } : {}),
+        ...(input.w !== undefined ? { w: input.w } : {}),
+        ...(input.h !== undefined ? { h: input.h } : {}),
         id: nextPropId(spec),
       },
     ],
@@ -1594,4 +2067,136 @@ export function removeProp(spec: RoomSpec, target: PropTarget): RoomSpec {
   const dressing = [...(spec.dressing ?? [])];
   dressing.splice(idx, 1);
   return { ...spec, dressing };
+}
+
+// ---------------------------------------------------------------------------
+// Cutscene prop recording (BRA-242): a prop played by a cutscene step
+// lands in the room spec, so a rebuild of the room puts it back.
+// ---------------------------------------------------------------------------
+
+/** A played cutscene `prop` step, in the player's pixel coordinates. */
+export interface CutscenePropInput {
+  /** Texture src as played, e.g. "worlds/testbed/bones.png". */
+  src: string;
+  /** Top-left corner, in scene px. */
+  x: number;
+  y: number;
+  width?: number;
+  height?: number;
+  rotation?: number;
+  alpha?: number;
+  hidden?: boolean;
+}
+
+export interface RecordCutscenePropResult {
+  /** The spec with the prop recorded (unchanged when not recorded). */
+  spec: RoomSpec;
+  recorded: boolean;
+  /** The pack tile the src resolved to. */
+  tile: string;
+  /** Spec cell the prop was recorded at (fractional cells allowed). */
+  gx: number;
+  gy: number;
+  /** The fresh `prop-<n>` id, when recorded. */
+  propId?: string;
+  /** What happened, in plain words — the step log carries this. */
+  note: string;
+}
+
+/**
+ * Resolve a played texture src to a prop tile name, by the file's
+ * basename: the composer uploads tiles as
+ * `${serverBase}/<basename of the pack file>`, so
+ * "worlds/testbed/bones.png" is the pack's "bones" tile. A src that
+ * matches no dressing tile throws, listing the known props — a
+ * one-off image (or a floor tile) cannot live in the room spec, and
+ * that must fail loudly at record time, not silently drop the prop.
+ * A basename shared by two dressing tiles is ambiguous and throws,
+ * naming both.
+ */
+export function propTileNameForSrc(pack: Pack, src: string): string {
+  const known = listPropTiles(pack);
+  const base = path.basename(src);
+  const hits = known.filter((name) => path.basename(pack.get(name)?.file ?? "") === base);
+  if (hits.length === 1) return hits[0];
+  if (hits.length > 1) {
+    throw new Error(
+      `Prop src "${src}" matches more than one prop tile: ${hits.map((h) => `"${h}"`).join(", ")} — record it by tile name instead.`,
+    );
+  }
+  throw new Error(
+    `Prop src "${src}" is not a prop tile in the pack. Known props: ${known.join(", ")}.`,
+  );
+}
+
+/**
+ * Record a played cutscene prop in the room spec (BRA-242): the
+ * played tile becomes a dressing placement via placeProp, so the
+ * next rebuild of the room puts it back at the same cell. Pure —
+ * returns a new spec, never mutates the input.
+ *
+ * - Position is exact: props are free sprites, so gx/gy keep the
+ *   fractional cell (x/100) instead of snapping to a grid cell.
+ * - Footprint must be whole cells (validateSpec's rule), so the
+ *   played px size rounds to the nearest whole-cell w/h (min 1);
+ *   a 150px-wide prop records as 2 cells wide, not 1.5.
+ * - A re-play is a no-op for the spec: a prop with the same tile,
+ *   cell, and rotation is already recorded, so it is reported as
+ *   such instead of appending a duplicate. (The Tile create itself
+ *   still duplicates on a re-run — the known player limit; the spec
+ *   at least does not.)
+ * - Throws when the src is not a pack prop, or when the placement
+ *   fails validation (outside the room, on a maze wall, bad alpha).
+ *   The player catches that and reports it on the step instead of
+ *   failing the play — the prop is on the table, it just will not
+ *   survive a rebuild.
+ */
+export function recordCutsceneProp(
+  spec: RoomSpec,
+  step: CutscenePropInput,
+  pack: Pack,
+): RecordCutscenePropResult {
+  const tile = propTileNameForSrc(pack, step.src);
+  const gx = step.x / TILE_PX;
+  const gy = step.y / TILE_PX;
+  const w = Math.max(1, Math.round((step.width ?? 100) / TILE_PX));
+  const h = Math.max(1, Math.round((step.height ?? 100) / TILE_PX));
+  const rotation = step.rotation ?? 0;
+  const existing = (spec.dressing ?? []).find(
+    (p) => p.tile === tile && p.gx === gx && p.gy === gy && (p.rotation ?? 0) === rotation,
+  );
+  if (existing) {
+    return {
+      spec,
+      recorded: false,
+      tile,
+      gx,
+      gy,
+      note: `"${tile}" at (${gx},${gy}) is already in the room spec${existing.id ? ` as ${existing.id}` : ""} — not recorded twice.`,
+    };
+  }
+  const next = placeProp(
+    spec,
+    {
+      tile,
+      gx,
+      gy,
+      ...(step.rotation !== undefined ? { rotation: step.rotation } : {}),
+      ...(step.alpha !== undefined ? { alpha: step.alpha } : {}),
+      ...(step.hidden !== undefined ? { hidden: step.hidden } : {}),
+      w,
+      h,
+    },
+    pack,
+  );
+  const placed = next.dressing?.[next.dressing.length - 1];
+  return {
+    spec: next,
+    recorded: true,
+    tile,
+    gx,
+    gy,
+    propId: placed?.id,
+    note: `Recorded "${tile}" at (${gx},${gy})${placed?.id ? ` as ${placed.id}` : ""} — a rebuild puts it back.`,
+  };
 }

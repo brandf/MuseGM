@@ -1,55 +1,96 @@
 /**
- * Meroki Pins — Foundry VTT module, v1 (0.1.0).
+ * Meroki Pins — Foundry VTT module, v1.1 (0.2.0).
  *
  * What it does
- *   Adds a "Meroki Pin" toggle tool to the Notes toolbar. Click the tool,
- *   click the map, type the request in the dialog, and the module drops a
- *   map Note pin at those canvas coordinates. The pin is backed by a
- *   JournalEntry page carrying the request plus flags.meroki.request.
+ *   Drops a Note pin backed by a JournalEntry carrying
+ *   `flags.meroki.request`. Two ways to drop one:
+ *   - Notes-toolbar toggle ("Meroki Pin"): click the tool, click the map,
+ *     type the request in the dialog. (v1 path, unchanged.)
+ *   - Right-click the canvas and pick "Drop a Meroki Pin here" from the
+ *     context menu: the dialog opens at the right-clicked spot. (v1.1.)
+ *   After a pin is placed from the toolbar tool, the tool disarms and the
+ *   controls switch back to the Notes tool automatically. (v1.1.)
  *   Muse (the Meroki monitor) watches for new pins, acts on them — e.g.
  *   a secret door at the pinned spot plus the room behind it — replies
  *   in chat, and marks the pin resolved.
  *
- *   v1 is one request per pin. A real back-and-forth thread on a pin is v2.
+ *   v1.1 is one request per pin. A real back-and-forth thread on a pin is v2.
  *
- * Why a toolbar tool and not a right-click menu (the original idea)
- *   Right-click on the canvas is already taken (ping / pan), and the v14
- *   ContextMenu API for a canvas context-menu entry was not verifiable
- *   offline — Dave's Foundry was off and no 14.370 client bundle was on
- *   disk to check it against. The toolbar tool is the v1 path; the
- *   context-menu entry is a v1.1 TODO (see bottom of this file).
+ * Why the context menu does not fight the ping
+ *   Right-click on the canvas is already ping / pan. The menu is an
+ *   ADDITIONAL listener on the board element: it neither prevents the
+ *   event nor stops its propagation, so core's ping still fires (a pulse
+ *   where you right-clicked) and the menu opens on top of it. The menu
+ *   entry then opens the same dialog the toolbar tool opens, at the
+ *   right-clicked coordinates (recorded by our own `contextmenu`
+ *   listener — the ContextMenu entry callback only receives the target
+ *   element, never the pointer position).
  *
  * API notes — what is verified vs. what is assumed
- *   VERIFIED (public docs, Nov 19 2026):
- *     - Hooks.on("getSceneControlButtons", fn) is the hook modules use to
- *       add scene-control tools; in v13+ `controls` is an ARRAY of control
- *       groups, each with a `tools` array (SceneControls.controls is
- *       Array.<SceneControl> in the official API docs).
- *     - Toggle tools use an `onChange(event, active)` callback (shown in
- *       the lib-df-buttons / UI Extender tool-registration examples,
- *       which build on this same hook).
- *     - `new Dialog({title, content, buttons, default, close})` +
- *       `dialog.render(true)` is the still-documented V1 Dialog API
- *       (foundryvtt.com/api Dialog page). V1 Application classes are
- *       deprecated in v13+ but still ship in v14; DialogV2 is the modern
- *       replacement and a migration is a TODO once its exact
- *       `DialogV2.wait` button-callback signature is verified against
- *       the 14.370 bundle.
+ *   VERIFIED (official Foundry VTT v14 API docs, foundryvtt.com/api, and
+ *   the @league-of-foundry-developers/foundry-vtt-types 13.346 type
+ *   definitions, both read 2026-11-21 — the 14.370 client bundle itself
+ *   is NOT on disk, see the live-check list at the bottom):
+ *     - `foundry.applications.ux.ContextMenu` (v14 API index lists it
+ *       under that path). `new ContextMenu(container, selector,
+ *       menuItems, options)` with `options: { jQuery: false,
+ *       fixed?: boolean, eventName?: string, onOpen?, onClose? }` —
+ *       `jQuery: false` is the v14 default (per the types' deprecation
+ *       note) and is passed explicitly. Entry shape: `{ name, icon?,
+ *       group?, callback: (target: HTMLElement) => void,
+ *       condition?: boolean | ((target) => boolean) }`. `fixed: true`
+ *       positions the menu at the pointer in the viewport instead of
+ *       injecting it into the target.
+ *     - `foundry.applications.api.DialogV2.wait(config)` where config
+ *       is `Partial<ApplicationConfiguration & DialogV2Configuration &
+ *       DialogV2WaitOptions>`: `window: { title }` for the title,
+ *       `content` (string or element), `buttons: DialogV2Button[]`
+ *       with `{ action, label, callback?, default?, icon? }`,
+ *       `rejectClose` (false = dismiss resolves null instead of
+ *       throwing), `render?: (event, dialog) => any`.
+ *     - `DialogV2ButtonCallback` is `(event: PointerEvent |
+ *       SubmitEvent, button: HTMLButtonElement, dialog: DialogV2) =>
+ *       Promise<any>`. `wait` resolves to the clicked button's `action`
+ *       identifier, OR to the value returned by its callback. The drop
+ *       callback returns the created JournalEntry id (or false when the
+ *       text fails validation); Cancel has no callback so `wait`
+ *       resolves to "cancel"; dismissing resolves to null.
+ *     - `ui.controls.activate(options)` with `ActivateOptions = {
+ *       event?, control?, tool?, toggles?: Record<string, boolean> }`.
+ *       Passing `toggles: { "meroki-pin": false }` turns the toggle
+ *       off through its `onChange(event, false)` — the same path as
+ *       clicking the tool off. No tool name is guessed: activating the
+ *       "notes" control with no `tool` keeps the control's current /
+ *       default tool. (`activeControl` / `activeTool` / `initialize`
+ *       are deprecated since v13 until v15 — `activate` is the v14 way.)
  *   ASSUMED (standard Foundry/Pixi patterns — verify on first install):
  *     - `canvas.app.stage.once("pointerdown", fn)` receives a Pixi
  *       FederatedPointerEvent; `event.getLocalPosition(canvas.app.stage)`
  *       returns canvas/world coordinates (the stage is the world root,
  *       so stage-local == scene coordinates).
  *     - `event.button === 0` means the primary (left) mouse button.
- *     - The Notes layer's click handler ignores clicks while a different
- *       tool is active, so arming this toggle tool does not ALSO open a
- *       core note dialog. (If it does, close the extra dialog — the pin
- *       still gets created. See "Known rough edges" in the README.)
+ *     - `document.getElementById("board")` is the board div containing
+ *       the `<canvas>` element (`canvas.app.view`); a ContextMenu on it
+ *       with selector `"canvas"` fires for right-clicks on the map.
+ *     - A DOM `contextmenu` event's client coords convert to world
+ *       coords via `canvas.app.stage.toLocal(new PIXI.Point(sx, sy))`
+ *       where (sx, sy) is the position within the canvas element
+ *       (`getBoundingClientRect` origin). Same assumption class as the
+ *       v1 `getLocalPosition` one.
+ *     - Core's canvas ping handler does not `stopPropagation()` on the
+ *       `contextmenu` event, so a menu bound on the board still opens
+ *       (and the ping still pulses). If core ever swallows the event,
+ *       the menu silently never opens while the toolbar tool keeps
+ *       working — that is the live-check item, not a crash.
  *     - `game.user.can("JOURNAL_CREATE")` is the permission check for
  *       creating journal entries; `Note.create(data, {parent: scene})`
  *       creates the embedded Note; `CONST.JOURNAL_ENTRY_PAGE_FORMATS.HTML`
  *       is 1. All are guarded or commented where a wrong guess would
  *       break the flow.
+ *     - The Notes layer's click handler ignores clicks while a different
+ *       tool is active, so arming this toggle tool does not ALSO open a
+ *       core note dialog. (If it does, close the extra dialog — the pin
+ *       still gets created. See "Known rough edges" in the README.)
  *
  * The pin contract (what the monitor looks for — keep in sync with the
  * module README and BACKLOG.md):
@@ -60,6 +101,17 @@
  *     — the visible pin; the monitor can find the entry from it.
  *   The monitor marks a pin done by setting flags.meroki.status = "done"
  *   on both documents (and may append its reply to the journal page).
+ *
+ * Live checks (need Dave's Foundry up — the 14.370 bundle is not on
+ * disk, so these were verified against the v14 docs/types only):
+ *   - Right-click the canvas: the menu opens AND the ping still pulses.
+ *   - Menu entry opens the dialog at the right-clicked spot (coords).
+ *   - Drop Pin from the toolbar tool: the toggle visually switches off
+ *     and the controls go back to the Notes tool.
+ *   - Drop Pin from the menu: the controls do NOT switch (nothing was
+ *     armed, nothing to disarm).
+ *   - DialogV2.wait resolves as documented (drop → entry id, cancel →
+ *     "cancel", X/Esc → null, empty text → warning + no pin).
  */
 
 const MODULE_ID = "meroki-pins";
@@ -67,9 +119,15 @@ const FLAG_SCOPE = "meroki";
 const TOOL_NAME = "meroki-pin";
 const PIN_TEXT_COLOR = "#e8c15a"; // gold — Meroki's pin color, stands out from core notes
 const MAX_REQUEST_LENGTH = 2000;
+/** How long a recorded right-click position stays usable (ms). */
+const CONTEXT_MENU_POSITION_TTL_MS = 10_000;
 
 /** True while the next canvas click should open the pin dialog. */
 let placementArmed = false;
+/** The canvas context menu instance (built once). */
+let canvasContextMenu = null;
+/** Last right-clicked world position, recorded by our own listener. */
+let lastContextMenuPos = null;
 
 Hooks.once("init", () => {
   console.log(`${MODULE_ID} | Meroki Pins loaded — Notes toolbar, "Meroki Pin" tool.`);
@@ -107,6 +165,102 @@ Hooks.on("getSceneControlButtons", (controls) => {
 });
 
 /* ------------------------------------------------------------------ */
+/* Canvas context menu (v1.1)                                          */
+/* ------------------------------------------------------------------ */
+
+// The board element exists from page load, but registering is cheap to
+// retry: register on ready, and again on canvasReady if the first try
+// found no board yet. Guarded so the menu is built exactly once.
+Hooks.once("ready", registerCanvasContextMenu);
+Hooks.on("canvasReady", registerCanvasContextMenu);
+
+/**
+ * Build the canvas right-click menu once. The ContextMenu class is
+ * resolved defensively (`foundry.applications.ux.ContextMenu`, falling
+ * back to the legacy global) — if neither exists the menu is skipped
+ * with a warning and the toolbar tool keeps working.
+ */
+function registerCanvasContextMenu() {
+  if (canvasContextMenu) return;
+  const board = document.getElementById("board");
+  if (!board) return; // too early; canvasReady will retry
+  const ContextMenuClass =
+    globalThis.foundry?.applications?.ux?.ContextMenu ?? globalThis.ContextMenu;
+  if (typeof ContextMenuClass !== "function") {
+    console.warn(`${MODULE_ID} | No ContextMenu class found — right-click menu disabled, toolbar tool still works.`);
+    return;
+  }
+  // Record the right-click position BEFORE the menu opens: the entry
+  // callback only receives the target element, never the pointer event.
+  // Our recorder runs first (registered before the ContextMenu's own
+  // listener) and does not preventDefault / stopPropagation, so core's
+  // ping still fires.
+  board.addEventListener("contextmenu", recordContextMenuPosition);
+  canvasContextMenu = new ContextMenuClass(
+    board,
+    "canvas",
+    [
+      {
+        name: "Drop a Meroki Pin here",
+        icon: '<i class="fa-solid fa-map-pin"></i>',
+        condition: () => !!canvas?.scene && canCreateJournal(),
+        callback: () => {
+          if (!canvas?.scene) {
+            ui.notifications.warn("Meroki Pins: open a scene first, then drop a pin.");
+            return;
+          }
+          if (!canCreateJournal()) {
+            ui.notifications.warn("Meroki Pins: you need permission to create journal entries to drop a pin.");
+            return;
+          }
+          const pos = lastContextMenuPos;
+          if (!pos || Date.now() - pos.at > CONTEXT_MENU_POSITION_TTL_MS) {
+            ui.notifications.warn("Meroki Pins: right-click the map again, then pick the menu entry.");
+            return;
+          }
+          void openPinDialog(pos.x, pos.y, { fromToolbar: false });
+        },
+      },
+    ],
+    { jQuery: false, fixed: true },
+  );
+}
+
+/** Remember where the last right-click on the board landed, in world coords. */
+function recordContextMenuPosition(event) {
+  const pos = clientToWorld(event.clientX, event.clientY);
+  if (pos) lastContextMenuPos = { ...pos, at: Date.now() };
+}
+
+/**
+ * Convert viewport (client) coordinates to scene/world coordinates.
+ * The canvas element's bounding rect gives the position within the
+ * canvas; the stage's world transform maps that to world coords.
+ * Returns null when the canvas is not ready.
+ */
+function clientToWorld(clientX, clientY) {
+  try {
+    const view = canvas?.app?.view;
+    const stage = canvas?.app?.stage;
+    if (!view || !stage || typeof stage.toLocal !== "function") return null;
+    const rect = view.getBoundingClientRect();
+    const point = new PIXI.Point(clientX - rect.left, clientY - rect.top);
+    const world = stage.toLocal(point);
+    return { x: Math.round(world.x), y: Math.round(world.y) };
+  } catch (_e) {
+    return null;
+  }
+}
+
+/** Permission check for creating journal entries (fail-open: creation surfaces the real error). */
+function canCreateJournal() {
+  try {
+    if (typeof game?.user?.can === "function") return game.user.can("JOURNAL_CREATE");
+  } catch (_e) { /* fall through */ }
+  return true;
+}
+
+/* ------------------------------------------------------------------ */
 /* Placement                                                           */
 /* ------------------------------------------------------------------ */
 
@@ -123,12 +277,10 @@ function armPlacement() {
   // Pre-check the journal permission so a player without it gets a clear
   // message instead of a failed create. Non-fatal: if the check itself is
   // unavailable, creation will surface the real error.
-  try {
-    if (typeof game?.user?.can === "function" && !game.user.can("JOURNAL_CREATE")) {
-      ui.notifications.warn("Meroki Pins: you need permission to create journal entries to drop a pin.");
-      return;
-    }
-  } catch (_e) { /* fall through */ }
+  if (!canCreateJournal()) {
+    ui.notifications.warn("Meroki Pins: you need permission to create journal entries to drop a pin.");
+    return;
+  }
 
   placementArmed = true;
   ui.notifications.info("Meroki Pin armed — click the map where the pin goes.");
@@ -151,59 +303,72 @@ async function onCanvasPointerDown(event) {
   const pos = event.getLocalPosition(canvas.app.stage);
   const x = Math.round(pos.x);
   const y = Math.round(pos.y);
-  await openPinDialog(x, y);
+  await openPinDialog(x, y, { fromToolbar: true });
 }
 
 /* ------------------------------------------------------------------ */
-/* Dialog                                                              */
+/* Dialog (DialogV2, v1.1)                                             */
 /* ------------------------------------------------------------------ */
 
 /**
- * V1 Dialog with a text box. The textarea is read back with
- * document.querySelector by id (not from the callback's `html` arg) so
- * the code does not depend on whether the dialog hands back jQuery or a
- * plain HTMLElement.
+ * DialogV2 with a text box. `DialogV2.wait` resolves to the clicked
+ * button's `action` id, or to the value its callback returns — the drop
+ * callback returns the created JournalEntry id (or `false` when the
+ * text fails validation); Cancel has no callback so `wait` resolves to
+ * "cancel"; dismissing (X / Esc) resolves to null (`rejectClose:
+ * false`). The textarea is read back with `document.querySelector` by
+ * id (not from the callback's `button` arg) so the code does not depend
+ * on the dialog's element plumbing.
+ *
+ * V1 parity note: like the old V1 dialog, clicking Drop Pin with empty
+ * text warns and closes the dialog — DialogV2 buttons submit on click
+ * and a callback cannot veto closing. The user just drops a new pin.
  */
-function openPinDialog(x, y) {
-  return new Promise((resolve) => {
-    const dialog = new Dialog({
-      title: "Drop a Meroki Pin",
-      content: `
-        <p>Leave a note for Meroki at <strong>(${x}, ${y})</strong> on
-        <strong>${escapeHtml(canvas.scene.name ?? "this scene")}</strong>.</p>
-        <textarea id="meroki-pin-request" rows="5" style="width:100%; resize:vertical;"
-          placeholder="e.g. put a secret door here that leads into a room that is the love nest room"></textarea>
-        <p class="hint" style="opacity:0.75; font-size:0.9em;">One request per pin.
-        Meroki picks it up from the journal, builds what you asked for, and
-        replies in chat when it is done.</p>`,
-      buttons: {
-        drop: {
-          icon: '<i class="fa-solid fa-map-pin"></i>',
-          label: "Drop Pin",
-          callback: async () => {
-            const text = (document.querySelector("#meroki-pin-request")?.value ?? "").trim();
-            if (!text) {
-              ui.notifications.warn("Meroki Pins: write the request first.");
-              return;
-            }
-            if (text.length > MAX_REQUEST_LENGTH) {
-              ui.notifications.warn(`Meroki Pins: keep it under ${MAX_REQUEST_LENGTH} characters.`);
-              return;
-            }
-            await createPin(x, y, text);
-          },
-        },
-        cancel: {
-          icon: '<i class="fa-solid fa-xmark"></i>',
-          label: "Cancel",
+async function openPinDialog(x, y, { fromToolbar } = {}) {
+  const DialogV2 = globalThis.foundry?.applications?.api?.DialogV2;
+  if (typeof DialogV2?.wait !== "function") {
+    ui.notifications.error("Meroki Pins: DialogV2 is not available in this Foundry version.");
+    return null;
+  }
+  const result = await DialogV2.wait({
+    window: { title: "Drop a Meroki Pin" },
+    content: `
+      <p>Leave a note for Meroki at <strong>(${x}, ${y})</strong> on
+      <strong>${escapeHtml(canvas.scene.name ?? "this scene")}</strong>.</p>
+      <textarea id="meroki-pin-request" rows="5" style="width:100%; resize:vertical;"
+        placeholder="e.g. put a secret door here that leads into a room that is the love nest room"></textarea>
+      <p class="hint" style="opacity:0.75; font-size:0.9em;">One request per pin.
+      Meroki picks it up from the journal, builds what you asked for, and
+      replies in chat when it is done.</p>`,
+    buttons: [
+      {
+        action: "drop",
+        label: "Drop Pin",
+        icon: "fa-solid fa-map-pin",
+        default: true,
+        callback: async (_event, _button, _dialog) => {
+          const text = (document.querySelector("#meroki-pin-request")?.value ?? "").trim();
+          if (!text) {
+            ui.notifications.warn("Meroki Pins: write the request first.");
+            return false;
+          }
+          if (text.length > MAX_REQUEST_LENGTH) {
+            ui.notifications.warn(`Meroki Pins: keep it under ${MAX_REQUEST_LENGTH} characters.`);
+            return false;
+          }
+          return createPin(x, y, text, { fromToolbar });
         },
       },
-      default: "drop",
-      render: () => document.querySelector("#meroki-pin-request")?.focus(),
-      close: () => resolve(),
-    });
-    dialog.render(true);
+      {
+        action: "cancel",
+        label: "Cancel",
+        icon: "fa-solid fa-xmark",
+      },
+    ],
+    rejectClose: false,
+    render: (_event, _dialog) => document.querySelector("#meroki-pin-request")?.focus(),
   });
+  return result;
 }
 
 /* ------------------------------------------------------------------ */
@@ -212,9 +377,12 @@ function openPinDialog(x, y) {
 
 /**
  * Creates the JournalEntry (request + flags) and the Note pin on the
- * current scene pointing at the entry's first page.
+ * current scene pointing at the entry's first page. Returns the created
+ * entry id. When the pin came from the toolbar tool, the tool is
+ * disarmed and the controls switch back to the Notes tool afterwards;
+ * a context-menu pin leaves the controls alone (nothing was armed).
  */
-async function createPin(x, y, request) {
+async function createPin(x, y, request, { fromToolbar } = {}) {
   const short = request.length > 40 ? `${request.slice(0, 40).trimEnd()}…` : request;
   const pageHtml = `<p>${escapeHtml(request).replace(/\n/g, "<br>")}</p>`;
   const sceneId = canvas.scene.id;
@@ -249,6 +417,28 @@ async function createPin(x, y, request) {
   );
 
   ui.notifications.info("Meroki Pin dropped — Meroki will pick it up from the journal.");
+  if (fromToolbar) await switchToolBack();
+  return entry.id;
+}
+
+/**
+ * Switch the active tool back after a pin is placed: activate the Notes
+ * control with the Meroki Pin toggle turned off. The `toggles` record
+ * flows through the tool's `onChange(event, false)` — the same path as
+ * clicking the tool off — so the toggle's visual state and the armed
+ * listener stay in sync. No tool name is guessed: with no `tool` given,
+ * the control keeps its current / default tool. Best effort: if the
+ * controls API is unavailable the toggle is left for the user to click
+ * off (placement itself is already disarmed).
+ */
+async function switchToolBack() {
+  try {
+    if (typeof ui?.controls?.activate === "function") {
+      await ui.controls.activate({ control: "notes", toggles: { [TOOL_NAME]: false } });
+    }
+  } catch (_e) {
+    // Visual toggle state only; the pin is already placed.
+  }
 }
 
 /* ------------------------------------------------------------------ */
@@ -263,16 +453,3 @@ function escapeHtml(s) {
     .replace(/"/g, "&quot;")
     .replace(/'/g, "&#39;");
 }
-
-/* ------------------------------------------------------------------ */
-/* TODO (v1.1)                                                         */
-/* ------------------------------------------------------------------ */
-// - Right-click canvas context-menu entry ("Drop a Meroki Pin here"):
-//   needs the v14 ContextMenu API verified against the 14.370 client
-//   bundle (class path + constructor shape). The toolbar tool is the v1
-//   path; add the menu entry once verified, keep both.
-// - Migrate the dialog from V1 Dialog to foundry.applications.api.DialogV2
-//   once DialogV2.wait's button-callback signature is verified the same way.
-// - After a pin is placed, switch the active tool back to the Notes tool
-//   (ui.controls tool-activation API — also to verify against the bundle);
-//   v1 leaves the toggle armed state to the user (click another tool).
