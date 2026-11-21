@@ -451,11 +451,27 @@ export function validateDressingPlan(plan: DressingPlan, roomSpec: RoomSpec): st
 }
 
 /**
+ * The group name for a dressing kind — the name its lights are
+ * addressable by (FR-7, BRA-197). "Torches" is not "torchs": the
+ * plural is spelled out, not derived by adding "s".
+ */
+export const DRESSING_KIND_GROUP_NAME: Record<DressingKind, string> = {
+  torch: "the torches",
+  candle: "the candles",
+  brazier: "the braziers",
+};
+
+/**
  * What the composer hook adds to a RoomSpec from a plan: torch cells
  * (the `torches` shorthand), one LightSpec per item, and a dressing
  * placement per item that has a tile. Items without a tile (candle,
  * brazier until the pack has them) are left out of `dressing` and
  * listed in `skipped` — the hook must not build what it cannot draw.
+ *
+ * Each light is named for its kind (DRESSING_KIND_GROUP_NAME) — so a
+ * whole kind can be addressed by name once built ("dim the
+ * braziers"). The name rides the LightSpec into the room spec and is
+ * stamped into the created AmbientLight's flags by `addLights`.
  *
  * Known gap: LightSpec carries no alpha (addLights hardcodes 0.5), so
  * the hook must set each light's alpha in a post-create update — see
@@ -463,7 +479,7 @@ export function validateDressingPlan(plan: DressingPlan, roomSpec: RoomSpec): st
  */
 export function dressingToRoomSpec(plan: DressingPlan): {
   torches: { gx: number; gy: number }[];
-  lights: { x: number; y: number; dim: number; bright: number; color: string }[];
+  lights: { x: number; y: number; dim: number; bright: number; color: string; name: string }[];
   dressing: { tile: string; gx: number; gy: number }[];
   skipped: string[];
 } {
@@ -476,6 +492,7 @@ export function dressingToRoomSpec(plan: DressingPlan): {
     dim: i.light.dim,
     bright: i.light.bright,
     color: i.light.color,
+    name: DRESSING_KIND_GROUP_NAME[i.kind],
   }));
   const dressing: { tile: string; gx: number; gy: number }[] = [];
   const skipped: string[] = [];

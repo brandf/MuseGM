@@ -26,8 +26,18 @@ import {
   sceneHasTileRoomKey,
   tileEmbedKey,
   tileRoomBuildKey,
+  type KeyedEmbed,
+  type PlannedTile,
+  type TileRoomEmbeds,
 } from "../src/worldbuilding/tile-keys.js";
-import { loadPack, type Pack, type RoomSpec } from "../src/worldbuilding/tiles-layout.js";
+import {
+  layoutRoom,
+  loadPack,
+  widenRoom,
+  type Pack,
+  type RoomSpec,
+  type TileDoc,
+} from "../src/worldbuilding/tiles-layout.js";
 import type { FoundryLive } from "../src/live.js";
 
 // --- dynamic import of the live modules (see header) ----------------
@@ -94,20 +104,61 @@ describe("tileRoomBuildKey / tileEmbedKey / parseTileEmbedKey", () => {
 });
 
 describe("planTileRoomConverge", () => {
-  const planned = { tiles: 3, walls: 2, lights: 1 };
-  const keyed = (kind: "tile" | "wall" | "light", i: number, id: string) => ({
+  // A planned tile: position + look. Distinct cells so each slot is
+  // distinguishable by position alone.
+  const T = (x: number, y: number, src = "worlds/testbed/floor-plain.png", sort = 0): PlannedTile => ({
+    sort,
+    elevation: 0,
+    x,
+    y,
+    src,
+    rotation: 0,
+  });
+  const keyedTile = (i: number, t: PlannedTile, id: string): KeyedEmbed => ({
+    key: tileEmbedKey(KEY, "tile", i),
+    id,
+    ...t,
+  });
+  const keyed = (kind: "wall" | "light", i: number, id: string): KeyedEmbed => ({
     key: tileEmbedKey(KEY, kind, i),
     id,
   });
+  const present = (
+    tiles: KeyedEmbed[],
+    walls: KeyedEmbed[] = [],
+    lights: KeyedEmbed[] = [],
+  ): TileRoomEmbeds => ({ tiles, walls, lights, levelIds: [], initialLevel: null });
 
-  it("creates everything when the scene is empty", () => {
-    const plan = planTileRoomConverge(planned, {
-      tiles: [],
+  /** A fake scene doc holding one layout's tiles as keyed embeds. */
+  const sceneFromTiles = (tiles: TileDoc[], buildKey: string): TileRoomEmbeds =>
+    extractTileRoomEmbeds({
+      tiles: tiles.map((t, i) => ({
+        ...t,
+        _id: `tile-${i}`,
+        flags: { "foundry-live": { tileRoomKey: tileEmbedKey(buildKey, "tile", i) } },
+      })),
       walls: [],
       lights: [],
-      levelIds: [],
-      initialLevel: null,
-    }, KEY);
+    });
+  const plannedFromLayout = (layout: ReturnType<typeof layoutRoom>) => ({
+    tiles: layout.tiles.map((t) => ({
+      sort: t.sort,
+      elevation: t.elevation,
+      x: t.x,
+      y: t.y,
+      src: t.texture.src,
+      rotation: t.rotation,
+    })),
+    walls: layout.walls.length,
+    lights: layout.lights.length,
+  });
+
+  it("creates everything when the scene is empty", () => {
+    const plan = planTileRoomConverge(
+      { tiles: [T(0, 0), T(100, 0), T(200, 0)], walls: 2, lights: 1 },
+      present([], [], []),
+      KEY,
+    );
     expect(plan.createTiles).toEqual([0, 1, 2]);
     expect(plan.createWalls).toEqual([0, 1]);
     expect(plan.createLights).toEqual([0]);
@@ -116,13 +167,16 @@ describe("planTileRoomConverge", () => {
   });
 
   it("creates nothing when everything is already in place", () => {
-    const plan = planTileRoomConverge(planned, {
-      tiles: [keyed("tile", 0, "t0"), keyed("tile", 1, "t1"), keyed("tile", 2, "t2")],
-      walls: [keyed("wall", 0, "w0"), keyed("wall", 1, "w1")],
-      lights: [keyed("light", 0, "l0")],
-      levelIds: ["lvl-1"],
-      initialLevel: "lvl-1",
-    }, KEY);
+    const tiles = [T(0, 0), T(100, 0), T(200, 0)];
+    const plan = planTileRoomConverge(
+      { tiles, walls: 2, lights: 1 },
+      present(
+        tiles.map((t, i) => keyedTile(i, t, `t${i}`)),
+        [keyed("wall", 0, "w0"), keyed("wall", 1, "w1")],
+        [keyed("light", 0, "l0")],
+      ),
+      KEY,
+    );
     expect(plan.createTiles).toEqual([]);
     expect(plan.createWalls).toEqual([]);
     expect(plan.createLights).toEqual([]);
@@ -132,30 +186,27 @@ describe("planTileRoomConverge", () => {
     expect(plan.keepLightIds).toEqual(["l0"]);
   });
 
-  it("creates only the missing indices and keeps the rest in order", () => {
-    const plan = planTileRoomConverge(planned, {
-      tiles: [keyed("tile", 0, "t0"), keyed("tile", 2, "t2")],
-      walls: [],
-      lights: [keyed("light", 0, "l0")],
-      levelIds: [],
-      initialLevel: null,
-    }, KEY);
+  it("creates only the missing tiles and keeps the rest in order", () => {
+    const tiles = [T(0, 0), T(100, 0), T(200, 0)];
+    const plan = planTileRoomConverge(
+      { tiles, walls: 2, lights: 1 },
+      present([keyedTile(0, tiles[0], "t0"), keyedTile(2, tiles[2], "t2")], [], [keyed("light", 0, "l0")]),
+      KEY,
+    );
     expect(plan.createTiles).toEqual([1]);
     expect(plan.keepTileIds).toEqual(["t0", null, "t2"]);
     expect(plan.createWalls).toEqual([0, 1]);
     expect(plan.createLights).toEqual([]);
   });
 
-  it("deletes surplus keyed embeds when the spec shrank", () => {
+  it("deletes surplus keyed tiles when the spec shrank", () => {
     const plan = planTileRoomConverge(
-      { tiles: 1, walls: 1, lights: 0 },
-      {
-        tiles: [keyed("tile", 0, "t0"), keyed("tile", 1, "t1"), keyed("tile", 5, "t5")],
-        walls: [keyed("wall", 0, "w0")],
-        lights: [keyed("light", 0, "l0"), keyed("light", 1, "l1")],
-        levelIds: [],
-        initialLevel: null,
-      },
+      { tiles: [T(0, 0)], walls: 1, lights: 0 },
+      present(
+        [keyedTile(0, T(0, 0), "t0"), keyedTile(1, T(100, 0), "t1"), keyedTile(5, T(500, 0), "t5")],
+        [keyed("wall", 0, "w0")],
+        [keyed("light", 0, "l0"), keyed("light", 1, "l1")],
+      ),
       KEY,
     );
     expect(plan.deleteTileIds).toEqual(["t1", "t5"]);
@@ -164,31 +215,88 @@ describe("planTileRoomConverge", () => {
   });
 
   it("never touches another build's embeds or unkeyed ones", () => {
-    const plan = planTileRoomConverge(planned, {
-      tiles: [
-        { key: tileEmbedKey("tile-room:other-room", "tile", 0), id: "other-t0" },
-        { key: tileEmbedKey(KEY, "tile", 9), id: "ours-t9" },
-      ],
-      walls: [{ key: "gm-hand-placed", id: "gm-wall" }],
-      lights: [],
-      levelIds: [],
-      initialLevel: null,
-    }, KEY);
+    const plan = planTileRoomConverge(
+      { tiles: [T(0, 0), T(100, 0), T(200, 0)], walls: 2, lights: 1 },
+      present(
+        [
+          // Same position as the first planned tile, but another
+          // build's key — must not match.
+          { key: tileEmbedKey("tile-room:other-room", "tile", 0), id: "other-t0", ...T(0, 0) },
+          // Our key but no position/look fields — matches nothing.
+          { key: tileEmbedKey(KEY, "tile", 9), id: "ours-t9" },
+        ],
+        [{ key: "gm-hand-placed", id: "gm-wall" }],
+        [],
+      ),
+      KEY,
+    );
     expect(plan.deleteTileIds).toEqual(["ours-t9"]);
     expect(plan.createTiles).toEqual([0, 1, 2]);
     expect(plan.keepTileIds).toEqual([null, null, null]);
   });
 
-  it("keeps the first of a duplicated index and deletes the second", () => {
-    const plan = planTileRoomConverge(planned, {
-      tiles: [keyed("tile", 0, "t0-a"), keyed("tile", 0, "t0-b")],
-      walls: [],
-      lights: [],
-      levelIds: [],
-      initialLevel: null,
-    }, KEY);
+  it("keeps the first of two identical-position tiles and deletes the second", () => {
+    const tiles = [T(0, 0), T(100, 0), T(200, 0)];
+    const plan = planTileRoomConverge(
+      { tiles, walls: 2, lights: 1 },
+      present([keyedTile(0, tiles[0], "t0-a"), keyedTile(0, tiles[0], "t0-b")], [], []),
+      KEY,
+    );
     expect(plan.keepTileIds).toEqual(["t0-a", null, null]);
     expect(plan.deleteTileIds).toEqual(["t0-b"]);
+  });
+
+  it("a widen keeps the prop at its cell and never parks it on a wall", () => {
+    // Regression (BRA-218): converge matched tiles by flat layout
+    // index, so widening the room shifted every later tile — the old
+    // bones tile stayed at index 72, which in the widened room is a
+    // south wall tile (ghost prop + missing wall). Position + look
+    // matching keeps the bones at its cell and recreates the shifted
+    // floor/wall tiles instead.
+    const layoutA = layoutRoom(baseSpec, pack, BASE);
+    const layoutB = layoutRoom(widenRoom(baseSpec, "east", 2), pack, BASE);
+    const presentEmbeds = sceneFromTiles(layoutA.tiles, KEY);
+    const plan = planTileRoomConverge(plannedFromLayout(layoutB), presentEmbeds, KEY);
+    const bonesA = layoutA.tiles.findIndex((t) => t.texture.src.endsWith("bones.png"));
+    const bonesB = layoutB.tiles.findIndex((t) => t.texture.src.endsWith("bones.png"));
+    const fogA = layoutA.tiles.findIndex((t) => t.texture.src.includes("fog-wisp"));
+    expect(bonesA).toBeGreaterThanOrEqual(0);
+    expect(bonesB).toBeGreaterThanOrEqual(0);
+    // The prop is the same embed, at its cell, in the widened room.
+    expect(plan.keepTileIds[bonesB]).toBe(`tile-${bonesA}`);
+    expect(plan.deleteTileIds).not.toContain(`tile-${bonesA}`);
+    expect(plan.deleteTileIds).not.toContain(`tile-${fogA}`);
+    // The real invariant: every kept tile still looks like the layout
+    // tile it covers — no prop parked on a wall slot, no wall parked
+    // on a prop slot.
+    layoutB.tiles.forEach((t, i) => {
+      const kept = plan.keepTileIds[i];
+      if (kept === null) return;
+      const embed = presentEmbeds.tiles.find((e) => e.id === kept);
+      expect(embed).toBeDefined();
+      expect(embed!.sort).toBe(t.sort);
+      expect(embed!.x).toBe(t.x);
+      expect(embed!.y).toBe(t.y);
+      expect(embed!.src).toBe(t.texture.src);
+    });
+  });
+
+  it("a re-skin keeps the prop and recreates the tiles whose look changed", () => {
+    // The western theme has no dressing variants, so the bones prop
+    // keeps its tile; the floor changes look (plain -> sand), so
+    // every floor tile is deleted + recreated instead of keeping the
+    // stale dungeon texture.
+    const dungeon = layoutRoom(baseSpec, pack, BASE);
+    const western = layoutRoom(baseSpec, pack, BASE, "western");
+    const presentEmbeds = sceneFromTiles(dungeon.tiles, KEY);
+    const plan = planTileRoomConverge(plannedFromLayout(western), presentEmbeds, KEY);
+    const bonesD = dungeon.tiles.findIndex((t) => t.texture.src.endsWith("bones.png"));
+    const bonesW = western.tiles.findIndex((t) => t.texture.src.endsWith("bones.png"));
+    expect(bonesW).toBeGreaterThanOrEqual(0);
+    expect(plan.keepTileIds[bonesW]).toBe(`tile-${bonesD}`);
+    const floorW = western.tiles.findIndex((t) => t.sort === 0);
+    expect(plan.keepTileIds[floorW]).toBeNull();
+    expect(plan.createTiles).toContain(floorW);
   });
 });
 

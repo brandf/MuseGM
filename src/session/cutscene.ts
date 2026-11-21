@@ -744,6 +744,12 @@ export interface PlayCutsceneResult extends SequenceResult {
  * Play a cutscene script: validate (refuses to start on any error),
  * expand formations (token centers resolve against live scene state),
  * then run the timeline through runSequence. Returns the per-step log.
+ *
+ * This is the implicit stage-first path: playing an unstaged script
+ * stages it inline (validate + expand + resolve) before anything
+ * moves. The explicit gate is src/session/staging.ts — stage the
+ * script against a world snapshot, show it to the GM, and fire the
+ * staged beat only on the GM's nod.
  */
 export async function playCutscene(
   live: FoundryLive,

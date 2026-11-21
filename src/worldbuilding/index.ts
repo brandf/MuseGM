@@ -35,7 +35,7 @@
 import * as fs from "node:fs";
 import type { FoundryLive } from "../live.js";
 import { uploadImage } from "./upload.js";
-import { FLAG_FIELDS, docHasFlag, findDocByFlag, flagValue } from "../idempotency.js";
+import { FLAG_FIELDS, FLAG_SCOPE, docHasFlag, findDocByFlag, flagValue } from "../idempotency.js";
 
 export interface SceneSpec {
   name: string;
@@ -73,6 +73,16 @@ export interface LightSpec {
   angle?: number;
   /** Hex color. Default: "#ff9a3c" (warm torchlight). */
   color?: string;
+  /**
+   * Display name for the light, e.g. "the braziers" or "the altar
+   * candles" (FR-7, BRA-197). When set, the name is stamped into the
+   * created AmbientLight's flags, and later steps/commands can address
+   * the light by name instead of by _id or coordinate (see
+   * `resolveNamedLights` in session/lights.ts). Several lights may
+   * share one name — they form one group and animate together.
+   * Without it, behavior is unchanged.
+   */
+  name?: string;
 }
 
 export interface LootSpec {
@@ -223,11 +233,45 @@ export async function addWalls(
 }
 
 /**
+ * One AmbientLight create document for a light spec. Pure — the
+ * payload `addLights` sends, testable with no connection. A named
+ * light is stamped with `flags["foundry-live"].lightName` (FR-7);
+ * with an embed key it also carries `tileRoomKey` (BRA-202), the two
+ * flags merged under one scope. A blank name stamps nothing.
+ */
+export function lightCreateData(
+  l: LightSpec,
+  embedKey?: string,
+): Record<string, unknown> {
+  const scope: Record<string, string> = {};
+  if (embedKey) scope[FLAG_FIELDS.tileRoom] = embedKey;
+  if (typeof l.name === "string" && l.name.trim().length > 0) {
+    scope[FLAG_FIELDS.lightName] = l.name.trim();
+  }
+  return {
+    x: l.x,
+    y: l.y,
+    rotation: 0,
+    config: {
+      dim: l.dim,
+      bright: l.bright,
+      angle: l.angle ?? 360,
+      color: l.color ?? "#ff9a3c",
+      alpha: 0.5,
+    },
+    hidden: false,
+    ...(Object.keys(scope).length > 0 ? { flags: { [FLAG_SCOPE]: scope } } : {}),
+  };
+}
+
+/**
  * Add lights to a scene. Returns the created AmbientLight _ids.
  *
  * With `opts.embedKeys`, the i-th light is stamped with
  * `flags["foundry-live"].tileRoomKey = embedKeys[i]` (BRA-202) so a
- * keyed re-run can find it again. Without it, behavior is unchanged.
+ * keyed re-run can find it again. A light spec with a `name` is
+ * stamped with `flags["foundry-live"].lightName` (FR-7) so it can be
+ * addressed by name later. Without either, behavior is unchanged.
  */
 export async function addLights(
   live: FoundryLive,
@@ -236,20 +280,7 @@ export async function addLights(
   opts: { embedKeys?: string[] } = {},
 ): Promise<string[]> {
   const created = await live.modifyDocument("AmbientLight", "create", {
-    data: lights.map((l, i) => ({
-      x: l.x,
-      y: l.y,
-      rotation: 0,
-      config: {
-        dim: l.dim,
-        bright: l.bright,
-        angle: l.angle ?? 360,
-        color: l.color ?? "#ff9a3c",
-        alpha: 0.5,
-      },
-      hidden: false,
-      ...(opts.embedKeys?.[i] ? { flags: flagValue(FLAG_FIELDS.tileRoom, opts.embedKeys[i]) } : {}),
-    })),
+    data: lights.map((l, i) => lightCreateData(l, opts.embedKeys?.[i])),
     parentUuid: `Scene.${sceneId}`,
   });
   return created.map((d) => String(d._id));

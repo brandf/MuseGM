@@ -40,6 +40,17 @@
  *   routes through the normal paths with replies whispered back to
  *   the GM. Anything else gets a whispered clarification. Rolls are
  *   out of scope for the whisper channel — they live in public chat.
+ * - Session modes (BRA-233): one session carries a mode — hands-on
+ *   (FR-1), co-design (FR-15), improvise (FR-18) — switchable in one
+ *   chat message from the GM ("let's go hands-on on this room" /
+ *   "take the brief from here") or with `--mode` at startup. The
+ *   switch is visible (a `mode-switched` log line + a confirmation
+ *   in chat) and persisted, so a restart keeps the mode; the build
+ *   state survives the switch untouched. Builds execute in every
+ *   mode; only brief routing differs by mode (co-design logs a
+ *   floor brief as a `brief` event for the convergence loop instead
+ *   of "can't do that yet"). See src/session/modes.ts for what each
+ *   mode actually changes — nothing is invented to fill the table.
  * - Speed budget (BRA-230, FR-10): every handled message is timed —
  *   detect (message timestamp → loop sees it) plus one action record
  *   (message → visible effect: roll/question answer, room built,
@@ -86,6 +97,15 @@ import {
   type LatencyRecord,
   type SessionLatencyReport,
 } from "./perf.js";
+import {
+  loadModeState,
+  modeSwitchLine,
+  parseBriefRequest,
+  parseModeSwitch,
+  saveModeState,
+  MODE_POLICIES,
+  type SessionMode,
+} from "./modes.js";
 
 /** What the monitor does with one chat message. */
 export type MessageClass =
@@ -518,6 +538,14 @@ export interface MonitorOptions {
    *  build, so a restart keeps the dungeon and the rooms already
    *  built on the server. */
   buildStatePath?: string;
+  /** Starting session mode (BRA-233): "hands-on" (FR-1), "co-design"
+   *  (FR-15), or "improvise" (FR-18). An explicit option wins over
+   *  the state file and is saved, so the next start agrees. */
+  mode?: SessionMode;
+  /** Mode state file (default: $FOUNDRY_MODE_STATE or the repo's
+   *  .mode-state.json). Read on start when no --mode is given;
+   *  written on every switch, so a restart keeps the mode. */
+  modeStatePath?: string;
 }
 
 export interface MonitorSummary {
@@ -532,6 +560,9 @@ export interface MonitorSummary {
   /** GM whispers acted on as instructions (sequences, builds, questions, clarifications). */
   whispersHandled: number;
   skipped: number;
+  /** Session mode at shutdown (BRA-233) + how many real switches this run made. */
+  mode: SessionMode;
+  modeSwitches: number;
   /** Speed-budget report (BRA-230, FR-10): p50/p95 per latency kind. */
   latency: SessionLatencyReport;
 }
@@ -609,6 +640,14 @@ export async function runMonitor(
       });
     }
   };
+  // Session mode (BRA-233): the startup option wins over the state
+  // file, which wins over the default. An explicit option is saved,
+  // so the next start without one agrees with this one. A missing or
+  // corrupt file starts hands-on — the mode is a stance, never a
+  // reason to refuse to run.
+  let mode: SessionMode =
+    opts.mode ?? loadModeState(opts.modeStatePath) ?? "hands-on";
+  if (opts.mode !== undefined) saveModeState(mode, opts.modeStatePath);
   const summary: MonitorSummary = {
     cycles: 0,
     messagesSeen: 0,
@@ -620,6 +659,8 @@ export async function runMonitor(
     clarifications: 0,
     whispersHandled: 0,
     skipped: 0,
+    mode,
+    modeSwitches: 0,
     latency: perf.summary(),
   };
   const pins = new PinProcessor();
@@ -668,6 +709,7 @@ export async function runMonitor(
     timeout,
     dryRun: !!opts.dryRun,
     gmId,
+    mode,
   });
 
   try {
@@ -730,6 +772,41 @@ export async function runMonitor(
           }
           // Not a sequence — fall through to the ordinary routing
           // below, but every reply goes back as a whisper to the GM.
+        }
+        // A mode switch (BRA-233): one chat message from the GM
+        // ("let's go hands-on on this room" / "take the brief from
+        // here"). Checked before the roll/question/build branches —
+        // a switch is an instruction about the session, not a request
+        // to act in it. Only the GM can switch; when no GM user
+        // resolves at all there is no creator to gate on, so anyone
+        // can. The switch is visible (a log line + a confirmation in
+        // chat — a whisper back when it came by whisper) and
+        // persisted, so a restart keeps the mode. The build session
+        // is untouched — rooms, plan, and any running sequence
+        // survive the switch.
+        const switchTo = parseModeSwitch(text);
+        if (switchTo !== null && (gmId === null || msg.author === gmId)) {
+          const from = mode;
+          if (opts.dryRun) {
+            log({ event: "mode-switch", from, to: switchTo, dryRun: true });
+          } else {
+            const line = modeSwitchLine(from, switchTo);
+            if (whisper && gmId) {
+              await live.sendChat(line, { whisperTo: [gmId] });
+            } else {
+              await live.sendChat(line);
+            }
+            if (from !== switchTo) {
+              mode = switchTo;
+              summary.modeSwitches += 1;
+              summary.mode = mode;
+              saveModeState(mode, opts.modeStatePath);
+            }
+            summary.answered += 1;
+            if (whisper) summary.whispersHandled += 1;
+            log({ event: "mode-switch", from, to: switchTo, same: from === switchTo });
+          }
+          continue;
         }
         // The build context for this message: the room being built,
         // every room (for names), and the GM's last ping/cursor
@@ -908,6 +985,20 @@ export async function runMonitor(
             log({ event: "whisper-clarify", id: msg.id, reason: "other" });
           }
           continue;
+        }
+        // A floor brief in co-design mode (BRA-233): the message is
+        // about the plan, not a tile — log it as a `brief` event so
+        // the human Muse runs the convergence loop on it, instead of
+        // the generic needs-agent line. The monitor does not answer
+        // a brief itself: the loop is not built yet, and posting a
+        // promise it cannot keep would be worse than silence.
+        if (MODE_POLICIES[mode].briefs === "log-brief") {
+          const brief = parseBriefRequest(text);
+          if (brief) {
+            summary.skipped += 1;
+            log({ event: "brief", id: msg.id, mode, signals: brief.signals, text: text.slice(0, 200) });
+            continue;
+          }
         }
         summary.skipped += 1;
         log({ event: "needs-agent", id: msg.id, text: text.slice(0, 200) });

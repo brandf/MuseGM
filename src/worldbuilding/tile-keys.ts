@@ -56,10 +56,21 @@ export function parseTileEmbedKey(
   return { buildKey: m[1], kind: m[2] as TileEmbedKind, index: Number(m[3]) };
 }
 
-/** One embed on the scene that carries a tile-room key. */
+/** One embed on the scene that carries a tile-room key. Tiles also
+ *  carry their match fields (position + look, read from the raw doc),
+ *  which is what converge matches on — flat layout indices shift
+ *  whenever the layout changes (a widen, a re-skin), so an index is
+ *  not an identity. Walls and lights are still matched by index;
+ *  their shift bug is a BRA-202 follow-up, not this item. */
 export interface KeyedEmbed {
   key: string;
   id: string;
+  sort?: number;
+  elevation?: number;
+  x?: number;
+  y?: number;
+  src?: string;
+  rotation?: number;
 }
 
 /** What a raw scene doc says about one keyed build's embeds. */
@@ -103,7 +114,36 @@ export function extractTileRoomEmbeds(scene: unknown): TileRoomEmbeds {
         FLAG_SCOPE
       ];
       const key = scope?.[FLAG_FIELDS.tileRoom];
-      if (typeof key === "string" && key.length > 0) out.push({ key, id });
+      if (typeof key !== "string" || key.length === 0) continue;
+      const embed: KeyedEmbed = { key, id };
+      // Tiles carry their match fields (position + look) so converge
+      // can match them without trusting the flat layout index. A
+      // field is only attached when the doc actually carries it with
+      // the right type — a malformed doc matches nothing and is
+      // deleted + recreated, which is the safe convergent choice.
+      if (field === "tiles") {
+        const raw = entry as Record<string, unknown>;
+        const num = (v: unknown): number | undefined => (typeof v === "number" ? v : undefined);
+        const sort = num(raw["sort"]);
+        const elevation = num(raw["elevation"]);
+        const x = num(raw["x"]);
+        const y = num(raw["y"]);
+        const rotation = num(raw["rotation"]);
+        const tex = raw["texture"];
+        const texSrc =
+          typeof tex === "object" && tex !== null && typeof (tex as { src?: unknown }).src === "string"
+            ? (tex as { src: string }).src
+            : undefined;
+        const img = typeof raw["img"] === "string" ? raw["img"] : undefined;
+        const src = texSrc ?? img;
+        if (sort !== undefined) embed.sort = sort;
+        if (elevation !== undefined) embed.elevation = elevation;
+        if (x !== undefined) embed.x = x;
+        if (y !== undefined) embed.y = y;
+        if (rotation !== undefined) embed.rotation = rotation;
+        if (src !== undefined) embed.src = src;
+      }
+      out.push(embed);
     }
     return out;
   };
@@ -122,9 +162,22 @@ export function extractTileRoomEmbeds(scene: unknown): TileRoomEmbeds {
   };
 }
 
-/** Planned embed counts for one room layout. */
-export interface PlannedEmbedCounts {
-  tiles: number;
+/** One tile the layout wants, for converge matching: position +
+ *  look. Tiles match a scene embed only when every field agrees. */
+export interface PlannedTile {
+  sort: number;
+  elevation: number;
+  x: number;
+  y: number;
+  src: string;
+  rotation: number;
+}
+
+/** Planned embeds for one room layout: the tiles themselves (matched
+ *  by position + look), and the wall/light counts (matched by index,
+ *  as before). */
+export interface PlannedEmbeds {
+  tiles: PlannedTile[];
   walls: number;
   lights: number;
 }
@@ -135,8 +188,9 @@ export interface TileRoomConvergePlan {
   createTiles: number[];
   createWalls: number[];
   createLights: number[];
-  /** Embed _ids to delete: keyed to this build but past the plan's
-   *  end (the spec shrank since the last build). */
+  /** Embed _ids to delete: keyed to this build but matching no
+   *  planned slot (the spec shrank, a prop moved, or a re-skin
+   *  changed the tile's look). */
   deleteTileIds: string[];
   deleteWallIds: string[];
   deleteLightIds: string[];
@@ -155,12 +209,53 @@ export interface TileRoomConvergePlan {
  * order). Embeds belonging to another build key — or with no key at
  * all — are never touched: the GM's hand-placed walls are not ours
  * to delete.
+ *
+ * Tiles match by position + look (sort, elevation, x, y, texture
+ * src, rotation), never by flat layout index: a widen or a re-skin
+ * shifts the indices of everything after it, and index matching
+ * would keep a prop tile where a wall tile now belongs (ghost prop,
+ * missing wall). Walls and lights still match by index — their shift
+ * bug is a BRA-202 follow-up, not this item.
  */
 export function planTileRoomConverge(
-  planned: PlannedEmbedCounts,
+  planned: PlannedEmbeds,
   present: TileRoomEmbeds,
   buildKey: string,
 ): TileRoomConvergePlan {
+  const planTiles = (
+    tiles: PlannedTile[],
+    presentList: KeyedEmbed[],
+  ): { create: number[]; deleteIds: string[]; keep: (string | null)[] } => {
+    const matches = (e: KeyedEmbed, t: PlannedTile): boolean =>
+      e.sort === t.sort && e.elevation === t.elevation && e.x === t.x && e.y === t.y &&
+      e.src === t.src && e.rotation === t.rotation;
+    const used = new Set<string>();
+    const create: number[] = [];
+    const keep: (string | null)[] = [];
+    for (let i = 0; i < tiles.length; i++) {
+      const match = presentList.find((e) => {
+        if (used.has(e.id)) return false;
+        const parsed = parseTileEmbedKey(e.key);
+        return parsed !== null && parsed.buildKey === buildKey && parsed.kind === "tile" && matches(e, tiles[i]);
+      });
+      if (match) {
+        used.add(match.id);
+        keep.push(match.id);
+      } else {
+        create.push(i);
+        keep.push(null);
+      }
+    }
+    // Surplus: keyed to this build, a tile, and matched by nothing.
+    // A duplicate of an already-matched tile is surplus too.
+    const deleteIds: string[] = [];
+    for (const e of presentList) {
+      const parsed = parseTileEmbedKey(e.key);
+      if (!parsed || parsed.buildKey !== buildKey || parsed.kind !== "tile") continue;
+      if (!used.has(e.id)) deleteIds.push(e.id);
+    }
+    return { create, deleteIds, keep };
+  };
   const planKind = (
     count: number,
     presentList: KeyedEmbed[],
@@ -192,7 +287,7 @@ export function planTileRoomConverge(
     }
     return { create, deleteIds, keep };
   };
-  const tiles = planKind(planned.tiles, present.tiles);
+  const tiles = planTiles(planned.tiles, present.tiles);
   const walls = planKind(planned.walls, present.walls);
   const lights = planKind(planned.lights, present.lights);
   return {

@@ -121,7 +121,10 @@ export interface DoorSpec {
   secret?: boolean;
 }
 
-/** One dressing/fog placement: top-left cell of the tile. */
+/** One dressing/fog placement: top-left cell of the tile.
+ *  Dressing placements are the room's props (FR-6): a prop's stable
+ *  identity is its `id` when present (assigned by placeProp), else
+ *  its tile + cell. Fog placements don't use `id`. */
 export interface Placement {
   tile: string;
   gx: number;
@@ -132,6 +135,11 @@ export interface Placement {
   alpha?: number;
   /** Hidden tiles are GM-only until shown. Default false. */
   hidden?: boolean;
+  /** Stable prop identity (FR-6): what move/remove address. Assigned
+   *  by placeProp (`prop-1`, `prop-2`, …). Placements written before
+   *  ids existed (e.g. by the build loop's add-dressing op) have none
+   *  and are addressed by tile + cell instead. */
+  id?: string;
 }
 
 /**
@@ -377,6 +385,13 @@ export function isMazeWallCell(
   return false;
 }
 
+/** Validate a room spec against the pack. Exported for the prop ops
+ *  (place/move/remove) — one source of truth, so a prop edit can only
+ *  produce a spec the composer would accept. */
+export function validateRoomSpec(spec: RoomSpec, pack: Pack): void {
+  validateSpec(spec, pack);
+}
+
 function validateSpec(spec: RoomSpec, pack: Pack): void {
   const { gridW, gridH } = spec;
   // Minimum is 1x1, not 3x3: corridors are 1-wide by design (FR-12).
@@ -458,7 +473,26 @@ function validateSpec(spec: RoomSpec, pack: Pack): void {
 
   const checkPlacement = (p: Placement, kind: string) => {
     const entry = pack.get(p.tile);
-    if (!entry) throw new Error(`Unknown ${kind} tile "${p.tile}" — not in the pack manifest.`);
+    if (!entry) {
+      if (kind === "dressing") {
+        throw new Error(
+          `Unknown dressing tile "${p.tile}" — not in the pack. Known props: ${listPropTiles(pack).join(", ")}.`,
+        );
+      }
+      throw new Error(`Unknown ${kind} tile "${p.tile}" — not in the pack manifest.`);
+    }
+    // A dressing placement must name a dressing-layer tile, and a fog
+    // placement a fog tile — a floor tile on the dressing layer would
+    // render at the wrong sort and never be listed as a prop.
+    const wantLayer = kind === "dressing" ? "dressing" : "atmosphere";
+    if (entry.layer !== wantLayer) {
+      if (kind === "dressing") {
+        throw new Error(
+          `"${p.tile}" is a ${entry.layer} tile, not a prop. Known props: ${listPropTiles(pack).join(", ")}.`,
+        );
+      }
+      throw new Error(`Fog tile "${p.tile}" is a ${entry.layer} tile, not an atmosphere tile.`);
+    }
     const cells = entry.sizePx / TILE_PX;
     if (!Number.isInteger(p.gx) || !Number.isInteger(p.gy) || p.gx < 0 || p.gy < 0 ||
         p.gx + cells > gridW || p.gy + cells > gridH) {
@@ -481,6 +515,18 @@ function validateSpec(spec: RoomSpec, pack: Pack): void {
   };
   for (const p of spec.dressing ?? []) checkPlacement(p, "dressing");
   for (const p of spec.fog ?? []) checkPlacement(p, "fog");
+  // Prop ids are the move/remove address — a duplicate makes the
+  // address ambiguous, so the spec is rejected rather than guessed at.
+  {
+    const seen = new Set<string>();
+    for (const p of spec.dressing ?? []) {
+      if (!p.id) continue;
+      if (seen.has(p.id)) {
+        throw new Error(`Duplicate prop id "${p.id}" in room spec — each prop needs its own id.`);
+      }
+      seen.add(p.id);
+    }
+  }
   for (const t of spec.torches ?? []) {
     if (t.gx < 0 || t.gx >= gridW || t.gy < 0 || t.gy >= gridH) {
       throw new Error(`Torch at (${t.gx},${t.gy}) is outside a ${gridW}x${gridH} room.`);
@@ -1206,4 +1252,173 @@ export function applyOverlay(spec: RoomSpec, overlay: FloorOverlay): RoomSpec {
     throw new Error("Overlay needs at least one tile variant.");
   }
   return { ...spec, overlays: [...(spec.overlays ?? []), overlay] };
+}
+
+// ---------------------------------------------------------------------------
+// Props (FR-6): the room's dressing placements, as addressable data.
+// ---------------------------------------------------------------------------
+
+/** Dressing-layer tiles are the props — every tile the pack marks for
+ *  the dressing layer, sorted. No brazier or candle tile exists yet
+ *  (a pack gap), so neither appears here. */
+export function listPropTiles(pack: Pack): string[] {
+  return [...pack.values()].filter((e) => e.layer === "dressing").map((e) => e.name).sort();
+}
+
+/** The address of a placement: its id when it has one, else tile@cell
+ *  (e.g. `bones@2,2`). The synthesized form is what move/remove accept
+ *  for placements written before ids existed. */
+export function propIdOf(p: Placement): string {
+  return p.id ?? `${p.tile}@${p.gx},${p.gy}`;
+}
+
+/** One prop, as the room lists it: every dressing placement with its
+ *  address, in spec order. */
+export interface PropEntry {
+  id: string;
+  tile: string;
+  gx: number;
+  gy: number;
+  rotation?: number;
+  alpha?: number;
+  hidden?: boolean;
+}
+
+export function listProps(spec: RoomSpec): PropEntry[] {
+  return (spec.dressing ?? []).map((p) => ({
+    id: propIdOf(p),
+    tile: p.tile,
+    gx: p.gx,
+    gy: p.gy,
+    ...(p.rotation !== undefined ? { rotation: p.rotation } : {}),
+    ...(p.alpha !== undefined ? { alpha: p.alpha } : {}),
+    ...(p.hidden !== undefined ? { hidden: p.hidden } : {}),
+  }));
+}
+
+function describeProps(spec: RoomSpec): string {
+  const props = listProps(spec);
+  if (props.length === 0) return "no props";
+  return props.map((p) => `"${p.tile}" at (${p.gx},${p.gy})`).join(", ");
+}
+
+/** Next free `prop-<n>` id: one past the highest prop number in the
+ *  room. Monotonic — a freed number is never reused, so a GM's notes
+ *  ("move prop-2") never silently rebind to a different prop. */
+function nextPropId(spec: RoomSpec): string {
+  let max = 0;
+  for (const p of spec.dressing ?? []) {
+    if (!p.id) continue;
+    const m = /^prop-(\d+)$/.exec(p.id);
+    if (m) max = Math.max(max, Number(m[1]));
+  }
+  return `prop-${max + 1}`;
+}
+
+/**
+ * Place a prop in a room (FR-6): append it to the room's dressing
+ * list with a fresh id. Pure — returns a new spec, never mutates the
+ * input. The tile must be a dressing-layer tile; anything else is
+ * rejected with the known props listed. The result is validated
+ * through validateRoomSpec (bounds, maze walls, alpha), so a placed
+ * prop is one the composer will accept.
+ */
+export function placeProp(
+  spec: RoomSpec,
+  input: { tile: string; gx: number; gy: number; rotation?: number; alpha?: number; hidden?: boolean },
+  pack: Pack,
+): RoomSpec {
+  const known = listPropTiles(pack);
+  if (!known.includes(input.tile)) {
+    const entry = pack.get(input.tile);
+    if (!entry) {
+      throw new Error(`Unknown prop "${input.tile}" — not in the pack. Known props: ${known.join(", ")}.`);
+    }
+    throw new Error(`"${input.tile}" is a ${entry.layer} tile, not a prop. Known props: ${known.join(", ")}.`);
+  }
+  const next: RoomSpec = {
+    ...spec,
+    dressing: [
+      ...(spec.dressing ?? []),
+      {
+        tile: input.tile,
+        gx: input.gx,
+        gy: input.gy,
+        ...(input.rotation !== undefined ? { rotation: input.rotation } : {}),
+        ...(input.alpha !== undefined ? { alpha: input.alpha } : {}),
+        ...(input.hidden !== undefined ? { hidden: input.hidden } : {}),
+        id: nextPropId(spec),
+      },
+    ],
+  };
+  validateSpec(next, pack);
+  return next;
+}
+
+/**
+ * How a prop is addressed by move/remove: its id (`prop-1`), its
+ * synthesized address (`bones@2,2`), a bare tile name when the room
+ * holds exactly one of that tile (`bones`), or a tile + cell
+ * (`{tile: "bones", gx: 2, gy: 2}`). Anything ambiguous or missing
+ * throws, naming what the room actually has — never guess.
+ */
+export type PropTarget = string | { tile: string; gx: number; gy: number };
+
+function resolvePropIndex(spec: RoomSpec, target: PropTarget): number {
+  const props = spec.dressing ?? [];
+  if (typeof target === "string") {
+    const byId = props.findIndex((p) => p.id === target);
+    if (byId !== -1) return byId;
+    const byAddr = props.map((p, i) => ({ p, i })).filter(({ p }) => propIdOf(p) === target);
+    if (byAddr.length === 1) return byAddr[0].i;
+    if (byAddr.length > 1) {
+      throw new Error(
+        `More than one prop answers to "${target}" — the room has ${describeProps(spec)}. Remove the duplicates by rebuilding the spec.`,
+      );
+    }
+    const byTile = props.map((p, i) => ({ p, i })).filter(({ p }) => p.tile === target);
+    if (byTile.length === 1) return byTile[0].i;
+    if (byTile.length > 1) {
+      throw new Error(
+        `More than one "${target}" in this room — say which one: ${byTile.map(({ p }) => `"${target}" at (${p.gx},${p.gy})`).join(", ")}.`,
+      );
+    }
+    throw new Error(`No prop "${target}" in this room — the room has: ${describeProps(spec)}.`);
+  }
+  const hits = props
+    .map((p, i) => ({ p, i }))
+    .filter(({ p }) => p.tile === target.tile && p.gx === target.gx && p.gy === target.gy);
+  if (hits.length === 1) return hits[0].i;
+  if (hits.length > 1) {
+    throw new Error(
+      `More than one "${target.tile}" at (${target.gx},${target.gy}) — the room has ${describeProps(spec)}. Remove the duplicates by rebuilding the spec.`,
+    );
+  }
+  throw new Error(
+    `No "${target.tile}" at (${target.gx},${target.gy}) in this room — the room has: ${describeProps(spec)}.`,
+  );
+}
+
+/**
+ * Move a prop to another cell (FR-6). Pure — returns a new spec with
+ * the prop's id kept, so a later rebuild still places the same prop.
+ * The destination is validated (bounds, maze walls) through
+ * validateRoomSpec.
+ */
+export function moveProp(spec: RoomSpec, target: PropTarget, to: { gx: number; gy: number }, pack: Pack): RoomSpec {
+  const idx = resolvePropIndex(spec, target);
+  const dressing = [...(spec.dressing ?? [])];
+  dressing[idx] = { ...dressing[idx], gx: to.gx, gy: to.gy };
+  const next: RoomSpec = { ...spec, dressing };
+  validateSpec(next, pack);
+  return next;
+}
+
+/** Remove a prop from a room (FR-6). Pure — returns a new spec without
+ *  it; the remaining props keep their ids and cells. */
+export function removeProp(spec: RoomSpec, target: PropTarget): RoomSpec {
+  const idx = resolvePropIndex(spec, target);
+  const dressing = [...(spec.dressing ?? [])];
+  dressing.splice(idx, 1);
+  return { ...spec, dressing };
 }

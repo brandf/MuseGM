@@ -154,7 +154,20 @@ async function convergeTileRoom(
   const parentUuid = `Scene.${sceneId}`;
   const present = extractTileRoomEmbeds(readSceneDoc(live, sceneId));
   const plan = planTileRoomConverge(
-    { tiles: layout.tiles.length, walls: layout.walls.length, lights: layout.lights.length },
+    {
+      // Tiles converge by position + look, not flat index (see
+      // planTileRoomConverge) — a widen or re-skin shifts indices.
+      tiles: layout.tiles.map((t) => ({
+        sort: t.sort,
+        elevation: t.elevation,
+        x: t.x,
+        y: t.y,
+        src: t.texture.src,
+        rotation: t.rotation,
+      })),
+      walls: layout.walls.length,
+      lights: layout.lights.length,
+    },
     present,
     key,
   );

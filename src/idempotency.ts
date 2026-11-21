@@ -39,6 +39,10 @@ export const FLAG_FIELDS = {
   /** Per-embed key on a tile room's Tile/Wall/AmbientLight docs:
    *  `<buildKey>:tile|wall|light:<index>` (BRA-202). */
   tileRoom: "tileRoomKey",
+  /** Display name of a named light (FR-7, BRA-197): the name the
+   *  creator gave it ("the braziers"), so scripts and chat can
+   *  address the light by name instead of by _id or coordinate. */
+  lightName: "lightName",
 } as const;
 
 /** FNV-1a 32-bit hash of a string — deterministic seed input. */

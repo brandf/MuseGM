@@ -152,6 +152,7 @@ sentence; tokens animate smoothly; the table watches a scene, not a
 build.
 
 **Status:** built offline Nov 20, unit-tested, live test pending.
+BRA-231 (Nov 20): staging gate built — `stageCutscene` validates + resolves against a world snapshot, beat store with fire/edit/drop, `playStagedCutscene` hash-checks before playing. Monitor routing (stage → whisper preview to GM → fire/edit/drop on the GM's one-word reply) is the follow-up, not yet built.
 `src/session/cutscene.ts` (versioned script schema, strict validation —
 every error listed, never a silent skip; formation expansion;
 `playCutscene` via the sequence runner) + `src/session/formations.ts`
@@ -184,7 +185,7 @@ them per theme).
 **Status:** partially built — dressing tiles exist (bones, chest, altar,
 pillar, rubble, spear) and sit on their own layer, and prop *placement
 by the cutscene engine* is built (`prop` step + formation props, Nov 20).
-Prop persistence in the room spec is not built.
+Built (BRA-218, Nov 20) — props are stored on the RoomSpec (dressing placements with stable prop-N ids), rebuild restores them at the same cells, re-skin keeps or swaps them via the theme dressing remap, and place/move/remove are pure spec ops (listProps/placeProp/moveProp/removeProp). Chat wiring for move/remove and cutscene-prop recording are follow-ups; crash-retry converge now matches tiles by position + look, fixing a widen ghost-prop bug.
 
 ### FR-7 — Lighting as a language
 
@@ -201,8 +202,7 @@ mage's casting light is a light animation, not a new static light.
 light switch; the creator can name a light ("the center light") and
 change it in one message.
 
-**Status:** not built. Lights today are static (dim/bright/color set at
-build). Needs timed light transitions + named lights in the room spec.
+**Status:** [~] built + unit-tested offline Nov 20 — timed transitions (cutscene light step) + named lights (src/session/lights.ts registry, LightSpec.name stamped at build, animateNamedLights); live test pending. Cutscene light-step {name} validation and monitor chat routing ("dim the braziers") are follow-ups.
 
 ### FR-8 — Undo / tweak
 
@@ -460,7 +460,7 @@ the locked plan builds with the existing engine pieces (no new
 one-off code per floor); every puzzle, encounter, and intrigue beat
 traces to something in the chronicle or the brief — nothing generic.
 
-**Status:** planner built + unit-tested Nov 20 (`src/session/floor-plan.ts`, `src/cli/floor-plan.ts`, `tests/floor-plan.test.ts` — 34 checks; `bun run floor-plan --demo` prints the lich's lair floor preview + the locked plan and manifest). Live wiring still pending: executing a locked plan's manifest against a real Foundry, and the chat convergence loop (show the preview, take reactions, re-plan).
+**Status:** planner built + unit-tested Nov 20 (`src/session/floor-plan.ts`, `src/cli/floor-plan.ts`, `tests/floor-plan.test.ts` — 34 checks; `bun run floor-plan --demo` prints the lich's lair floor preview + the locked plan and manifest). The switch itself is built (BRA-233, Nov 20): one monitor session carries the mode — hands-on / co-design / improvise — switchable in one chat message, persisted across restarts. Live wiring still pending: executing a locked plan's manifest against a real Foundry, and the chat convergence loop (show the preview, take reactions, re-plan).
 
 ### FR-16 — Interactive dressing: the map you can touch
 

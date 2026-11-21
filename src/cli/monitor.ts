@@ -16,6 +16,12 @@ export {};
  *   cutscene script or a named sequence ("mice and the ogre") is
  *   validated and played; a whispered build or question is answered
  *   back as a whisper. Anything else gets a whispered clarification.
+ * - Session modes (BRA-233): one session carries a mode — hands-on
+ *   (FR-1), co-design (FR-15), improvise (FR-18) — set at startup
+ *   with --mode or switched mid-session in one chat message from the
+ *   GM ("let's go hands-on on this room" / "take the brief from
+ *   here"). The mode persists across restarts; the build state
+ *   survives a switch untouched.
  * - Open chat / requests / roleplay are logged as "needs-agent" on
  *   stderr and skipped. A human Muse can answer those from the log.
  *
@@ -23,6 +29,7 @@ export {};
  *   bun run src/cli/monitor.ts [--alias Meroki] [--debounce 3]
  *                              [--timeout 30] [--once] [--dry-run]
  *                              [--pack <manifest.json>] [--server-base <path>]
+ *                              [--mode <hands-on|co-design|improvise>]
  *
  * Logs are JSON lines on stderr ({event, ...}); --once prints a summary
  * JSON object on stdout and exits. Ctrl-C stops the loop cleanly
@@ -44,7 +51,7 @@ function has(name: string): boolean {
 
 if (has("--help") || has("-h")) {
   process.stdout.write(
-    `usage: bun run src/cli/monitor.ts [--alias Meroki] [--debounce 3] [--timeout 30] [--once] [--dry-run] [--pack <manifest.json>] [--server-base <path>]\n` +
+    `usage: bun run src/cli/monitor.ts [--alias Meroki] [--debounce 3] [--timeout 30] [--once] [--dry-run] [--pack <manifest.json>] [--server-base <path>] [--mode <hands-on|co-design|improvise>]\n` +
       `\n` +
       `  --alias <name>   display name in chat (default Meroki)\n` +
       `  --debounce <s>   burst-merge window per wait cycle (default 3)\n` +
@@ -53,6 +60,10 @@ if (has("--help") || has("-h")) {
       `  --dry-run        classify + log, but post nothing and change nothing\n` +
       `  --pack <path>    tile-pack manifest for the build loop (default tiles/manifest.json)\n` +
       `  --server-base <path>  server folder the pack was uploaded to (default worlds/<world>)\n` +
+      `  --mode <mode>    starting session mode: hands-on (FR-1, tile by tile),\n` +
+      `                   co-design (FR-15, floor briefs), improvise (FR-18, mid-session\n` +
+      `                   sequences). Persists across restarts; the GM can switch it\n` +
+      `                   mid-session in one chat message ("take the brief from here").\n` +
       `\n` +
       `The monitor starts from the newest chat message (it never re-answers\n` +
       `history) and picks up open Meroki Pins dropped while it was offline.\n` +
@@ -67,6 +78,18 @@ if (has("--help") || has("-h")) {
 }
 
 process.env.LOG_LEVEL ??= "error";
+const modeArg = arg("--mode");
+if (
+  modeArg !== undefined &&
+  modeArg !== "hands-on" &&
+  modeArg !== "co-design" &&
+  modeArg !== "improvise"
+) {
+  process.stderr.write(
+    `monitor: --mode must be hands-on, co-design, or improvise (got ${JSON.stringify(modeArg)})\n`,
+  );
+  process.exit(2);
+}
 const { FoundryLive } = await import("../live.js");
 const { runMonitor } = await import("../session/monitor.js");
 
@@ -78,6 +101,7 @@ async function main(): Promise<void> {
   const dryRun = has("--dry-run");
   const packPath = arg("--pack");
   const serverBase = arg("--server-base");
+  const mode = modeArg as "hands-on" | "co-design" | "improvise" | undefined;
 
   const live = await FoundryLive.connect();
   let stopping = false;
@@ -95,6 +119,7 @@ async function main(): Promise<void> {
       once,
       packPath,
       serverBase,
+      mode,
       shouldStop: () => stopping,
     });
     if (once) {

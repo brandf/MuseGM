@@ -13,6 +13,24 @@
  * the standard Foundry pattern for partial updates of nested fields;
  * flag for live verification.
  *
+ * Named lights (FR-7, BRA-197) — the naming layer over the lights:
+ * a light placed in a room can be given a name ("the braziers",
+ * "the altar candles"), stamped into its flags at build time
+ * (`flags["foundry-live"].lightName`, see `addLights`), and later
+ * steps/commands address the name instead of a Light _id or a
+ * coordinate. A name addresses a GROUP of lights: every light
+ * carrying that name animates together ("the braziers" is all the
+ * braziers, not one). Resolution is pure — `resolveNamedLights`
+ * over a scene's light docs — with clear errors: unknown names list
+ * the names that exist, a name matching several groups asks for one
+ * exactly. Never guess, never animate a partial match silently.
+ *
+ * What this layer does NOT wire (follow-ups, not this item): the
+ * cutscene `light` step still validates `{id} | {at}` only — its
+ * validation needs to accept `{name}` and call `animateNamedLights`
+ * — and the monitor has no "dim the braziers" chat routing yet.
+ * Both are small edits on top of this layer, not part of it.
+ *
  * Honest limit: resolving a light by proximity, or reading its
  * current state as the animation's `from`, needs the scene's lights
  * in this connection's worldData cache. If the cache has no lights
@@ -21,6 +39,7 @@
  * with no read.
  */
 import type { FoundryLive } from "../live.js";
+import { FLAG_FIELDS, FLAG_SCOPE } from "../idempotency.js";
 
 export interface LightState {
   dim: number;
@@ -35,6 +54,8 @@ export interface LightDoc {
   y: number;
   config?: Partial<LightState> & { angle?: number };
   hidden?: boolean;
+  /** Build-time flags — a named light carries `lightName` here. */
+  flags?: Record<string, Record<string, unknown> | undefined> | null;
 }
 
 export type LightSelector = { id: string } | { at: { x: number; y: number } };
@@ -113,6 +134,179 @@ export function lightStateOf(doc: LightDoc): LightState {
     color: typeof doc.config?.color === "string" ? doc.config.color : "#ffffff",
     alpha: doc.config?.alpha ?? 0.5,
   };
+}
+
+// ---------------------------------------------------------------- named lights (FR-7, BRA-197)
+
+/**
+ * Normalize a light name for matching: lowercase, trimmed, inner
+ * whitespace collapsed, a leading "the" dropped. "The Braziers",
+ * "the  braziers" and "braziers" are the same name. Returns "" for a
+ * blank name.
+ */
+export function normalizeLightName(name: string): string {
+  return name
+    .toLowerCase()
+    .replace(/\s+/g, " ")
+    .trim()
+    .replace(/^the\b\s*/, "");
+}
+
+/**
+ * The name a light doc carries in its flags, or null when it has
+ * none. The stored name is returned as authored (trimmed) — the
+ * display name for error messages; matching normalizes it.
+ */
+export function lightNameOf(doc: LightDoc): string | null {
+  const raw = doc.flags?.[FLAG_SCOPE]?.[FLAG_FIELDS.lightName];
+  if (typeof raw !== "string") return null;
+  const name = raw.trim();
+  return name.length > 0 ? name : null;
+}
+
+/** One named light: its display name and its document _id. */
+export interface NamedLight {
+  name: string;
+  id: string;
+}
+
+/** Every named light on a scene, in scene order. Unnamed lights are skipped. */
+export function namedLightsOf(lights: LightDoc[]): NamedLight[] {
+  const out: NamedLight[] = [];
+  for (const doc of lights) {
+    const name = lightNameOf(doc);
+    if (name && typeof doc._id === "string" && doc._id.length > 0) {
+      out.push({ name, id: doc._id });
+    }
+  }
+  return out;
+}
+
+/** One name and every light carrying it — a name addresses a group. */
+export interface NamedLightGroup {
+  /** Display name (first-seen spelling). */
+  name: string;
+  ids: string[];
+}
+
+/**
+ * Group a scene's lights by normalized name, first-seen display name
+ * kept, ids in scene order. Two spellings of one name ("The
+ * Braziers", "braziers") are one group.
+ */
+export function groupNamedLights(lights: LightDoc[]): NamedLightGroup[] {
+  const groups: NamedLightGroup[] = [];
+  const byKey = new Map<string, NamedLightGroup>();
+  for (const { name, id } of namedLightsOf(lights)) {
+    const key = normalizeLightName(name);
+    let group = byKey.get(key);
+    if (!group) {
+      group = { name, ids: [] };
+      byKey.set(key, group);
+      groups.push(group);
+    }
+    group.ids.push(id);
+  }
+  return groups;
+}
+
+/**
+ * Resolve a name against a scene's lights. Exact normalized match
+ * wins; otherwise a unique substring match ("brazier" finds "the
+ * braziers"). Errors name the names that exist — never guess:
+ * - unknown name: lists every named light on the scene (or says the
+ *   scene has none);
+ * - a name matching several groups: lists the matches and asks for
+ *   one exactly;
+ * - a blank query: lists the names to pick from.
+ */
+export function resolveNamedLights(lights: LightDoc[], query: string): NamedLightGroup {
+  const groups = groupNamedLights(lights);
+  const listNames = (): string => groups.map((g) => `"${g.name}"`).join(", ");
+  if (groups.length === 0) {
+    throw new Error(
+      `This scene has no named lights — give a light a name when it is built ` +
+        `(LightSpec.name, e.g. "the braziers") before addressing it by name.`,
+    );
+  }
+  const key = normalizeLightName(query);
+  if (!key) {
+    throw new Error(`Name a light — named lights on this scene: ${listNames()}.`);
+  }
+  const exact = groups.find((g) => normalizeLightName(g.name) === key);
+  if (exact) return exact;
+  const partial = groups.filter((g) => normalizeLightName(g.name).includes(key));
+  if (partial.length === 1) return partial[0];
+  if (partial.length > 1) {
+    throw new Error(
+      `"${query.trim()}" matches more than one light: ${partial.map((g) => `"${g.name}"`).join(", ")} — name one exactly.`,
+    );
+  }
+  throw new Error(
+    `No light named "${query.trim()}" on this scene — named lights here: ${listNames()}.`,
+  );
+}
+
+/** One light's part of a named-light plan: from its current state to the target. */
+export interface NamedLightTarget {
+  lightId: string;
+  /** Current state (the transition starts here). */
+  from: LightState;
+  to: LightState;
+  durationMs: number;
+  steps: number;
+}
+
+export interface NamedLightPlanOptions {
+  /** Total time for the transition. Default 2000ms. */
+  durationMs?: number;
+  /** Update steps across the transition. Default 12. */
+  steps?: number;
+}
+
+/**
+ * Pure half of a named-light change: resolve the name to its group
+ * and plan one transition per light, from each light's current state
+ * to the target (fields the target leaves out stay where they are).
+ * The plan is the full group, so the caller can see nothing was
+ * missed.
+ */
+export function namedLightPlan(
+  lights: LightDoc[],
+  query: string,
+  target: Partial<LightState>,
+  opts: NamedLightPlanOptions = {},
+): { name: string; targets: NamedLightTarget[] } {
+  const group = resolveNamedLights(lights, query);
+  if (target.color !== undefined && !isValidHexColor(target.color)) {
+    throw new Error(`Invalid hex color: ${JSON.stringify(target.color)} (want #rrggbb)`);
+  }
+  const durationMs = opts.durationMs ?? 2000;
+  const steps = opts.steps ?? 12;
+  if (!(durationMs > 0) || !Number.isFinite(durationMs)) {
+    throw new Error(`namedLightPlan: durationMs must be > 0, got ${durationMs}`);
+  }
+  if (!Number.isInteger(steps) || steps < 1) {
+    throw new Error(`namedLightPlan: steps must be an integer >= 1, got ${steps}`);
+  }
+  const byId = new Map(lights.map((d) => [d._id, d]));
+  const targets: NamedLightTarget[] = group.ids.map((id) => {
+    const doc = byId.get(id);
+    const from = doc ? lightStateOf(doc) : { dim: 0, bright: 0, color: "#ffffff", alpha: 0.5 };
+    return {
+      lightId: id,
+      from,
+      to: {
+        dim: target.dim ?? from.dim,
+        bright: target.bright ?? from.bright,
+        color: target.color ?? from.color,
+        alpha: target.alpha ?? from.alpha,
+      },
+      durationMs,
+      steps,
+    };
+  });
+  return { name: group.name, targets };
 }
 
 /**
@@ -296,4 +490,50 @@ export async function animateLight(
     if (i < steps) await sleep(stepMs);
   }
   return { lightId: id, final };
+}
+
+// ---------------------------------------------------------------- named lights, live half (FR-7, BRA-197)
+
+/**
+ * Resolve a name against a scene's lights in this connection's
+ * cache. Same errors as the pure resolver — unknown names list the
+ * names that exist. Needs the cache (same honest limit as the
+ * proximity selector): when the cache has no lights, the error says
+ * so instead of guessing.
+ */
+export function resolveNamedLightsLive(
+  live: FoundryLive,
+  sceneId: string,
+  query: string,
+): NamedLightGroup {
+  return resolveNamedLights(resolveSceneLights(live, sceneId), query);
+}
+
+/**
+ * Animate every light in a named group to the target, in parallel
+ * (one fade per light — a sequential fade across the braziers would
+ * read as a wave, not one change). Each light starts from its own
+ * current state. Returns the resolved name and the per-light results.
+ */
+export async function animateNamedLights(
+  live: FoundryLive,
+  sceneId: string,
+  query: string,
+  target: Partial<LightState>,
+  opts: NamedLightPlanOptions = {},
+): Promise<{ name: string; results: { lightId: string; final: LightState }[] }> {
+  const lights = resolveSceneLights(live, sceneId);
+  const plan = namedLightPlan(lights, query, target, opts);
+  const results = await Promise.all(
+    plan.targets.map((t) =>
+      animateLight(
+        live,
+        sceneId,
+        { id: t.lightId },
+        t.to,
+        { durationMs: t.durationMs, steps: t.steps, from: t.from },
+      ),
+    ),
+  );
+  return { name: plan.name, results };
 }

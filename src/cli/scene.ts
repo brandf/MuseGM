@@ -5,6 +5,8 @@
  *   bun run src/cli/scene.ts create --name "Cathedral" --image <local-file-or-server-path> --width 400 --height 300 [--grid 50] [--build-key <key>]
  *   bun run src/cli/scene.ts walls --scene <id> --walls '[{"x1":0,"y1":0,"x2":400,"y2":0}]'
  *   bun run src/cli/scene.ts lights --scene <id> --lights '[{"x":200,"y":150,"dim":300,"bright":100}]'
+ *   bun run src/cli/scene.ts lights-list --scene <id>          # named lights on the scene
+ *   bun run src/cli/scene.ts lights-name --scene <id> --name "the braziers" [--dim 0] [--bright 0] [--color #rrggbb] [--alpha 0] [--duration-ms 2000] [--steps 12]
  *   bun run src/cli/scene.ts chest --scene <id> --x 200 --y 150 [--name "Old Chest"] [--loot '[{"name":"Gold","price":50}]'] [--key <key>]
  *   bun run src/cli/scene.ts delete --scene <id> [--actor <loot-actor-id>]
  *   bun run src/cli/scene.ts demo            # full room build, prints ids
@@ -24,6 +26,9 @@ import type { FoundryLive } from "../live.js";
 const { FoundryLive: LiveClient } = await import("../live.js");
 const wb = await import("../worldbuilding/index.js");
 const { uploadImage } = await import("../worldbuilding/upload.js");
+const { animateNamedLights, groupNamedLights, resolveSceneLights } = await import(
+  "../session/lights.js"
+);
 
 function arg(name: string): string | undefined {
   const i = process.argv.indexOf(name);
@@ -75,6 +80,32 @@ async function main(): Promise<void> {
         const lights = JSON.parse(arg("--lights") ?? "[]");
         if (!sceneId) throw new Error("lights needs --scene <id> --lights '[...]'");
         out = { lightIds: await wb.addLights(live, sceneId, lights) };
+        break;
+      }
+      case "lights-list": {
+        const sceneId = arg("--scene");
+        if (!sceneId) throw new Error("lights-list needs --scene <id>");
+        out = {
+          sceneId,
+          named: groupNamedLights(resolveSceneLights(live, sceneId)),
+        };
+        break;
+      }
+      case "lights-name": {
+        const sceneId = arg("--scene");
+        const name = arg("--name");
+        if (!sceneId || !name) {
+          throw new Error('lights-name needs --scene <id> --name "the braziers"');
+        }
+        const target: Record<string, number | string> = {};
+        if (arg("--dim") !== undefined) target.dim = Number(arg("--dim"));
+        if (arg("--bright") !== undefined) target.bright = Number(arg("--bright"));
+        if (arg("--color") !== undefined) target.color = arg("--color") as string;
+        if (arg("--alpha") !== undefined) target.alpha = Number(arg("--alpha"));
+        out = await animateNamedLights(live, sceneId, name, target, {
+          durationMs: Number(arg("--duration-ms") ?? "2000"),
+          steps: Number(arg("--steps") ?? "12"),
+        });
         break;
       }
       case "chest": {
